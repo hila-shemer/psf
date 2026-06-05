@@ -27,6 +27,7 @@ ROOTS=(
     /home/shemer/sakura-firmware
     /home/shemer/.claude
     /home/shemer/clones
+    /home/shemer/.local
 )
 
 # Patterns to skip (repeatable, glob-style, matched against the stored path).
