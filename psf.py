@@ -34,6 +34,7 @@ PATH_BASENAME_KEEP = 6    # chars kept each side of '...' in a long basename
 DEDUP_MIN = 3             # min identical siblings to merge into one ×N group
 NEVER_MERGE = frozenset({"claude"})   # comms never grouped, even when identical
 GROUP_PIDS = 8            # member pids listed on a group's detail line
+LIFECYCLE_MAX = 40        # max born (and max died) comm-groups listed
 
 # System constants, read once. CLK_TCK converts stat jiffies -> seconds;
 # PAGE_SIZE converts stat rss (in pages) -> bytes.
@@ -426,6 +427,57 @@ def diff_snapshots(before, after):
     born.sort(key=lambda p: p.pid)
     died.sort(key=lambda p: p.pid)
     return born, died
+
+
+def _dominant_parent(members, parents):
+    """The most common parent comm among members (None if unknown)."""
+    counts = Counter(parents.get(m.ppid) for m in members)
+    counts.pop(None, None)
+    return counts.most_common(1)[0][0] if counts else None
+
+
+def _lifecycle_side(procs, sign, parents, sysinfo, is_died):
+    """One 'born'/'died' line body: group by comm (×N), largest first, each
+    annotated with its dominant parent comm; singletons show pid + comm and,
+    for deaths, how long they had lived. Capped at LIFECYCLE_MAX comm-groups."""
+    buckets = {}
+    for p in procs:
+        buckets.setdefault(p.comm, []).append(p)
+    ordered = sorted(buckets.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    parts = []
+    for comm, members in ordered[:LIFECYCLE_MAX]:
+        pcomm = _dominant_parent(members, parents)
+        tag = " (←%s)" % pcomm if pcomm else ""
+        if len(members) >= 2:
+            parts.append("×%d %s%s" % (len(members), comm, tag))
+        else:
+            p = members[0]
+            lived = ""
+            if is_died:
+                lived = " lived %s" % fmt_duration(
+                    lifetime_secs(p.starttime, sysinfo.uptime, sysinfo.clk_tck))
+            parts.append("%s%d %s%s%s" % (sign, p.pid, comm, tag, lived))
+    if len(ordered) > LIFECYCLE_MAX:
+        parts.append("+%d more" % (len(ordered) - LIFECYCLE_MAX))
+    return "  ".join(parts)
+
+
+def format_lifecycle(born, died, parents, sysinfo, dt, color=False):
+    """The born/died section: a header naming the measured window, then a
+    'born:' and/or 'died:' line. `parents` maps pid -> comm. Returns [] when
+    nothing changed in the window."""
+    if not born and not died:
+        return []
+    lines = ["lifecycle — system-wide, %.2gs window:" % dt]
+    if born:
+        lines.append("  born:  " + _lifecycle_side(born, "+", parents,
+                                                    sysinfo, False))
+    if died:
+        lines.append("  died:  " + _lifecycle_side(died, "-", parents,
+                                                    sysinfo, True))
+    if color:
+        lines = ["\x1b[2m%s\x1b[0m" % ln for ln in lines]
+    return lines
 
 
 # --- cache ------------------------------------------------------------------
