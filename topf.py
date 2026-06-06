@@ -357,6 +357,30 @@ def cpu_fraction(cpu_ticks, wall_secs, clk_tck):
     return (cpu_ticks / clk_tck) / wall_secs
 
 
+def windowed_rate(ring, window, clk_tck):
+    """CPU rate (in cores) over the trailing `window` seconds of a sample ring.
+    `ring` is [(monotonic_t, cpu_ticks)] ascending. Uses the most recent sample
+    at or before now-window as the baseline (or the oldest sample if the ring is
+    younger than the window), and the ACTUAL elapsed wall time between that
+    baseline and the latest sample (frames can be late). None if < 2 samples or
+    a non-positive span."""
+    if len(ring) < 2:
+        return None
+    now_t, now_ticks = ring[-1]
+    target = now_t - window
+    base = ring[0]
+    for sample in ring:
+        if sample[0] <= target:
+            base = sample
+        else:
+            break
+    t0, ticks0 = base
+    elapsed = now_t - t0
+    if elapsed <= 0:
+        return None
+    return ((now_ticks - ticks0) / clk_tck) / elapsed
+
+
 def fmt_pct(frac):
     """Format a CPU fraction as a percentage with magnitude-scaled precision so
     tiny lifetime averages stay legible (e.g. 0.0002 -> '0.02%') instead of
