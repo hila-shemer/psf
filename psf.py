@@ -358,6 +358,28 @@ def fmt_duration(secs):
     return "%ds" % sec
 
 
+def brace_summary(values, max_items=5):
+    """Collapse strings to a common prefix + brace of the differing tails:
+    ['a/x', 'a/y'] -> 'a/{x,y}'. A single distinct value is returned as-is."""
+    uniq = sorted(set(values))
+    if len(uniq) == 1:
+        return uniq[0]
+    prefix = os.path.commonprefix(uniq)
+    tails = [v[len(prefix):] for v in uniq]
+    shown = tails[:max_items]
+    more = ",..." if len(tails) > max_items else ""
+    return "%s{%s%s}" % (prefix, ",".join(shown), more)
+
+
+def range_str(values, fmt):
+    """'lo–hi' (en-dash) via fmt(); a single value when min == max. `values`
+    must be non-empty."""
+    lo, hi = min(values), max(values)
+    if lo == hi:
+        return fmt(lo)
+    return "%s–%s" % (fmt(lo), fmt(hi))
+
+
 # --- cache ------------------------------------------------------------------
 
 
