@@ -12,11 +12,12 @@ Run under sudo/root to see other users' processes; degrades to '?' otherwise.
 """
 import argparse
 import json
+import math
 import os
 import re
 import sys
 import time
-from collections import Counter
+from collections import Counter, namedtuple
 from dataclasses import dataclass, field
 
 
@@ -26,6 +27,19 @@ CMD_WIDTH = 50            # chars of cmdline shown per process
 COLLAPSE_THRESHOLD = 20   # kept-descendant count above which a subtree collapses
 CACHE_TTL = 30            # seconds before a cached socket entry is re-probed
 REPR_COMMS = 4            # distinct comms named in a collapse summary
+SAMPLE_INTERVAL = 0.2     # seconds slept to measure current CPU (0 disables)
+
+# System constants, read once. CLK_TCK converts stat jiffies -> seconds;
+# PAGE_SIZE converts stat rss (in pages) -> bytes.
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+
+# Resolved-once view of system state needed to turn raw counters into rates.
+SysInfo = namedtuple("SysInfo", "clk_tck page_size uptime")
+
+# One /proc/PID/stat row, only the fields we use.
+Stat = namedtuple("Stat", "comm state ppid num_threads starttime "
+                          "utime stime rss_pages")
 
 # Each matcher: (label, target, regex) where target is "comm" or "cmdline".
 DEFAULT_MATCHERS = [
@@ -50,6 +64,10 @@ class Proc:
     num_threads: int
     starttime: int
     uid: int
+    utime: int = 0                  # user jiffies (stat field 14)
+    stime: int = 0                  # system jiffies (stat field 15)
+    rss_pages: int = 0              # resident pages (stat field 24)
+    cpu_current: float = None       # recent CPU fraction from probe sampling
     children: list = field(default_factory=list)   # list[Proc]
     interesting: bool = False
     kept: bool = False
@@ -64,19 +82,24 @@ class Proc:
 
 
 def parse_stat(content):
-    """Parse /proc/PID/stat text. Returns (comm, state, ppid, num_threads,
-    starttime). comm may contain spaces and parens, so split on the LAST ')'."""
+    """Parse /proc/PID/stat text into a Stat. comm may contain spaces and
+    parens, so split on the LAST ')'."""
     open_paren = content.index("(")
     close_paren = content.rindex(")")
     comm = content[open_paren + 1:close_paren]
     rest = content[close_paren + 2:].split()
-    # rest[i] is stat field (i + 3): field3=state, field4=ppid,
-    # field20=num_threads, field22=starttime.
-    state = rest[0]
-    ppid = int(rest[1])
-    num_threads = int(rest[17])
-    starttime = int(rest[19])
-    return comm, state, ppid, num_threads, starttime
+    # rest[i] is stat field (i + 3): field3=state, field4=ppid, field14=utime,
+    # field15=stime, field20=num_threads, field22=starttime, field24=rss.
+    return Stat(
+        comm=comm,
+        state=rest[0],
+        ppid=int(rest[1]),
+        num_threads=int(rest[17]),
+        starttime=int(rest[19]),
+        utime=int(rest[11]),
+        stime=int(rest[12]),
+        rss_pages=int(rest[21]),
+    )
 
 
 def clean_cmdline(raw, comm=""):
@@ -267,6 +290,71 @@ def format_sockets(inodes, netmap):
     return "  ".join(parts)
 
 
+# --- pure core: resource stats ----------------------------------------------
+
+
+def lifetime_secs(starttime, uptime, clk_tck):
+    """Wall-clock seconds the process has been alive: system uptime minus the
+    process's start offset (stat starttime is in clock ticks since boot)."""
+    return uptime - starttime / clk_tck
+
+
+def cpu_fraction(cpu_ticks, wall_secs, clk_tck):
+    """CPU busy fraction = cpu-seconds / wall-seconds. 1.0 == one core saturated
+    (can exceed 1.0 across cores). None when the window is non-positive."""
+    if wall_secs <= 0:
+        return None
+    return (cpu_ticks / clk_tck) / wall_secs
+
+
+def fmt_pct(frac):
+    """Format a CPU fraction as a percentage with magnitude-scaled precision so
+    tiny lifetime averages stay legible (e.g. 0.0002 -> '0.02%') instead of
+    rounding to '0.00%'. None -> None; non-positive -> '0%'."""
+    if frac is None:
+        return None
+    pct = frac * 100.0
+    if pct <= 0:
+        return "0%"
+    if pct >= 10:
+        return "%.0f%%" % pct
+    if pct >= 1:
+        return "%.1f%%" % pct
+    # sub-1%: two significant figures in plain decimal (never sci notation,
+    # which would be unreadable in a process monitor), trailing zeros trimmed.
+    decimals = 1 - int(math.floor(math.log10(pct)))
+    return ("%.*f" % (decimals, pct)).rstrip("0").rstrip(".") + "%"
+
+
+def fmt_bytes(n):
+    """Human-readable binary size: 0 -> '0', <1KiB -> 'NB', else one decimal
+    with a K/M/G/T suffix."""
+    if n <= 0:
+        return "0"
+    if n < 1024:
+        return "%dB" % n
+    val = float(n)
+    for unit in ("K", "M", "G", "T"):
+        val /= 1024.0
+        if val < 1024 or unit == "T":
+            return "%.1f%s" % (val, unit)
+
+
+def fmt_duration(secs):
+    """Compact elapsed time, top two units: '5s', '1m5s', '1h2m', '1d1h'."""
+    secs = int(secs) if secs > 0 else 0
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, sec = divmod(rem, 60)
+    if days:
+        return "%dd%dh" % (days, hours)
+    if hours:
+        return "%dh%dm" % (hours, mins)
+    if mins:
+        return "%dm%ds" % (mins, sec)
+    return "%ds" % sec
+
+
 # --- cache ------------------------------------------------------------------
 
 
@@ -348,14 +436,16 @@ def scan():
         pid = int(name)
         base = "%s/%d" % (PROC, pid)
         try:
-            comm, state, ppid, nthreads, starttime = parse_stat(_read(base + "/stat"))
-            cmdline = clean_cmdline(_read(base + "/cmdline"), comm)
+            st = parse_stat(_read(base + "/stat"))
+            cmdline = clean_cmdline(_read(base + "/cmdline"), st.comm)
             uid = os.stat(base).st_uid
         except (OSError, ValueError, IndexError):
             continue        # process vanished mid-scan, or unreadable
-        procs[pid] = Proc(pid=pid, ppid=ppid, comm=comm, cmdline=cmdline,
-                          state=state, num_threads=nthreads,
-                          starttime=starttime, uid=uid)
+        procs[pid] = Proc(pid=pid, ppid=st.ppid, comm=st.comm, cmdline=cmdline,
+                          state=st.state, num_threads=st.num_threads,
+                          starttime=st.starttime, uid=uid,
+                          utime=st.utime, stime=st.stime,
+                          rss_pages=st.rss_pages)
     return procs
 
 
@@ -402,6 +492,41 @@ def read_boot_id():
         return _read("/proc/sys/kernel/random/boot_id").strip()
     except OSError:
         return ""
+
+
+def read_uptime():
+    """System uptime in seconds (first field of /proc/uptime)."""
+    try:
+        return float(_read("/proc/uptime").split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def read_cpu_ticks(pid):
+    """Total CPU jiffies (utime + stime) for a pid right now, or None if its
+    stat is unreadable (vanished / permission)."""
+    try:
+        st = parse_stat(_read("%s/%d/stat" % (PROC, pid)))
+    except (OSError, ValueError, IndexError):
+        return None
+    return st.utime + st.stime
+
+
+def sample_current_cpu(nodes, interval, clk_tck=CLK_TCK):
+    """Measure each node's recent CPU fraction over a short window: read cpu
+    jiffies, sleep `interval`, read again, and set node.cpu_current. Only the
+    (few) printed nodes are sampled, so the fixed sleep is the whole cost."""
+    if interval <= 0 or not nodes:
+        return
+    start = time.monotonic()
+    first = {n.pid: read_cpu_ticks(n.pid) for n in nodes}
+    time.sleep(interval)
+    elapsed = time.monotonic() - start
+    for n in nodes:
+        before, after = first.get(n.pid), read_cpu_ticks(n.pid)
+        if before is None or after is None:
+            continue
+        n.cpu_current = cpu_fraction(after - before, elapsed, clk_tck)
 
 
 # --- probe orchestration ----------------------------------------------------
@@ -471,7 +596,20 @@ def _summarize_path(path):
     return path
 
 
-def _detail(node, color):
+def _cpu_bit(node, sysinfo):
+    """'cpu 3.4% (2.5% avg)' when a current sample exists, else 'cpu 2.5% avg'.
+    avg = lifetime CPU rate (total cpu-time / time alive)."""
+    life = lifetime_secs(node.starttime, sysinfo.uptime, sysinfo.clk_tck)
+    avg = fmt_pct(cpu_fraction(node.utime + node.stime, life, sysinfo.clk_tck))
+    cur = fmt_pct(node.cpu_current)
+    if avg is None:
+        return None
+    if cur is not None:
+        return "cpu %s (%s avg)" % (cur, avg)
+    return "cpu %s avg" % avg
+
+
+def _detail(node, color, sysinfo=None):
     bits = []
     if node.cwd and node.cwd not in ("?", ""):
         bits.append("cwd:" + _summarize_path(node.cwd))
@@ -479,6 +617,15 @@ def _detail(node, color):
         bits.append("exe:" + _summarize_path(node.exe))
     if node.sockets_str:
         bits.append(node.sockets_str)
+    if sysinfo is not None:
+        cpu = _cpu_bit(node, sysinfo)
+        if cpu is not None:
+            bits.append(cpu)
+        rss = node.rss_pages * sysinfo.page_size
+        if rss > 0:
+            bits.append("rss:" + fmt_bytes(rss))
+        bits.append("up:" + fmt_duration(
+            lifetime_secs(node.starttime, sysinfo.uptime, sysinfo.clk_tck)))
     if node.num_threads > 1:
         bits.append("%d threads" % node.num_threads)
     if not bits:
@@ -487,8 +634,9 @@ def _detail(node, color):
     return "\x1b[2m%s\x1b[0m" % line if color else line
 
 
-def render(roots, suppressed, width=CMD_WIDTH, color=None):
-    """Render kept Procs as an ascii tree. Returns a list of lines."""
+def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None):
+    """Render kept Procs as an ascii tree. Returns a list of lines. When
+    `sysinfo` is given, each detail line also carries cpu/rss/elapsed."""
     if color is None:
         color = False
     lines = []
@@ -502,7 +650,7 @@ def render(roots, suppressed, width=CMD_WIDTH, color=None):
         head = "%s%s%d %s" % (prefix, connector, node.pid, cmd)
         lines.append(head)
         child_prefix = prefix + ("   " if is_last else "│  ")
-        detail = _detail(node, color)
+        detail = _detail(node, color, sysinfo)
         if detail is not None:
             lines.append(child_prefix + detail)
         visible = [c for c in node.children
@@ -514,6 +662,22 @@ def render(roots, suppressed, width=CMD_WIDTH, color=None):
 
     for i, root in enumerate(roots):
         walk(root, "", True)
+    return lines
+
+
+def glossary(color):
+    """A short legend printed at the head of the output explaining the
+    annotations (notably what '+N est' means). Returns a list of lines."""
+    lines = [
+        "psf — interesting process subtrees only; the dim line under each "
+        "process annotates it.",
+        "  sockets: LISTEN :PORT = listening   "
+        "+N est = N established TCP connections   unix:PATH = named socket",
+        "  stats:   cpu X% (Y avg) = recent / lifetime-average CPU   "
+        "rss = resident memory   up = time since start",
+    ]
+    if color:
+        lines = ["\x1b[2m%s\x1b[0m" % ln for ln in lines]
     return lines
 
 
@@ -559,6 +723,12 @@ def main(argv=None):
     ap.add_argument("--no-cache", action="store_true",
                     help="ignore and do not write the socket cache")
     ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--no-glossary", action="store_true",
+                    help="suppress the legend printed at the head of output")
+    ap.add_argument("-s", "--sample-interval", type=float,
+                    default=SAMPLE_INTERVAL,
+                    help="seconds slept to measure current CPU (default %.2g; "
+                         "0 disables the current-CPU sample)" % SAMPLE_INTERVAL)
     args = ap.parse_args(argv)
 
     procs = scan()
@@ -575,10 +745,17 @@ def main(argv=None):
     probe(printed, cache)
     if not args.no_cache:
         cache.save(live_keys={(p.pid, p.starttime) for p in procs.values()})
+    sample_current_cpu(printed, args.sample_interval)
 
     color = sys.stdout.isatty() and not args.no_color
-    lines = render(visible_roots, suppressed, width=args.width, color=color)
-    print("\n".join(lines))
+    sysinfo = SysInfo(clk_tck=CLK_TCK, page_size=PAGE_SIZE,
+                      uptime=read_uptime())
+    out = []
+    if not args.no_glossary:
+        out += glossary(color) + [""]
+    out += render(visible_roots, suppressed, width=args.width, color=color,
+                  sysinfo=sysinfo)
+    print("\n".join(out))
 
     hidden = sum(1 for p in procs.values() if not p.kept)
     kthreads = sum(1 for p in procs.values() if p.ppid == 2 or p.pid == 2)
