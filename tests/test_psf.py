@@ -670,5 +670,40 @@ class TestDiffSnapshots(unittest.TestCase):
         self.assertEqual([p.comm for p in died], ["a"])
 
 
+# --- lifecycle formatting ---------------------------------------------------
+
+
+class TestFormatLifecycle(unittest.TestCase):
+    def setUp(self):
+        self.SYS = psf.SysInfo(clk_tck=100, page_size=4096, uptime=1100.0)
+
+    def test_empty_is_no_section(self):
+        self.assertEqual(psf.format_lifecycle([], [], {}, self.SYS, 0.2), [])
+
+    def test_born_grouped_with_parent(self):
+        born = [_p(pid, 999, comm="cc1plus") for pid in (10, 11, 12)]
+        parents = {999: "bazel"}
+        out = psf.format_lifecycle(born, [], parents, self.SYS, 0.21)
+        text = "\n".join(out)
+        self.assertIn("system-wide", text)
+        self.assertIn("0.21s", text)
+        self.assertIn("×3 cc1plus", text)
+        self.assertIn("(←bazel)", text)
+
+    def test_died_singleton_shows_lived(self):
+        # started at tick 99999, uptime 1100 -> ~100s alive
+        dead = _p(500, 1, comm="git", starttime=99999)
+        out = psf.format_lifecycle([], [dead], {1: "bash"}, self.SYS, 0.2)
+        text = "\n".join(out)
+        self.assertIn("-500 git", text)
+        self.assertIn("lived 1m40s", text)
+
+    def test_cap_with_more(self):
+        born = [_p(1000 + i, 1, comm="c%03d" % i)
+                for i in range(psf.LIFECYCLE_MAX + 5)]
+        out = psf.format_lifecycle(born, [], {}, self.SYS, 0.2)
+        self.assertIn("+5 more", "\n".join(out))
+
+
 if __name__ == "__main__":
     unittest.main()
