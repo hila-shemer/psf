@@ -381,6 +381,31 @@ def windowed_rate(ring, window, clk_tck):
     return ((now_ticks - ticks0) / clk_tck) / elapsed
 
 
+def update_history(history, procs, now, longest_window):
+    """Append (now, utime+stime) to each live proc's ring (keyed by
+    (pid, starttime)); evict samples older than now-longest_window while keeping
+    the single most recent sample before the cutoff (so the longest window stays
+    fully covered); drop rings for pids no longer present. Mutates `history`."""
+    cutoff = now - longest_window
+    seen = set()
+    for p in procs.values():
+        key = (p.pid, p.starttime)
+        seen.add(key)
+        ring = history.setdefault(key, [])
+        ring.append((now, p.utime + p.stime))
+        keep_from = 0
+        for i, (ts, _ticks) in enumerate(ring):
+            if ts < cutoff:
+                keep_from = i
+            else:
+                break
+        if keep_from:
+            del ring[:keep_from]
+    for key in list(history):
+        if key not in seen:
+            del history[key]
+
+
 def fmt_pct(frac):
     """Format a CPU fraction as a percentage with magnitude-scaled precision so
     tiny lifetime averages stay legible (e.g. 0.0002 -> '0.02%') instead of
