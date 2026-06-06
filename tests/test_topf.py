@@ -134,3 +134,36 @@ def test_select_promotes_and_marks_interesting():
     topf.select(procs, [], topf.PAGE_SIZE, 2, True)
     assert hog.interesting is True and hog.kept is True
     assert root.kept is True   # ancestor kept to keep tree rooted
+
+
+def test_subtree_window_cpu_sums_all_descendants():
+    root = _rproc(1, ppid=0, windows=[1.0, 0, 0])
+    a = _rproc(2, ppid=1, windows=[2.0, 0, 0])
+    b = _rproc(3, ppid=2, windows=[0.5, 0, 0])
+    procs = {1: root, 2: a, 3: b}
+    topf.build_tree(procs)
+    assert abs(topf.subtree_window_cpu(root, 0) - 3.5) < 1e-9
+    assert abs(topf.subtree_window_cpu(a, 0) - 2.5) < 1e-9
+
+
+def test_subtree_window_cpu_treats_none_as_zero():
+    root = _rproc(1, ppid=0, windows=[None, None, None])
+    assert topf.subtree_window_cpu(root, 0) == 0.0
+
+
+def test_render_orders_top_level_by_window_desc_pid_tiebreak():
+    # two top-level roots; the busier one (higher 0-window cpu) must render first
+    cold = _rproc(10, ppid=0, comm="cold", windows=[0.1, 0, 0])
+    hot = _rproc(20, ppid=0, comm="hot", windows=[5.0, 0, 0])
+    procs = {10: cold, 20: hot}
+    topf.build_tree(procs)
+    for p in procs.values():
+        p.kept = True
+    roots = [cold, hot]
+    key = lambda item: topf.subtree_window_cpu(
+        item.members[0] if isinstance(item, topf.Group) else item, 0)
+    lines = topf.render(roots, set(), top_sort_key=key)
+    assert lines[0].endswith("hot")
+    assert any(ln.endswith("cold") for ln in lines)
+    assert lines.index(next(l for l in lines if l.endswith("hot"))) < \
+           lines.index(next(l for l in lines if l.endswith("cold")))
