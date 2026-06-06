@@ -727,6 +727,12 @@ def read_uptime():
         return 0.0
 
 
+def cores_count():
+    """Number of online CPUs (for the header and for context, not for math —
+    CPU figures are already in cores). Falls back to 1."""
+    return os.cpu_count() or 1
+
+
 def _parents_map(*snaps):
     """pid -> comm across one or more {pid: Proc} snapshots (for annotating the
     parent of a born/died process)."""
@@ -1130,6 +1136,91 @@ def collect_printed(roots, suppressed):
     return out
 
 
+def header_line(frame_dt, sysinfo, nprocs, hidden, interval, frozen=False):
+    """Top-style status line."""
+    state = "  FROZEN" if frozen else ""
+    return ("topf — %.2gs, %d cores, %d procs (%d hidden)   every %.2gs   "
+            "[q]uit  [space]freeze  [w]indow%s"
+            % (frame_dt, sysinfo.cores, nprocs, hidden, interval, state))
+
+
+def build_frame(prev, cur, history, t_prev, t_now, args, color, sysinfo,
+                sort_idx, show_avg, frozen=False):
+    """Pure-ish assembly of one frame's lines (no clipping, no terminal I/O):
+    tree (ordered) + optional lifecycle, with a header on top. `prev` may be
+    None (first frame / once-mode primes). `history` already updated & windows
+    already computed for `cur`. Returns a list of lines."""
+    roots = build_tree(cur)
+    select(cur, DEFAULT_MATCHERS, sysinfo.page_size, args.promote_level,
+           args.rss_needs_cpu)
+    suppressed = collapse(cur, threshold=args.threshold)
+    visible_roots = [r for r in roots if r.kept]
+    printed = [n for n in collect_printed(visible_roots, suppressed) if n.kept]
+
+    if args.no_cache:
+        cache = Cache(os.devnull, boot_id="", now=time.time())
+    else:
+        cache = Cache(cache_path(), boot_id=read_boot_id(), now=time.time())
+    probe(printed, cache)
+    if not args.no_cache:
+        cache.save(live_keys={(p.pid, p.starttime) for p in cur.values()})
+
+    dedup_min = None if args.no_dedup else args.dedup_min
+    key = lambda item: subtree_window_cpu(
+        item.members[0] if isinstance(item, Group) else item, sort_idx)
+
+    frame_dt = (t_now - t_prev) if prev is not None else 0.0
+    hidden = sum(1 for p in cur.values() if not p.kept)
+    out = [header_line(frame_dt, sysinfo, len(cur), hidden,
+                       args.sample_interval, frozen)]
+    if not args.no_glossary:
+        out += [""] + glossary(color)
+    out += [""]
+    out += render(visible_roots, suppressed, width=args.width, color=color,
+                  sysinfo=sysinfo, dedup_min=dedup_min, never_merge=NEVER_MERGE,
+                  top_sort_key=key, show_avg=show_avg)
+    if prev is not None and not args.no_lifecycle:
+        born, died = diff_snapshots(prev, cur)
+        section = format_lifecycle(born, died, _parents_map(prev, cur),
+                                   sysinfo, frame_dt, color=color)
+        if section:
+            out += [""] + section
+    return out
+
+
+def render_once(interval, args):
+    """Take two samples `interval` apart and return one frame's lines (no alt
+    screen). Shortest window is real; longer windows show '—'; a lifetime avg is
+    appended (show_avg=True). This is the piped / --once path."""
+    windows = args.windows
+    longest = max(windows)
+    history = {}
+    s_a = scan()
+    t_a = time.monotonic()
+    update_history(history, s_a, t_a, longest)
+    time.sleep(interval)
+    s_b = scan()
+    t_b = time.monotonic()
+    update_history(history, s_b, t_b, longest)
+    compute_windows(s_b, history, windows, CLK_TCK)
+    sysinfo = SysInfo(clk_tck=CLK_TCK, page_size=PAGE_SIZE,
+                      uptime=read_uptime(), cores=cores_count())
+    color = sys.stdout.isatty() and not args.no_color
+    return build_frame(s_a, s_b, history, t_a, t_b, args, color, sysinfo,
+                       sort_idx=0, show_avg=True)
+
+
+def _once_defaults():
+    """A defaults namespace for render_once in tests."""
+    import types
+    return types.SimpleNamespace(
+        width=CMD_WIDTH, threshold=COLLAPSE_THRESHOLD, no_cache=True,
+        no_color=True, no_glossary=False, sample_interval=REFRESH_INTERVAL,
+        no_dedup=False, dedup_min=DEDUP_MIN, no_lifecycle=False,
+        windows=DEFAULT_WINDOWS, promote_level=PROMOTE_LEVEL,
+        rss_needs_cpu=True)
+
+
 def parse_windows(text):
     """Parse a '2,10,60' window spec into a tuple of positive floats (ascending
     order is the caller's responsibility). Raises ValueError on empty/garbage."""
@@ -1181,55 +1272,12 @@ def main(argv=None):
                     help="allow promotion by large RSS alone")
     args = ap.parse_args(argv)
 
-    s_a = scan()
-    t_a = time.monotonic()
-    roots = build_tree(s_a)
-    select(s_a, DEFAULT_MATCHERS)
-    suppressed = collapse(s_a, threshold=args.threshold)
-    visible_roots = [r for r in roots if r.kept]
-    printed = [n for n in collect_printed(visible_roots, suppressed) if n.kept]
-
-    born, died, s_b, dt = [], [], None, 0.0
-    if args.sample_interval > 0:
-        time.sleep(args.sample_interval)
-        s_b = scan()
-        dt = time.monotonic() - t_a
-        for n in printed:                      # current CPU over the same window
-            other = s_b.get(n.pid)
-            if other is not None and other.starttime == n.starttime:
-                n.cpu_current = cpu_fraction(
-                    (other.utime + other.stime) - (n.utime + n.stime),
-                    dt, CLK_TCK)
-        born, died = diff_snapshots(s_a, s_b)
-
-    if args.no_cache:
-        cache = Cache(os.devnull, boot_id="", now=time.time())
-    else:
-        cache = Cache(cache_path(), boot_id=read_boot_id(), now=time.time())
-    probe(printed, cache)
-    if not args.no_cache:
-        cache.save(live_keys={(p.pid, p.starttime) for p in s_a.values()})
-
-    color = sys.stdout.isatty() and not args.no_color
-    sysinfo = SysInfo(clk_tck=CLK_TCK, page_size=PAGE_SIZE, uptime=read_uptime())
-    dedup_min = None if args.no_dedup else args.dedup_min
-
-    out = []
-    if not args.no_glossary:
-        out += glossary(color) + [""]
-    out += render(visible_roots, suppressed, width=args.width, color=color,
-                  sysinfo=sysinfo, dedup_min=dedup_min, never_merge=NEVER_MERGE)
-    if s_b is not None and not args.no_lifecycle:
-        section = format_lifecycle(born, died, _parents_map(s_a, s_b),
-                                   sysinfo, dt, color=color)
-        if section:
-            out += [""] + section
-    print("\n".join(out))
-
-    hidden = sum(1 for p in s_a.values() if not p.kept)
-    kthreads = sum(1 for p in s_a.values() if p.ppid == 2 or p.pid == 2)
-    sys.stderr.write("(hidden: %d procs, %d kernel threads)\n"
-                     % (hidden, kthreads))
+    use_once = args.once or not sys.stdout.isatty()
+    if use_once:
+        lines = render_once(args.sample_interval, args)
+        print("\n".join(lines))
+        return
+    run_live(args)   # implemented in Task 10
 
 
 if __name__ == "__main__":
