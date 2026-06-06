@@ -1,7 +1,7 @@
 # topf — windowed-CPU live process viewer (psf → topf)
 
 Date: 2026-06-06
-Status: design approved, pending spec review
+Status: implemented (see docs/superpowers/plans/2026-06-07-topf-implementation.md)
 
 ## Motivation
 
