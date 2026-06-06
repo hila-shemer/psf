@@ -962,6 +962,53 @@ def _group_detail(members, color, sysinfo):
     return _compose_dim(bits, color)
 
 
+_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def visible_truncate(s, width):
+    """Truncate `s` to `width` VISIBLE characters, counting through SGR escapes
+    (\\x1b[..m) without splitting them. If a non-reset colour is still active at
+    the end of the kept text, a reset (\\x1b[0m) is appended so it doesn't bleed
+    into the rest of the screen."""
+    if width <= 0:
+        return ""
+    out = []
+    vis = 0
+    has_color = False
+    i = 0
+    n = len(s)
+    while i < n:
+        m = _SGR_RE.match(s, i)
+        if m:
+            esc = m.group()
+            out.append(esc)
+            has_color = esc != "\x1b[0m"
+            i = m.end()
+            continue
+        if vis >= width:
+            break
+        out.append(s[i])
+        vis += 1
+        i += 1
+    res = "".join(out)
+    if has_color:           # a non-reset colour is still active -> stop the bleed
+        res += "\x1b[0m"
+    return res
+
+
+def clip_frame(lines, rows, cols):
+    """Clip a list of rendered lines to a `rows` x `cols` terminal: every line
+    is column-truncated (ANSI-aware); if there are more than `rows` lines, keep
+    rows-1 and replace the rest with a '… +K more' footer."""
+    clipped = [visible_truncate(ln, cols) for ln in lines]
+    if len(clipped) <= rows:
+        return clipped
+    keep = clipped[:rows - 1]
+    more = len(clipped) - (rows - 1)
+    keep.append(visible_truncate("… +%d more" % more, cols))
+    return keep
+
+
 def subtree_window_cpu(node, widx):
     """Sum of the window `widx` CPU rate over `node` and ALL its descendants
     (suppressed/collapsed included). None rates count as 0. Used to order
