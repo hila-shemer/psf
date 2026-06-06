@@ -414,6 +414,20 @@ def range_str(values, fmt):
     return "%s–%s" % (fmt(lo), fmt(hi))
 
 
+def diff_snapshots(before, after):
+    """Given two {pid: Proc} snapshots, return (born, died) Proc lists keyed by
+    (pid, starttime) so a reused PID is treated as a death + a birth. born are
+    drawn from `after`, died from `before`. Each list is sorted by pid."""
+    def keyed(snap):
+        return {(p.pid, p.starttime): p for p in snap.values()}
+    kb, ka = keyed(before), keyed(after)
+    born = [ka[k] for k in ka if k not in kb]
+    died = [kb[k] for k in kb if k not in ka]
+    born.sort(key=lambda p: p.pid)
+    died.sort(key=lambda p: p.pid)
+    return born, died
+
+
 # --- cache ------------------------------------------------------------------
 
 
