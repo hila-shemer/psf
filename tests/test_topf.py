@@ -167,3 +167,46 @@ def test_render_orders_top_level_by_window_desc_pid_tiebreak():
     assert any(ln.endswith("cold") for ln in lines)
     assert lines.index(next(l for l in lines if l.endswith("hot"))) < \
            lines.index(next(l for l in lines if l.endswith("cold")))
+
+
+def test_visible_truncate_plain():
+    assert topf.visible_truncate("hello world", 5) == "hello"
+
+
+def test_visible_truncate_counts_visible_not_escapes():
+    s = "\x1b[33mhello\x1b[0m"
+    # width 3 keeps the opening SGR, 3 visible chars, and appends a reset
+    assert topf.visible_truncate(s, 3) == "\x1b[33mhel\x1b[0m"
+
+
+def test_visible_truncate_no_cut_keeps_everything():
+    s = "\x1b[33mhi\x1b[0m"
+    assert topf.visible_truncate(s, 10) == s
+
+
+def test_visible_truncate_zero_width():
+    assert topf.visible_truncate("anything", 0) == ""
+
+
+def test_visible_truncate_never_splits_escape():
+    s = "a\x1b[1;31mB"   # width 2 must not cut inside the \x1b[1;31m
+    out = topf.visible_truncate(s, 2)
+    assert out == "a\x1b[1;31mB\x1b[0m"
+
+
+def test_clip_frame_within_bounds():
+    lines = ["aaa", "bbb"]
+    assert topf.clip_frame(lines, rows=5, cols=10) == ["aaa", "bbb"]
+
+
+def test_clip_frame_overflow_adds_more_footer():
+    lines = ["l0", "l1", "l2", "l3", "l4"]
+    out = topf.clip_frame(lines, rows=3, cols=20)
+    assert len(out) == 3
+    assert out[:2] == ["l0", "l1"]
+    assert out[2] == "… +3 more"
+
+
+def test_clip_frame_truncates_columns():
+    out = topf.clip_frame(["hello world"], rows=5, cols=5)
+    assert out == ["hello"]
