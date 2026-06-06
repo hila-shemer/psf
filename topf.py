@@ -19,8 +19,11 @@ import json
 import math
 import os
 import re
+import select as _select      # stdlib selector; avoid clash with select() below
 import sys
+import termios
 import time
+import tty
 from collections import Counter, namedtuple
 from dataclasses import dataclass, field
 
@@ -1134,6 +1137,81 @@ def collect_printed(roots, suppressed):
     for r in roots:
         walk(r)
     return out
+
+
+def _draw_frame(out, lines):
+    """Home the cursor, write each line with clear-to-EOL, then clear to end of
+    screen so a shorter frame doesn't leave stale rows behind."""
+    buf = ["\x1b[H"]
+    for ln in lines:
+        buf.append(ln + "\x1b[K\r\n")
+    buf.append("\x1b[J")
+    out.write("".join(buf))
+    out.flush()
+
+
+def run_live(args):
+    """Full-screen live loop: raw ANSI alt-screen + termios cbreak + select
+    polling. Read-only keys: q/Ctrl-C quit, space freeze, w cycle sort window.
+    Terminal state is always restored (finally), even on exception/signal."""
+    fd = sys.stdin.fileno()
+    out = sys.stdout
+    old_attr = termios.tcgetattr(fd)
+    windows = args.windows
+    longest = max(windows)
+    history = {}
+    cache = (Cache(os.devnull, boot_id="", now=time.time()) if args.no_cache
+             else Cache(cache_path(), boot_id=read_boot_id(), now=time.time()))
+    sysinfo_base = (read_uptime(), cores_count())
+    sort_idx = 0
+    frozen = False
+    prev, t_prev = None, None
+
+    try:
+        tty.setcbreak(fd)
+        out.write("\x1b[?1049h")
+        out.flush()
+        while True:
+            if not frozen:
+                cur = scan()
+                t_now = time.monotonic()
+                update_history(history, cur, t_now, longest)
+                compute_windows(cur, history, windows, CLK_TCK)
+                color = not args.no_color
+                sysinfo = SysInfo(clk_tck=CLK_TCK, page_size=PAGE_SIZE,
+                                  uptime=read_uptime(), cores=sysinfo_base[1])
+                lines = build_frame(prev, cur, history, t_prev or t_now, t_now,
+                                    args, color, sysinfo, sort_idx,
+                                    show_avg=False, frozen=frozen)
+                cols, rows = os.get_terminal_size()
+                _draw_frame(out, clip_frame(lines, rows, cols))
+                prev, t_prev = cur, t_now
+
+            r, _w, _e = _select.select([fd], [], [], args.sample_interval)
+            if r:
+                ch = sys.stdin.read(1)
+                if ch in ("q", "\x03"):     # q or Ctrl-C
+                    break
+                if ch == " ":
+                    frozen = not frozen
+                    if frozen:              # repaint once to show FROZEN marker
+                        cols, rows = os.get_terminal_size()
+                        lines[0] = header_line(
+                            (t_now - (t_prev or t_now)), sysinfo, len(cur),
+                            sum(1 for p in cur.values() if not p.kept),
+                            args.sample_interval, frozen=True)
+                        _draw_frame(out, clip_frame(lines, rows, cols))
+                elif ch == "w":
+                    sort_idx = (sort_idx + 1) % len(windows)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        out.write("\x1b[?1049l")
+        out.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
+        if not args.no_cache:
+            cache.now = time.time()
+            cache.save(live_keys=set())     # nothing forced live; entries already pruned
 
 
 def header_line(frame_dt, sysinfo, nprocs, hidden, interval, frozen=False):
