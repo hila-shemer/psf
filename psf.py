@@ -31,6 +31,8 @@ SAMPLE_INTERVAL = 0.2     # seconds slept to measure current CPU (0 disables)
 PATH_HEAD = 2             # leading path components kept when compressing
 PATH_MAX_BASENAME = 30    # basename length above which it is itself shortened
 PATH_BASENAME_KEEP = 6    # chars kept each side of '...' in a long basename
+DEDUP_MIN = 3             # min identical siblings to merge into one ×N group
+NEVER_MERGE = frozenset({"claude"})   # comms never grouped, even when identical
 
 # System constants, read once. CLK_TCK converts stat jiffies -> seconds;
 # PAGE_SIZE converts stat rss (in pages) -> bytes.
@@ -43,6 +45,9 @@ SysInfo = namedtuple("SysInfo", "clk_tck page_size uptime")
 # One /proc/PID/stat row, only the fields we use.
 Stat = namedtuple("Stat", "comm state ppid num_threads starttime "
                           "utime stime rss_pages")
+
+# A merged set of >= DEDUP_MIN near-identical sibling Procs.
+Group = namedtuple("Group", "members")
 
 # Each matcher: (label, target, regex) where target is "comm" or "cmdline".
 DEFAULT_MATCHERS = [
@@ -179,6 +184,34 @@ def select(procs, matchers):
         while anc is not None and not anc.kept:
             anc.kept = True
             anc = procs.get(anc.ppid)
+
+
+def group_siblings(procs, dedup_min, never_merge):
+    """Partition a node's visible sibling Procs by (comm, exe) into a render
+    list. A partition with >= dedup_min members whose comm is not in
+    never_merge becomes a Group; everything else stays an individual Proc.
+    dedup_min falsy (None/0) disables grouping. Items are ordered by their
+    smallest pid so output is stable."""
+    if not dedup_min:
+        return list(procs)
+    buckets = {}
+    order = []
+    for p in procs:
+        key = (p.comm, p.exe)
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append(p)
+    items = []
+    for key in order:
+        members = buckets[key]
+        if len(members) >= dedup_min and key[0] not in never_merge:
+            items.append(Group(members=members))
+        else:
+            items.extend(members)
+    items.sort(key=lambda it: min(m.pid for m in it.members)
+               if isinstance(it, Group) else it.pid)
+    return items
 
 
 # --- pure core: collapse ----------------------------------------------------
