@@ -1,3 +1,5 @@
+import os
+
 import topf
 
 
@@ -261,3 +263,24 @@ def test_render_once_smoke():
     lines = topf.render_once(interval=0.05, args=topf._once_defaults())
     assert isinstance(lines, list) and lines
     assert any(ln.startswith("topf —") for ln in lines)
+
+
+def test_cache_get_expires_with_advancing_now(tmp_path):
+    # Mirror the live loop: frame 1 probes + saves; later frames build a fresh
+    # Cache that loads from the file and must honour TTL against ITS now.
+    path = str(tmp_path / "cache.json")
+    c1 = topf.Cache(path=path, boot_id="b", now=100.0, ttl=30)
+    c1.put(5, 1, fdcount=3, sockets="LISTEN :22")
+    c1.save(live_keys={(5, 1)})
+
+    # a frame 5s later: within TTL -> hit
+    c2 = topf.Cache(path=path, boot_id="b", now=105.0, ttl=30)
+    assert c2.get(5, 1, 3) == "LISTEN :22"
+
+    # a frame 200s later: beyond TTL -> miss (get reads c.now, not a frozen value)
+    c3 = topf.Cache(path=path, boot_id="b", now=300.0, ttl=30)
+    assert c3.get(5, 1, 3) is None
+
+    # a stale fd count also misses
+    c4 = topf.Cache(path=path, boot_id="b", now=105.0, ttl=30)
+    assert c4.get(5, 1, 99) is None
