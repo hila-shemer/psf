@@ -210,3 +210,25 @@ def test_clip_frame_overflow_adds_more_footer():
 def test_clip_frame_truncates_columns():
     out = topf.clip_frame(["hello world"], rows=5, cols=5)
     assert out == ["hello"]
+
+
+def test_cpu_bit_live_three_windows():
+    text, level = topf._cpu_bit([4.0, 2.0, 0.5])
+    assert text == "cpu 400% 200% 50%"
+    # level = max tint across windows: 4.0 cores clears all 3 anchors -> 3
+    assert level == 3
+
+
+def test_cpu_bit_none_window_renders_dash():
+    text, _ = topf._cpu_bit([4.0, None, None])
+    assert text == "cpu 400% — —"
+
+
+def test_cpu_bit_once_mode_appends_avg():
+    text, _ = topf._cpu_bit([0.42, None, None], avg_frac=0.031)
+    assert text == "cpu 42% — — (3.1% avg)"
+
+
+def test_cpu_bit_tint_ignores_none():
+    _, level = topf._cpu_bit([0.05, None, None])  # 0.05 cores -> level 0
+    assert level == 0
