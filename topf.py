@@ -1130,8 +1130,21 @@ def collect_printed(roots, suppressed):
     return out
 
 
+def parse_windows(text):
+    """Parse a '2,10,60' window spec into a tuple of positive floats (ascending
+    order is the caller's responsibility). Raises ValueError on empty/garbage."""
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    if not parts:
+        raise ValueError("no windows given")
+    vals = tuple(float(p) for p in parts)   # float() raises ValueError on garbage
+    if any(v <= 0 for v in vals):
+        raise ValueError("windows must be positive")
+    return vals
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Focused process snapshot.")
+    ap = argparse.ArgumentParser(prog="topf",
+                                 description="Focused live process viewer.")
     ap.add_argument("-w", "--width", type=int, default=CMD_WIDTH,
                     help="cmdline chars per process (default %d)" % CMD_WIDTH)
     ap.add_argument("-t", "--threshold", type=int, default=COLLAPSE_THRESHOLD,
@@ -1142,9 +1155,9 @@ def main(argv=None):
     ap.add_argument("--no-glossary", action="store_true",
                     help="suppress the legend printed at the head of output")
     ap.add_argument("-s", "--sample-interval", type=float,
-                    default=SAMPLE_INTERVAL,
-                    help="seconds slept to measure current CPU (default %.2g; "
-                         "0 disables the current-CPU sample)" % SAMPLE_INTERVAL)
+                    default=REFRESH_INTERVAL,
+                    help="sample == redraw cadence in seconds (default %.2g)"
+                         % REFRESH_INTERVAL)
     ap.add_argument("--no-dedup", action="store_true",
                     help="do not merge near-identical sibling subtrees")
     ap.add_argument("--dedup-min", type=int, default=DEDUP_MIN,
@@ -1152,6 +1165,20 @@ def main(argv=None):
                          % DEDUP_MIN)
     ap.add_argument("--no-lifecycle", action="store_true",
                     help="suppress the born/died section")
+    ap.add_argument("--once", action="store_true",
+                    help="take a single plain frame and exit (auto when piped)")
+    ap.add_argument("--windows", type=parse_windows, default=DEFAULT_WINDOWS,
+                    metavar="A,B,C",
+                    help="CPU window seconds, shortest first (default 2,10,60)")
+    ap.add_argument("--promote-level", type=int, default=PROMOTE_LEVEL,
+                    help="tint-anchor level to promote a heavy proc (default %d)"
+                         % PROMOTE_LEVEL)
+    ap.add_argument("--rss-needs-cpu", dest="rss_needs_cpu",
+                    action="store_true", default=True,
+                    help="RSS-only promotion also needs some CPU (default on)")
+    ap.add_argument("--no-rss-needs-cpu", dest="rss_needs_cpu",
+                    action="store_false",
+                    help="allow promotion by large RSS alone")
     args = ap.parse_args(argv)
 
     s_a = scan()
