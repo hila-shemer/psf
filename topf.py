@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""psf - focused process-snapshot tool.
+"""topf - focused live process viewer (windowed CPU).
 
-Prints a compact tree of only the *interesting* process subtrees (bazel,
-ssh sessions, tmux, claude), each annotated with the start of its command
-line, a summarized cwd, the executing binary, and open ports/sockets.
+A top-like, full-screen, continuously-sampling viewer that shows only the
+*interesting* process subtrees: those matched by comm/cmdline (bazel, ssh
+sessions, tmux, claude) AND those that are interesting because they are heavy
+(promoted by windowed CPU or RSS). Each node is annotated with the start of its
+command line, a summarized cwd, the executing binary, open ports/sockets, and
+per-window CPU / RSS / uptime.
 
-Deep-probes only the nodes it prints, and caches the expensive socket
-analysis across runs (keyed by (pid, starttime), validated by fd-count + TTL).
+Deep-probes only the nodes it prints, and caches the expensive socket analysis
+across frames (keyed by (pid, starttime), validated by fd-count + TTL).
 
-Run under sudo/root to see other users' processes; degrades to '?' otherwise.
+With stdout piped or --once, prints a single plain frame (the old psf
+behaviour). Run under sudo/root to see other users' processes.
 """
 import argparse
 import json
