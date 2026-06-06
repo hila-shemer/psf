@@ -47,6 +47,10 @@ LIFECYCLE_MAX = 40        # max born (and max died) comm-groups listed
 TINT_SGR = ("2", "2;33", "33", "1;31")          # dim, dim-yellow, yellow, bold-red
 RSS_TINT_ANCHORS = (100 * 1024**2, 1024**3, 5 * 1024**3)   # 100M, 1G, 5G
 CPU_TINT_ANCHORS = (0.10, 1.0, 4.0)                        # 10%, 100%, 400%
+DEFAULT_WINDOWS = (2.0, 10.0, 60.0)   # CPU window seconds (shortest..longest)
+PROMOTE_LEVEL = 2         # tint-anchor level required to promote (>= 1.0 core / >= 1G)
+RSS_GATE_LEVEL = 1        # longest-window CPU floor for RSS-only promotion (~10%)
+REFRESH_INTERVAL = 1.0    # default sample == redraw cadence (seconds)
 
 # System constants, read once. CLK_TCK converts stat jiffies -> seconds;
 # PAGE_SIZE converts stat rss (in pages) -> bytes.
@@ -175,17 +179,43 @@ def _descendants(proc):
     return out
 
 
-def select(procs, matchers):
-    """Mark .interesting and .kept. Kept = interesting roots + their
-    descendants + their ancestors (so the tree stays rooted). Kernel-thread
-    subtrees (under pid 2) are never kept unless explicitly matched."""
+def is_promoted(proc, page_size, promote_level, rss_needs_cpu, is_kthread):
+    """A process is promoted (interesting because heavy) when it clears
+    tint-anchor level >= promote_level on any CPU window, or (non-kthreads only)
+    on RSS. RSS-only promotion is gated: it also requires the longest window's
+    CPU to clear RSS_GATE_LEVEL unless rss_needs_cpu is False. Kernel threads
+    promote by CPU alone (they have no meaningful RSS)."""
+    cpu_level = max((_tint_level(f, CPU_TINT_ANCHORS)
+                     for f in proc.cpu_windows if f is not None), default=0)
+    if cpu_level >= promote_level:
+        return True
+    if is_kthread:
+        return False
+    rss = proc.rss_pages * page_size
+    if _tint_level(rss, RSS_TINT_ANCHORS) >= promote_level:
+        if not rss_needs_cpu:
+            return True
+        longest = proc.cpu_windows[-1] if proc.cpu_windows else None
+        return _tint_level(longest, CPU_TINT_ANCHORS) >= RSS_GATE_LEVEL
+    return False
+
+
+def select(procs, matchers, page_size, promote_level, rss_needs_cpu):
+    """Mark .interesting and .kept. Interesting = matched (bazel/ssh/tmux/claude)
+    OR resource-promoted (heavy CPU/RSS). Kept = interesting + their descendants
+    + their ancestors (so the tree stays rooted). Kernel-thread subtrees (under
+    pid 2) are never matched, but ARE promotable when heavy (CPU only)."""
     kthreadd = procs.get(2)
     kthread_pids = set()
     if kthreadd is not None:
         kthread_pids = {2} | {d.pid for d in _descendants(kthreadd)}
 
     for p in procs.values():
-        p.interesting = is_interesting(p, matchers) and p.pid not in kthread_pids
+        is_kthread = p.pid in kthread_pids
+        matched = (not is_kthread) and is_interesting(p, matchers)
+        promoted = is_promoted(p, page_size, promote_level, rss_needs_cpu,
+                               is_kthread)
+        p.interesting = matched or promoted
         p.kept = False
 
     for p in list(procs.values()):

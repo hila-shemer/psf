@@ -82,3 +82,55 @@ def test_compute_windows_young_proc_gets_none():
     hist = {(5, 1): [(3.0, 100)]}   # only one sample
     topf.compute_windows(procs, hist, (1.0, 2.0), TCK)
     assert procs[5].cpu_windows == [None, None]
+
+
+G = 1024 ** 3
+
+
+def _rproc(pid, ppid=1, comm="x", windows=None, rss_bytes=0, starttime=1):
+    p = topf.Proc(pid=pid, ppid=ppid, comm=comm, cmdline=comm, state="R",
+                  num_threads=1, starttime=starttime, uid=0,
+                  rss_pages=rss_bytes // topf.PAGE_SIZE)
+    p.cpu_windows = windows if windows is not None else [None, None, None]
+    return p
+
+
+def test_promote_by_cpu_level2():
+    p = _rproc(5, windows=[1.5, 0.0, 0.0])   # 1.5 cores -> cpu level 2
+    assert topf.is_promoted(p, topf.PAGE_SIZE, 2, True, False) is True
+
+
+def test_no_promote_below_level():
+    p = _rproc(5, windows=[0.5, 0.5, 0.5])   # 0.5 cores -> level 1 only
+    assert topf.is_promoted(p, topf.PAGE_SIZE, 2, True, False) is False
+
+
+def test_rss_only_promotion_gated_off_when_idle():
+    p = _rproc(5, windows=[0.0, 0.0, 0.0], rss_bytes=2 * G)  # rss level 2, no cpu
+    assert topf.is_promoted(p, topf.PAGE_SIZE, 2, True, False) is False   # gate on
+    assert topf.is_promoted(p, topf.PAGE_SIZE, 2, False, False) is True   # gate off
+
+
+def test_rss_only_promotion_passes_gate_with_floor_cpu():
+    # rss level 2 AND longest-window cpu >= level 1 (>=0.10 cores)
+    p = _rproc(5, windows=[0.0, 0.0, 0.2], rss_bytes=2 * G)
+    assert topf.is_promoted(p, topf.PAGE_SIZE, 2, True, False) is True
+
+
+def test_kthread_promotes_by_cpu_only_never_rss():
+    heavy = _rproc(5, windows=[2.0, 0.0, 0.0], rss_bytes=0)
+    assert topf.is_promoted(heavy, topf.PAGE_SIZE, 2, True, True) is True
+    # a kthread reporting rss is still never promoted by rss
+    rssonly = _rproc(6, windows=[0.0, 0.0, 0.0], rss_bytes=2 * G)
+    assert topf.is_promoted(rssonly, topf.PAGE_SIZE, 2, True, True) is False
+
+
+def test_select_promotes_and_marks_interesting():
+    # root(1) -> hog(5) heavy; hog must be kept AND interesting (survives collapse)
+    root = _rproc(1, ppid=0, comm="init")
+    hog = _rproc(5, ppid=1, comm="qemu", windows=[3.0, 3.0, 3.0])
+    procs = {1: root, 5: hog}
+    topf.build_tree(procs)
+    topf.select(procs, [], topf.PAGE_SIZE, 2, True)
+    assert hog.interesting is True and hog.kept is True
+    assert root.kept is True   # ancestor kept to keep tree rooted
