@@ -1,295 +1,387 @@
 import os
 
+import tempfile
+import unittest
+
 import psf
-import topf
 
 
-def _rproc(pid, ppid=1, comm="x", cmdline="x", rss_bytes=0, starttime=1,
-           utime=0, stime=0, exe="?"):
-    p = topf.Proc(pid=pid, ppid=ppid, comm=comm, cmdline=cmdline, state="R",
-                  num_threads=1, starttime=starttime, uid=0,
-                  rss_pages=rss_bytes // topf.PAGE_SIZE,
-                  utime=utime, stime=stime)
-    p.exe = exe
-    return p
+# --- helpers ----------------------------------------------------------------
 
 
-# --- classification ----------------------------------------------------------
+def _p(pid, ppid, comm="x", **kw):
+    kw.setdefault("cmdline", comm)
+    kw.setdefault("state", "S")
+    kw.setdefault("num_threads", 1)
+    kw.setdefault("starttime", pid * 10)
+    kw.setdefault("uid", 0)
+    return psf.Proc(pid=pid, ppid=ppid, comm=comm, **kw)
 
 
-def test_classify_matches_known_categories():
-    assert psf.classify(_rproc(1, comm="claude")).name == "user-session"
-    assert psf.classify(_rproc(2, comm="bazel")).name == "build-daemon"
-    assert psf.classify(_rproc(3, comm="clang-14")).name == "compile-worker"
-    assert psf.classify(_rproc(4, comm="sshd")).name == "infrastructure"
-    assert psf.classify(_rproc(5, comm="systemd")).name == "system-service"
-    assert psf.classify(_rproc(6, comm="random_thing")).name == "misc"
+# --- Task 1: stat parsing ---------------------------------------------------
 
 
-def test_classify_cmdline_matches():
-    p = _rproc(1, comm="sshd", cmdline="sshd: user@pts/0")
-    assert psf.classify(p).name == "infrastructure"  # comm match first
-    p2 = _rproc(2, comm="x", cmdline="sshd: user@pts/0")
-    # sshd: cmdline matches SESSION_LEADER_PATTERNS but also CLASSIFICATION_RULES
-    cat = psf.classify(p2)
-    # sshd$ in rules matches "x" as comm? No, "^sshd$" won't match "x"
-    # The cmdline rule for "^sshd: " won't match here because rules use
-    # comm or cmdline based on their target
+class TestParseStat(unittest.TestCase):
+    def test_parse_stat_basic(self):
+        # fields: 1 pid, 2 (comm), 3 state, 4 ppid, ... 20 num_threads,
+        # 21 itrealvalue, 22 starttime
+        line = ("4242 (test app) S 1 4242 4242 0 -1 4194304 100 0 0 0 "
+                "10 5 0 0 20 0 7 0 99999 0 0")
+        comm, state, ppid, nthreads, starttime = psf.parse_stat(line)
+        self.assertEqual(comm, "test app")
+        self.assertEqual(state, "S")
+        self.assertEqual(ppid, 1)
+        self.assertEqual(nthreads, 7)
+        self.assertEqual(starttime, 99999)
+
+    def test_parse_stat_comm_with_parens(self):
+        line = ("99 (weird )(name) R 2 0 0 0 -1 0 0 0 0 0 "
+                "0 0 0 0 20 0 1 0 555 0 0")
+        comm, state, ppid, nthreads, starttime = psf.parse_stat(line)
+        self.assertEqual(comm, "weird )(name")
+        self.assertEqual(ppid, 2)
+        self.assertEqual(starttime, 555)
 
 
-def test_classify_venv_python_overrides_to_user_session():
-    # python -> compile-worker normally
-    assert psf.classify(_rproc(1, comm="python3")).name == "compile-worker"
-    # python with venv -> user-session
-    def venv_resolver(proc):
-        if proc.comm.startswith("python"):
-            return "/home/user/.venv"
-        return None
-    assert psf.classify(_rproc(1, comm="python3"),
-                        venv_resolver=venv_resolver).name == "user-session"
+# --- Task 2: cmdline + tree -------------------------------------------------
 
 
-def test_classify_no_venv_resolver_stays_compile_worker():
-    def no_venv(proc):
-        return None
-    assert psf.classify(_rproc(1, comm="python3"),
-                        venv_resolver=no_venv).name == "compile-worker"
+class TestCleanCmdline(unittest.TestCase):
+    def test_nul_separated(self):
+        self.assertEqual(psf.clean_cmdline("bazel\0build\0//foo\0"),
+                         "bazel build //foo")
+
+    def test_empty_falls_back_to_comm(self):
+        self.assertEqual(psf.clean_cmdline("", comm="kworker"), "[kworker]")
 
 
-# --- venv detection ----------------------------------------------------------
+class TestBuildTree(unittest.TestCase):
+    def test_children_and_roots(self):
+        procs = {1: _p(1, 0), 10: _p(10, 1), 11: _p(11, 1), 100: _p(100, 10)}
+        roots = psf.build_tree(procs)
+        self.assertEqual([r.pid for r in roots], [1])
+        self.assertEqual(sorted(c.pid for c in procs[1].children), [10, 11])
+        self.assertEqual([c.pid for c in procs[10].children], [100])
+
+    def test_orphan_is_root(self):
+        # ppid points outside the set (parent already reaped) -> treated as root
+        procs = {500: _p(500, 999), 501: _p(501, 500)}
+        roots = psf.build_tree(procs)
+        self.assertEqual([r.pid for r in roots], [500])
 
 
-def test_detect_venv_from_exe_path():
-    p = _rproc(1, comm="python3", exe="/home/user/psf/.venv/bin/python3")
-    venv = psf.detect_venv(p)
-    assert venv is not None
-    assert "psf" in venv or ".venv" in venv
+# --- Task 3: selection ------------------------------------------------------
 
 
-def test_detect_venv_no_venv():
-    p = _rproc(1, comm="python3", exe="/usr/bin/python3")
-    venv = psf.detect_venv(p)
-    # Depends on whether /proc/PID/environ has VIRTUAL_ENV; on most systems
-    # running pytest, it won't. Just check it doesn't crash.
-    assert venv is None or isinstance(venv, str)
+class TestSelection(unittest.TestCase):
+    def test_is_interesting_matches_comm_and_cmdline(self):
+        m = psf.DEFAULT_MATCHERS
+        self.assertTrue(psf.is_interesting(_p(1, 0, comm="tmux: server"), m))
+        self.assertTrue(psf.is_interesting(
+            _p(2, 0, comm="java", cmdline="bazel(myworkspace)"), m))
+        self.assertFalse(psf.is_interesting(_p(3, 0, comm="systemd-journald"), m))
+
+    def test_keeps_interesting_descendants_and_ancestors(self):
+        # init -> sshd -> bash -> claude ; plus an unrelated daemon
+        procs = {
+            1: _p(1, 0, comm="systemd"),
+            5: _p(5, 1, comm="sshd", cmdline="sshd: shemer@pts/0"),
+            6: _p(6, 5, comm="bash"),
+            7: _p(7, 6, comm="claude"),
+            9: _p(9, 1, comm="crond"),
+        }
+        psf.build_tree(procs)
+        psf.select(procs, psf.DEFAULT_MATCHERS)
+        kept = {pid for pid, p in procs.items() if p.kept}
+        self.assertEqual(kept, {1, 5, 6, 7})   # ancestor 1, sshd subtree; not crond
+        self.assertTrue(procs[7].interesting)  # claude
+        self.assertFalse(procs[6].interesting)  # bash kept only as path member
+
+    def test_kernel_threads_excluded(self):
+        procs = {1: _p(1, 0, comm="systemd"),
+                 2: _p(2, 0, comm="kthreadd"),
+                 3: _p(3, 2, comm="ksoftirqd/0")}
+        psf.build_tree(procs)
+        psf.select(procs, psf.DEFAULT_MATCHERS)
+        self.assertFalse(any(p.kept for p in procs.values()))
 
 
-def test_read_environ_returns_dict():
-    # Read our own environ — must be non-empty on Linux
-    pid = os.getpid()
-    env = psf.read_environ(pid)
-    assert isinstance(env, dict)
-    assert "PATH" in env
+# --- Task 4: collapse -------------------------------------------------------
 
 
-# --- session detection -------------------------------------------------------
+class TestCollapse(unittest.TestCase):
+    def test_big_subtree_collapses_with_histogram(self):
+        procs = {1: _p(1, 0, comm="bazel", cmdline="bazel build //...")}
+        procs[1].interesting = True
+        pid = 100
+        for comm, n in (("cc1plus", 5), ("ld", 3)):
+            for _ in range(n):
+                procs[pid] = _p(pid, 1, comm=comm)
+                pid += 1
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        suppressed = psf.collapse(procs, threshold=4)
+        root = procs[1]
+        self.assertTrue(root.collapsed)
+        self.assertIn("+8", root.collapse_note)       # 8 descendants summarized
+        self.assertIn("cc1plus", root.collapse_note)
+        self.assertEqual(len(suppressed), 8)
+
+    def test_small_subtree_not_collapsed(self):
+        procs = {1: _p(1, 0, comm="tmux"), 2: _p(2, 1, comm="bash")}
+        procs[1].interesting = True
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        suppressed = psf.collapse(procs, threshold=4)
+        self.assertFalse(procs[1].collapsed)
+        self.assertEqual(suppressed, set())
+
+    def test_interesting_descendant_is_never_suppressed(self):
+        procs = {1: _p(1, 0, comm="tmux")}
+        procs[1].interesting = True
+        for i in range(10):
+            procs[200 + i] = _p(200 + i, 1, comm="bash")
+        procs[300] = _p(300, 1, comm="claude")
+        procs[300].interesting = True
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        suppressed = psf.collapse(procs, threshold=4)
+        self.assertTrue(procs[1].collapsed)
+        self.assertNotIn(300, suppressed)             # claude stays visible
 
 
-def test_find_session_leaders_finds_claude():
-    procs = {
-        1: _rproc(1, ppid=0, comm="init"),
-        10: _rproc(10, ppid=1, comm="claude"),
-    }
-    topf.build_tree(procs)
-    leaders = psf.find_session_leaders(procs)
-    assert len(leaders) == 1
-    assert leaders[0].comm == "claude"
+# --- Task 5: socket parsing -------------------------------------------------
 
 
-def test_find_sessions_groups_subtrees():
-    procs = {
-        1: _rproc(1, ppid=0, comm="init"),
-        10: _rproc(10, ppid=1, comm="claude"),
-        11: _rproc(11, ppid=10, comm="python3"),
-        12: _rproc(12, ppid=10, comm="node"),
-    }
-    topf.build_tree(procs)
-    categories = {10: psf.CAT_BY_NAME["user-session"],
-                  11: psf.CAT_BY_NAME["compile-worker"],
-                  12: psf.CAT_BY_NAME["compile-worker"]}
-    sessions = psf.find_sessions(procs, categories)
-    assert len(sessions) == 1
-    assert sessions[0].leader.pid == 10
-    assert len(sessions[0].children) == 2
+class TestSocketParsing(unittest.TestCase):
+    # Real /proc/net/tcp layout: inode is field index 9. tx:rx and tr:tm->when
+    # are each a single colon-joined field.
+    TCP = (
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when "
+        "retrnsmt   uid  timeout inode\n"
+        "   0: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 "
+        "00000000   100        0 1111 1 0000000000000000 100 0 0 10 0\n"
+        "   1: 0100007F:8A9C 0100007F:1F90 01 00000000:00000000 00:00000000 "
+        "00000000   100        0 2222 1 0000000000000000 100 0 0 10 0\n"
+    )
+    UNIX = (
+        "Num       RefCount Protocol Flags    Type St Inode Path\n"
+        "0000: 00000002 00000000 00010000 0001 01 3333 /tmp/tmux-1000/default\n"
+        "0000: 00000002 00000000 00010000 0001 01 4444\n"
+    )
+
+    def test_parse_tcp_listen_and_established(self):
+        m = psf.parse_net_tcp(self.TCP, ipv6=False)
+        self.assertEqual(m[1111], ("tcp", "LISTEN", 8080))
+        self.assertEqual(m[2222][1], "ESTAB")
+
+    def test_parse_unix_named_only(self):
+        m = psf.parse_net_unix(self.UNIX)
+        self.assertEqual(m[3333], ("unix", "/tmp/tmux-1000/default"))
+        self.assertNotIn(4444, m)            # unnamed unix socket skipped
+
+    def test_format_sockets_summary(self):
+        netmap = {
+            1111: ("tcp", "LISTEN", 8080),
+            2222: ("tcp", "ESTAB", 0),
+            3333: ("unix", "/tmp/tmux-1000/default"),
+        }
+        out = psf.format_sockets({1111, 2222, 3333, 9999}, netmap)
+        self.assertEqual(out, "LISTEN :8080  +1 est  unix:/tmp/tmux-1000/default")
+
+    def test_format_sockets_empty(self):
+        self.assertEqual(psf.format_sockets(set(), {}), "")
 
 
-# --- glue summarization ------------------------------------------------------
+# --- Task 6: cache ----------------------------------------------------------
 
 
-def test_summarize_glue_collapses_infrastructure():
-    procs = {}
-    for i, comm in enumerate(["bash", "bash", "bash", "sshd", "sshd"]):
-        procs[i] = _rproc(i, comm=comm)
-    categories = {i: psf.CAT_BY_NAME["infrastructure"] for i in procs}
-    session_pids = set()  # nothing in sessions
-    lines = psf.summarize_glue(procs, categories, session_pids)
-    assert len(lines) >= 1
-    assert "bash×3" in lines[0]
-    assert "sshd×2" in lines[0]
+class TestCache(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "cache.json")
+
+    def test_roundtrip_and_boot_id(self):
+        c = psf.Cache(self.path, boot_id="boot-A", now=1000.0)
+        c.put(42, 99999, fdcount=7, sockets="LISTEN :22")
+        c.save(live_keys={(42, 99999)})
+
+        c2 = psf.Cache(self.path, boot_id="boot-A", now=1005.0)
+        self.assertEqual(c2.get(42, 99999, fdcount=7), "LISTEN :22")
+
+        # different boot id -> whole cache invalid
+        c3 = psf.Cache(self.path, boot_id="boot-B", now=1005.0)
+        self.assertIsNone(c3.get(42, 99999, fdcount=7))
+
+    def test_fdcount_mismatch_is_miss(self):
+        c = psf.Cache(self.path, boot_id="b", now=1000.0)
+        c.put(42, 99999, fdcount=7, sockets="x")
+        c.save(live_keys={(42, 99999)})
+        c2 = psf.Cache(self.path, boot_id="b", now=1001.0)
+        self.assertIsNone(c2.get(42, 99999, fdcount=8))   # fd count changed
+
+    def test_ttl_expiry_is_miss(self):
+        c = psf.Cache(self.path, boot_id="b", now=1000.0)
+        c.put(42, 99999, fdcount=7, sockets="x")
+        c.save(live_keys={(42, 99999)})
+        c2 = psf.Cache(self.path, boot_id="b", now=1000.0 + psf.CACHE_TTL + 1)
+        self.assertIsNone(c2.get(42, 99999, fdcount=7))   # too old
+
+    def test_save_drops_dead_entries(self):
+        c = psf.Cache(self.path, boot_id="b", now=1000.0)
+        c.put(1, 10, fdcount=1, sockets="a")
+        c.put(2, 20, fdcount=1, sockets="b")
+        c.save(live_keys={(1, 10)})                       # 2 is dead
+        c2 = psf.Cache(self.path, boot_id="b", now=1001.0)
+        self.assertEqual(c2.get(1, 10, fdcount=1), "a")
+        self.assertIsNone(c2.get(2, 20, fdcount=1))
+
+    def test_missing_file_is_empty(self):
+        c = psf.Cache(self.path, boot_id="b", now=1.0)
+        self.assertIsNone(c.get(1, 1, fdcount=1))
 
 
-# --- new-process clusters ----------------------------------------------------
+# --- Task 7: live /proc readers ---------------------------------------------
 
 
-def test_find_new_clusters_detects_burst():
-    prev = {1: _rproc(1, comm="init")}
-    cur = {1: _rproc(1, comm="init")}
-    for i in range(2, 12):
-        cur[i] = _rproc(i, comm="clang")
-    # Build the keyed dict for find_new_clusters
-    # The function compares pid sets; we need proc dicts keyed by pid
-    # Note: find_new_clusters takes {pid: Proc} dicts
-    categories = {i: psf.CAT_BY_NAME["compile-worker"] for i in range(2, 12)}
-    clusters = psf.find_new_clusters(cur, prev, categories)
-    assert len(clusters) >= 1
-    assert "10 new: clang" in clusters[0]
+class TestProcIO(unittest.TestCase):
+    def test_scan_includes_self(self):
+        procs = psf.scan()
+        me = procs[os.getpid()]
+        self.assertEqual(me.ppid, os.getppid())
+        self.assertGreaterEqual(me.num_threads, 1)
+        self.assertEqual(me.uid, os.getuid())
+
+    def test_fd_inodes_and_count_for_self(self):
+        import socket
+        s = socket.socket()
+        try:
+            count, inodes = psf.fd_socket_inodes(os.getpid())
+            self.assertGreater(count, 0)
+            self.assertIsInstance(inodes, set)
+            self.assertIn(os.fstat(s.fileno()).st_ino, inodes)
+        finally:
+            s.close()
+
+    def test_links_for_self(self):
+        cwd, exe = psf.read_links(os.getpid())
+        self.assertEqual(cwd, os.getcwd())
+        self.assertTrue(exe.endswith("python3") or "python" in exe)
+
+    def test_boot_id_nonempty(self):
+        self.assertTrue(psf.read_boot_id())
+
+    def test_netns_of_self(self):
+        self.assertTrue(psf.netns_of(os.getpid()).startswith("net:["))
 
 
-def test_find_new_clusters_ignores_small_spawns():
-    prev = {1: _rproc(1, comm="init")}
-    cur = {1: _rproc(1, comm="init"), 2: _rproc(2, comm="x"),
-           3: _rproc(3, comm="x"), 4: _rproc(4, comm="x")}
-    categories = {2: psf.CAT_BY_NAME["misc"], 3: psf.CAT_BY_NAME["misc"],
-                  4: psf.CAT_BY_NAME["misc"]}
-    clusters = psf.find_new_clusters(cur, prev, categories)
-    # Only 3 procs, below CLUSTER_MIN=5
-    assert clusters == []
+# --- Task 8: probe orchestration --------------------------------------------
 
 
-# --- path snapshot -----------------------------------------------------------
+class TestProbeOrchestration(unittest.TestCase):
+    def test_probe_uses_cache_on_fdcount_match(self):
+        # Build one printed proc; pre-seed cache; probe must NOT call the
+        # (exploding) socket resolver when fd count matches.
+        p = _p(os.getpid(), os.getppid(), comm="python", cmdline="python psf")
+        p.kept = True
+        tmp = tempfile.mkdtemp()
+        cpath = os.path.join(tmp, "c.json")
+
+        calls = []
+
+        def fake_resolver(pids_by_ns):
+            calls.append(pids_by_ns)
+            return {}
+
+        cache = psf.Cache(cpath, boot_id="b", now=1000.0)
+        count, _ = psf.fd_socket_inodes(p.pid)
+        cache.put(p.pid, p.starttime, fdcount=count, sockets="LISTEN :1234")
+        cache.save(live_keys={(p.pid, p.starttime)})
+
+        cache2 = psf.Cache(cpath, boot_id="b", now=1001.0)
+        psf.probe([p], cache2, resolver=fake_resolver)
+        self.assertEqual(p.sockets_str, "LISTEN :1234")
+        self.assertEqual(calls, [])        # resolver skipped entirely
+
+    def test_probe_resolves_on_miss(self):
+        p = _p(os.getpid(), os.getppid(), comm="python")
+        p.kept = True
+        tmp = tempfile.mkdtemp()
+        cache = psf.Cache(os.path.join(tmp, "c.json"), boot_id="b", now=1.0)
+        psf.probe([p], cache)              # real resolver, empty cache
+        self.assertIsNotNone(p.cwd)
+        self.assertIsNotNone(p.exe)
+        self.assertIsInstance(p.sockets_str, str)
 
 
-def test_path_is_in_subtree_matches_root_and_children(tmp_path):
-    root = tmp_path / "foo"
-    child = root / "bar"
-    peer = tmp_path / "foobar"
-    child.mkdir(parents=True)
-    peer.mkdir()
-    norm = psf.normalize_path_target(str(root))
-    assert psf._path_is_in_subtree(str(root), norm)
-    assert psf._path_is_in_subtree(str(child), norm)
-    assert not psf._path_is_in_subtree(str(peer), norm)
-    assert not psf._path_is_in_subtree("socket:[123]", norm)
+# --- Task 9: render ---------------------------------------------------------
 
 
-def test_proc_path_hits_finds_cwd_exe_fd_and_maps(tmp_path):
-    root = tmp_path / "foo"
-    root.mkdir()
-    p = _rproc(10, comm="python3", cmdline="python script.py",
-               exe=str(root / "bin" / "python"))
-    p.cwd = str(root)
-    fd_path = str(root / "data.txt")
-    maps_path = str(root / "lib.so")
-    root_norm = psf.normalize_path_target(str(root))
+class TestRender(unittest.TestCase):
+    def test_render_tree_lines(self):
+        procs = {
+            1: _p(1, 0, comm="sshd", cmdline="sshd: shemer@pts/0"),
+            2: _p(2, 1, comm="bash", cmdline="-bash"),
+            3: _p(3, 2, comm="claude",
+                  cmdline="claude --resume some/long/args/here/that/exceeds/fifty/chars"),
+        }
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        procs[3].cwd = "/home/shemer/proj"
+        procs[3].exe = "/usr/bin/node"
+        procs[3].sockets_str = "+2 est"
+        procs[3].num_threads = 11
+        lines = psf.render(psf.build_tree(procs), suppressed=set(),
+                           width=50, color=False)
+        text = "\n".join(lines)
+        self.assertIn("sshd: shemer@pts/0", text)
+        self.assertIn("claude --resume", text)
+        self.assertIn("cwd:~/proj", text)           # cwd shown, HOME summarized
+        self.assertIn("node", text)                 # exe shown
+        self.assertIn("+2 est", text)               # sockets shown
+        self.assertIn("11 threads", text)           # thread count
+        # cmdline truncated to width
+        claude_line = [ln for ln in lines if "claude --resume" in ln][0]
+        self.assertLessEqual(len(claude_line.split("claude")[1]), 60)
 
-    def fake_listdir(path):
-        assert path.endswith("/10/fd")
-        return ["3"]
+    def test_render_collapse_note(self):
+        root = _p(1, 0, comm="bazel", cmdline="bazel build //...")
+        root.kept = True
+        root.collapsed = True
+        root.collapse_note = "… (+50 descendants: cc1plus×50)"
+        lines = psf.render([root], suppressed=set(), width=50, color=False)
+        self.assertTrue(any("+50 descendants" in ln for ln in lines))
 
-    def fake_readlink(path):
-        assert path.endswith("/10/fd/3")
-        return fd_path
+    def test_render_hides_non_kept_children(self):
+        # PID 1 kept only as an ancestor; its non-kept child (journald) must
+        # not leak into the tree, but the kept path to claude must show.
+        procs = {
+            1: _p(1, 0, comm="systemd", cmdline="/sbin/init"),
+            2: _p(2, 1, comm="journald", cmdline="systemd-journald"),
+            3: _p(3, 1, comm="tmux", cmdline="tmux"),
+            4: _p(4, 3, comm="claude", cmdline="claude"),
+        }
+        psf.build_tree(procs)
+        psf.select(procs, psf.DEFAULT_MATCHERS)
+        roots = [r for r in psf.build_tree(procs) if r.kept]
+        lines = psf.render(roots, suppressed=set(), width=50, color=False)
+        text = "\n".join(lines)
+        self.assertIn("tmux", text)
+        self.assertIn("claude", text)
+        self.assertNotIn("journald", text)        # boring child hidden
 
-    def fake_maps(pid):
-        assert pid == 10
-        return "7f r--p 0000 00:00 0 %s\n" % maps_path
-
-    hits = psf.proc_path_hits(p, root_norm, readlink=fake_readlink,
-                              listdir=fake_listdir, read_maps=fake_maps,
-                              fd_kind=lambda pid, fd: "fd:%s file" % fd)
-    rendered = [(h.kind, h.path) for h in hits]
-    assert ("cwd", str(root)) in rendered
-    assert ("exe", str(root / "bin" / "python")) in rendered
-    assert ("fd:3 file", fd_path) in rendered
-    assert ("mmap", maps_path) in rendered
-
-
-def test_render_psf_path_filters_to_touching_processes(monkeypatch, tmp_path):
-    root = tmp_path / "foo"
-    root.mkdir()
-    procs = {
-        1: _rproc(1, ppid=0, comm="init", cmdline="init"),
-        10: _rproc(10, ppid=1, comm="claude", cmdline="claude"),
-        11: _rproc(11, ppid=10, comm="python3", cmdline="python worker.py"),
-        20: _rproc(20, ppid=1, comm="bash", cmdline="bash"),
-    }
-    topf.build_tree(procs)
-    procs[10].cwd = "/tmp"
-    procs[10].exe = "/usr/bin/claude"
-    procs[11].cwd = str(root)
-    procs[11].exe = "/usr/bin/python3"
-    procs[20].cwd = "/tmp"
-    procs[20].exe = "/usr/bin/bash"
-
-    monkeypatch.setattr(psf, "read_links",
-                        lambda pid: (procs[pid].cwd, procs[pid].exe))
-    monkeypatch.setattr(psf, "read_environ", lambda pid: {})
-    monkeypatch.setattr(psf, "proc_path_hits",
-                        lambda p, norm: [psf.PathHit("cwd", "", p.cwd)]
-                        if p.pid == 11 else [])
-
-    args = psf._parse_args(["--path", str(root)])
-    sysinfo = topf.SysInfo(clk_tck=topf.CLK_TCK, page_size=topf.PAGE_SIZE,
-                           uptime=100.0, cores=1)
-    text = "\n".join(psf.render_psf(procs, sysinfo, args))
-    assert "touching" in text
-    assert "claude" in text
-    assert "python worker.py" in text
-    assert "cwd:" in text
-    assert "bash" not in text
+    def test_render_skips_suppressed(self):
+        procs = {1: _p(1, 0, comm="bazel"), 2: _p(2, 1, comm="cc1plus")}
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        lines = psf.render([procs[1]], suppressed={2}, width=50, color=False)
+        self.assertFalse(any("cc1plus" in ln for ln in lines))
 
 
-def test_render_path_process_renders_hit_without_venv_arg():
-    # Guards the call site that kept passing show_venv=args.venv after the flag
-    # was removed - args has no .venv and _proc_detail has no such param, so it
-    # raised. render_path_process is the loose branch's renderer; no session
-    # plumbing needed to reproduce.
-    proc = _rproc(4321, comm="chrome", cmdline="chrome --type=renderer")
-    sysinfo = topf.SysInfo(clk_tck=topf.CLK_TCK, page_size=topf.PAGE_SIZE,
-                           uptime=100.0, cores=1)
-    args = psf._parse_args(["--path", "/usr"])
-    categories = {proc.pid: psf.CAT_BY_NAME["misc"]}
-    path_hits = {proc.pid: [psf.PathHit("mmap", "", "/usr/lib/libc.so.6")]}
-    line = psf.render_path_process(proc, sysinfo, args, categories,
-                                   venv_map={}, path_hits=path_hits)
-    assert "4321" in line and "chrome" in line
-    assert "mmap:" in line
-
-
-def test_render_psf_loose_process_reaches_render_path_process(monkeypatch,
-                                                              tmp_path):
-    # A path hit on a process outside every session lands under "Other touching
-    # processes" - the only caller of render_path_process. The session-child
-    # path test never reaches it, which is how the show_venv crash stayed green.
-    root = tmp_path / "foo"
-    root.mkdir()
-    procs = {
-        1: _rproc(1, ppid=0, comm="init", cmdline="init"),
-        99: _rproc(99, ppid=1, comm="grep", cmdline="grep -r needle"),
-    }
-    topf.build_tree(procs)
-    monkeypatch.setattr(psf, "read_links", lambda pid: ("/tmp", "/usr/bin/grep"))
-    monkeypatch.setattr(psf, "read_environ", lambda pid: {})
-    monkeypatch.setattr(psf, "proc_path_hits",
-                        lambda p, norm: [psf.PathHit("fd:3 file", "",
-                                                     str(root / "x"))]
-                        if p.pid == 99 else [])
-    args = psf._parse_args(["--path", str(root)])
-    sysinfo = topf.SysInfo(clk_tck=topf.CLK_TCK, page_size=topf.PAGE_SIZE,
-                           uptime=100.0, cores=1)
-    text = "\n".join(psf.render_psf(procs, sysinfo, args))
-    assert "Other touching processes" in text
-    assert "grep -r needle" in text
-    assert "fd:3 file:" in text
-
-
-# --- smoke test --------------------------------------------------------------
-
-
-def test_render_once_psf_smoke():
-    """Linux-only: run against real /proc, verify non-empty output."""
-    args = psf._parse_args([])
-    lines = psf.render_once_psf(args)
-    assert isinstance(lines, list) and lines
-    # Header should contain 'psf'
-    assert any("psf" in ln for ln in lines)
+if __name__ == "__main__":
+    unittest.main()
