@@ -58,7 +58,7 @@ CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 
 # Resolved-once view of system state needed to turn raw counters into rates.
-SysInfo = namedtuple("SysInfo", "clk_tck page_size uptime")
+SysInfo = namedtuple("SysInfo", "clk_tck page_size uptime cores")
 
 # One /proc/PID/stat row, only the fields we use.
 Stat = namedtuple("Stat", "comm state ppid num_threads starttime "
@@ -855,22 +855,20 @@ def _tint_level(value, anchors):
     return sum(1 for a in anchors if value >= a)
 
 
-def _cpu_bit(node, sysinfo):
-    """('cpu 3.4% (2.5% avg)', level) when a current sample exists, else
-    ('cpu 2.5% avg', …). avg = lifetime CPU rate (total cpu-time / time alive).
-    The tint level tracks live load (current sample, or avg when none) against
-    CPU_TINT_ANCHORS. Returns None when no rate is computable."""
-    life = lifetime_secs(node.starttime, sysinfo.uptime, sysinfo.clk_tck)
-    avg_frac = cpu_fraction(node.utime + node.stime, life, sysinfo.clk_tck)
-    avg = fmt_pct(avg_frac)
-    cur = fmt_pct(node.cpu_current)
-    if avg is None:
-        return None
-    live = node.cpu_current if node.cpu_current is not None else avg_frac
-    level = _tint_level(live, CPU_TINT_ANCHORS)
-    if cur is not None:
-        return ("cpu %s (%s avg)" % (cur, avg), level)
-    return ("cpu %s avg" % avg, level)
+def _cpu_bit(windows_fracs, avg_frac=None):
+    """Format a per-window CPU headline: 'cpu 400% 200% 50%' (one figure per
+    window; None -> '—'). Tint level = max _tint_level across the non-None
+    windows. In --once mode, avg_frac adds a trailing '(Y avg)' lifetime bit.
+    Returns (text, level)."""
+    parts = [(fmt_pct(f) or "—") for f in windows_fracs]
+    level = max((_tint_level(f, CPU_TINT_ANCHORS)
+                 for f in windows_fracs if f is not None), default=0)
+    text = "cpu " + " ".join(parts)
+    if avg_frac is not None:
+        a = fmt_pct(avg_frac)
+        if a is not None:
+            text += " (%s avg)" % a
+    return (text, level)
 
 
 def _compose_dim(bits, color):
@@ -884,7 +882,7 @@ def _compose_dim(bits, color):
     return "\x1b[2m  \x1b[0m".join(segs)
 
 
-def _detail(node, color, sysinfo=None):
+def _detail(node, color, sysinfo=None, show_avg=False):
     bits = []   # (text, tint level)
     if node.cwd and node.cwd not in ("?", ""):
         bits.append(("cwd:" + compress_path(node.cwd), 0))
@@ -893,9 +891,14 @@ def _detail(node, color, sysinfo=None):
     if node.sockets_str:
         bits.append((node.sockets_str, 0))
     if sysinfo is not None:
-        cpu = _cpu_bit(node, sysinfo)
-        if cpu is not None:
-            bits.append(cpu)
+        if node.cpu_windows and any(f is not None for f in node.cpu_windows):
+            avg = None
+            if show_avg:
+                life = lifetime_secs(node.starttime, sysinfo.uptime,
+                                     sysinfo.clk_tck)
+                avg = cpu_fraction(node.utime + node.stime, life,
+                                   sysinfo.clk_tck)
+            bits.append(_cpu_bit(node.cpu_windows, avg))
         rss = node.rss_pages * sysinfo.page_size
         if rss > 0:
             bits.append(("rss:" + fmt_bytes(rss),
@@ -917,7 +920,7 @@ def _group_label(members, width):
     return brace_summary([m.cmdline for m in members])[:width]
 
 
-def _group_detail(members, color, sysinfo):
+def _group_detail(members, color, sysinfo, show_avg=False):
     """Aggregated detail line for a merged group: shared/braced cwd & exe,
     member pids, and cpu/rss/up ranges (when sysinfo is given)."""
     bits = []   # (text, tint level)
@@ -932,22 +935,28 @@ def _group_detail(members, color, sysinfo):
     bits.append(("pids:" + " ".join(str(x) for x in pids[:GROUP_PIDS]) + extra,
                  0))
     if sysinfo is not None:
-        avgs = [a for a in (
-            cpu_fraction(m.utime + m.stime,
-                         lifetime_secs(m.starttime, sysinfo.uptime,
-                                       sysinfo.clk_tck), sysinfo.clk_tck)
-            for m in members) if a is not None]
-        if avgs:
-            curs = [m.cpu_current for m in members if m.cpu_current is not None]
-            # Tint tracks the group's combined live load (the whole ×N entry).
-            live_total = sum(curs) if curs else sum(avgs)
-            level = _tint_level(live_total, CPU_TINT_ANCHORS)
-            if curs:
-                bits.append(("cpu %s (%s avg)" % (range_str(curs, fmt_pct),
-                                                  range_str(avgs, fmt_pct)),
-                             level))
-            else:
-                bits.append(("cpu %s avg" % range_str(avgs, fmt_pct), level))
+        nwin = max((len(m.cpu_windows) for m in members if m.cpu_windows),
+                   default=0)
+        if nwin:
+            parts = []
+            sums = []
+            for w in range(nwin):
+                vals = [m.cpu_windows[w] for m in members
+                        if m.cpu_windows and m.cpu_windows[w] is not None]
+                parts.append(range_str(vals, fmt_pct) if vals else "—")
+                sums.append(sum(vals))
+            # tint tracks the heaviest window's summed load across members
+            level = max(_tint_level(s, CPU_TINT_ANCHORS) for s in sums)
+            text = "cpu " + " ".join(parts)
+            if show_avg:
+                avgs = [a for a in (
+                    cpu_fraction(m.utime + m.stime,
+                                 lifetime_secs(m.starttime, sysinfo.uptime,
+                                               sysinfo.clk_tck), sysinfo.clk_tck)
+                    for m in members) if a is not None]
+                if avgs:
+                    text += " (%s avg)" % range_str(avgs, fmt_pct)
+            bits.append((text, level))
         rss = [m.rss_pages * sysinfo.page_size for m in members
                if m.rss_pages > 0]
         if rss:
@@ -1044,7 +1053,7 @@ def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
                 head = "%s%s×%d %s" % (prefix, connector, len(item.members),
                                        _group_label(item.members, width))
                 lines.append(head)
-                detail = _group_detail(item.members, color, sysinfo)
+                detail = _group_detail(item.members, color, sysinfo, show_avg)
                 if detail is not None:
                     lines.append(child_prefix + detail)
                 kids = [c for m in item.members
@@ -1053,7 +1062,7 @@ def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
                 head = "%s%s%d %s" % (prefix, connector, item.pid,
                                       compress_cmdline(item.cmdline, width))
                 lines.append(head)
-                detail = _detail(item, color, sysinfo)
+                detail = _detail(item, color, sysinfo, show_avg)
                 if detail is not None:
                     lines.append(child_prefix + detail)
                 kids = _visible_children(item, suppressed)
@@ -1074,12 +1083,12 @@ def glossary(color):
     """A short legend printed at the head of the output explaining the
     annotations (notably what '+N est' means). Returns a list of lines."""
     lines = [
-        "psf — interesting process subtrees only; the dim line under each "
+        "topf — interesting & heavy process subtrees; the dim line under each "
         "process annotates it.",
         "  sockets: LISTEN :PORT = listening   "
         "+N est = N established TCP connections   unix:PATH = named socket",
-        "  stats:   cpu X% (Y avg) = recent / lifetime-average CPU   "
-        "rss = resident memory   up = time since start",
+        "  stats:   cpu A% B% C% = CPU over the short/med/long windows "
+        "(cores; 100% = 1 core)   rss = resident memory   up = time since start",
         "  groups:  ×N = N near-identical siblings merged (pids/ranges on the "
         "detail line)   lifecycle = procs born/died during the sample window",
     ]
