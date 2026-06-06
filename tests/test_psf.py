@@ -23,24 +23,38 @@ def _p(pid, ppid, comm="x", **kw):
 
 class TestParseStat(unittest.TestCase):
     def test_parse_stat_basic(self):
-        # fields: 1 pid, 2 (comm), 3 state, 4 ppid, ... 20 num_threads,
-        # 21 itrealvalue, 22 starttime
+        # fields: 1 pid, 2 (comm), 3 state, 4 ppid, 14 utime, 15 stime,
+        # 20 num_threads, 22 starttime, 24 rss (pages)
         line = ("4242 (test app) S 1 4242 4242 0 -1 4194304 100 0 0 0 "
                 "10 5 0 0 20 0 7 0 99999 0 0")
-        comm, state, ppid, nthreads, starttime = psf.parse_stat(line)
-        self.assertEqual(comm, "test app")
-        self.assertEqual(state, "S")
-        self.assertEqual(ppid, 1)
-        self.assertEqual(nthreads, 7)
-        self.assertEqual(starttime, 99999)
+        st = psf.parse_stat(line)
+        self.assertEqual(st.comm, "test app")
+        self.assertEqual(st.state, "S")
+        self.assertEqual(st.ppid, 1)
+        self.assertEqual(st.num_threads, 7)
+        self.assertEqual(st.starttime, 99999)
+        self.assertEqual(st.utime, 10)
+        self.assertEqual(st.stime, 5)
+        self.assertEqual(st.rss_pages, 0)
 
     def test_parse_stat_comm_with_parens(self):
         line = ("99 (weird )(name) R 2 0 0 0 -1 0 0 0 0 0 "
                 "0 0 0 0 20 0 1 0 555 0 0")
-        comm, state, ppid, nthreads, starttime = psf.parse_stat(line)
-        self.assertEqual(comm, "weird )(name")
-        self.assertEqual(ppid, 2)
-        self.assertEqual(starttime, 555)
+        st = psf.parse_stat(line)
+        self.assertEqual(st.comm, "weird )(name")
+        self.assertEqual(st.ppid, 2)
+        self.assertEqual(st.starttime, 555)
+
+    def test_parse_stat_cpu_and_rss(self):
+        # utime=200 stime=50 num_threads=4 starttime=1234 rss=4096 pages
+        line = ("100 (proc) R 1 100 100 0 -1 0 0 0 0 0 "
+                "200 50 0 0 20 0 4 0 1234 999 4096")
+        st = psf.parse_stat(line)
+        self.assertEqual(st.utime, 200)
+        self.assertEqual(st.stime, 50)
+        self.assertEqual(st.num_threads, 4)
+        self.assertEqual(st.starttime, 1234)
+        self.assertEqual(st.rss_pages, 4096)
 
 
 # --- Task 2: cmdline + tree -------------------------------------------------
@@ -381,6 +395,102 @@ class TestRender(unittest.TestCase):
             p.kept = True
         lines = psf.render([procs[1]], suppressed={2}, width=50, color=False)
         self.assertFalse(any("cc1plus" in ln for ln in lines))
+
+
+# --- resource stats: cpu rate, elapsed, rss ---------------------------------
+
+
+class TestCpuMath(unittest.TestCase):
+    def test_lifetime_secs(self):
+        # process started at tick 99999, 100 ticks/sec -> 999.99s after boot;
+        # system up 1100s -> ~100.01s alive.
+        self.assertAlmostEqual(psf.lifetime_secs(99999, 1100.0, 100), 100.01,
+                               places=4)
+
+    def test_cpu_fraction_lifetime_average(self):
+        # 250 jiffies @100Hz = 2.5 cpu-seconds over a 100s life -> 0.025.
+        self.assertAlmostEqual(psf.cpu_fraction(250, 100.0, 100), 0.025)
+
+    def test_cpu_fraction_zero_wall_is_none(self):
+        self.assertIsNone(psf.cpu_fraction(10, 0.0, 100))
+        self.assertIsNone(psf.cpu_fraction(10, -1.0, 100))
+
+    def test_cpu_fraction_busy_core(self):
+        # 20 jiffies of cpu in a 0.2s window @100Hz = 0.2 cpu-s / 0.2s = 1.0.
+        self.assertAlmostEqual(psf.cpu_fraction(20, 0.2, 100), 1.0)
+
+
+class TestFormatters(unittest.TestCase):
+    def test_fmt_pct_scales_precision(self):
+        self.assertEqual(psf.fmt_pct(0.034), "3.4%")
+        self.assertEqual(psf.fmt_pct(0.50), "50%")
+        self.assertEqual(psf.fmt_pct(0.12), "12%")
+        self.assertEqual(psf.fmt_pct(1.5), "150%")        # >100% on many cores
+
+    def test_fmt_pct_tiny_keeps_two_sig_figs(self):
+        self.assertEqual(psf.fmt_pct(0.0002), "0.02%")    # the asked-for case
+        self.assertEqual(psf.fmt_pct(0.000034), "0.0034%")
+
+    def test_fmt_pct_never_scientific_notation(self):
+        # a near-idle daemon over a long life -> extremely small average; must
+        # stay plain decimal, not '1.7e-05%'.
+        out = psf.fmt_pct(1.7e-07)
+        self.assertNotIn("e", out)
+        self.assertEqual(out, "0.000017%")
+
+    def test_fmt_pct_zero_and_none(self):
+        self.assertEqual(psf.fmt_pct(0.0), "0%")
+        self.assertIsNone(psf.fmt_pct(None))
+
+    def test_fmt_bytes(self):
+        self.assertEqual(psf.fmt_bytes(0), "0")
+        self.assertEqual(psf.fmt_bytes(512), "512B")
+        self.assertEqual(psf.fmt_bytes(1536), "1.5K")
+        self.assertEqual(psf.fmt_bytes(2 * 1024 * 1024), "2.0M")
+        self.assertEqual(psf.fmt_bytes(1310720000), "1.2G")
+
+    def test_fmt_duration(self):
+        self.assertEqual(psf.fmt_duration(5), "5s")
+        self.assertEqual(psf.fmt_duration(65), "1m5s")
+        self.assertEqual(psf.fmt_duration(3725), "1h2m")
+        self.assertEqual(psf.fmt_duration(90000), "1d1h")
+
+
+class TestResourceDetail(unittest.TestCase):
+    def test_detail_shows_cpu_rss_and_elapsed(self):
+        # uptime 1100s, started @99999 ticks -> ~100s alive; 250 jiffies cpu
+        # -> 2.5% lifetime average; rss 4096 pages * 4096 B = 16M.
+        p = _p(7, 1, comm="claude", cmdline="claude",
+               starttime=99999, utime=200, stime=50, rss_pages=4096)
+        p.kept = True
+        p.cpu_current = 0.034            # set by the sampler
+        sysinfo = psf.SysInfo(clk_tck=100, page_size=4096, uptime=1100.0)
+        lines = psf.render([p], suppressed=set(), width=50, color=False,
+                           sysinfo=sysinfo)
+        text = "\n".join(lines)
+        self.assertIn("cpu 3.4% (2.5% avg)", text)   # current + lifetime avg
+        self.assertIn("rss:16.0M", text)
+        self.assertIn("up:1m40s", text)              # ~100s alive
+
+    def test_detail_without_current_sample(self):
+        p = _p(7, 1, comm="claude", cmdline="claude",
+               starttime=99999, utime=200, stime=50, rss_pages=0)
+        p.kept = True
+        p.cpu_current = None             # sampling disabled / unreadable
+        sysinfo = psf.SysInfo(clk_tck=100, page_size=4096, uptime=1100.0)
+        text = "\n".join(psf.render([p], suppressed=set(), width=50,
+                                    color=False, sysinfo=sysinfo))
+        self.assertIn("cpu 2.5% avg", text)          # avg only, no current
+        self.assertNotIn("rss:", text)               # rss 0 -> omitted
+
+
+class TestGlossary(unittest.TestCase):
+    def test_glossary_explains_est_and_stats(self):
+        text = "\n".join(psf.glossary(color=False))
+        self.assertIn("est", text)                   # explains "+N est"
+        self.assertIn("established", text)
+        self.assertIn("rss", text)
+        self.assertIn("cpu", text)
 
 
 if __name__ == "__main__":
