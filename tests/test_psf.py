@@ -492,5 +492,31 @@ class TestGlossary(unittest.TestCase):
         self.assertIn("cpu", text)
 
 
+# --- path compression -------------------------------------------------------
+
+
+class TestCompressPath(unittest.TestCase):
+    def test_home_summary_and_middle_elision(self):
+        p = psf.HOME + "/mss/.claude/worktrees/multimlamp"
+        self.assertEqual(psf.compress_path(p), "~/mss/../multimlamp")
+
+    def test_deleted_marker_preserved(self):
+        p = psf.HOME + "/mss/.claude/worktrees/multimlamp (deleted)"
+        self.assertEqual(psf.compress_path(p), "~/mss/../multimlamp (deleted)")
+
+    def test_no_middle_unchanged(self):
+        self.assertEqual(psf.compress_path(psf.HOME + "/mss/foo"), "~/mss/foo")
+
+    def test_absolute_path_elided(self):
+        self.assertEqual(psf.compress_path("/usr/lib/a/b/c"), "/usr/../c")
+
+    def test_long_basename_compressed(self):
+        name = "verylongnamethatgoesonandonandon_final"   # 38 chars
+        self.assertEqual(psf.compress_path(name), "verylo..._final")
+
+    def test_question_mark_passthrough(self):
+        self.assertEqual(psf.compress_path("?"), "?")
+
+
 if __name__ == "__main__":
     unittest.main()

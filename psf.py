@@ -28,6 +28,9 @@ COLLAPSE_THRESHOLD = 20   # kept-descendant count above which a subtree collapse
 CACHE_TTL = 30            # seconds before a cached socket entry is re-probed
 REPR_COMMS = 4            # distinct comms named in a collapse summary
 SAMPLE_INTERVAL = 0.2     # seconds slept to measure current CPU (0 disables)
+PATH_HEAD = 2             # leading path components kept when compressing
+PATH_MAX_BASENAME = 30    # basename length above which it is itself shortened
+PATH_BASENAME_KEEP = 6    # chars kept each side of '...' in a long basename
 
 # System constants, read once. CLK_TCK converts stat jiffies -> seconds;
 # PAGE_SIZE converts stat rss (in pages) -> bytes.
@@ -590,10 +593,32 @@ def probe(nodes, cache, resolver=resolve_netmaps):
 HOME = os.path.expanduser("~")
 
 
-def _summarize_path(path):
-    if path and path.startswith(HOME):
-        return "~" + path[len(HOME):]
-    return path
+def _compress_basename(name):
+    if len(name) <= PATH_MAX_BASENAME:
+        return name
+    k = PATH_BASENAME_KEEP
+    return name[:k] + "..." + name[-k:]
+
+
+def compress_path(path):
+    """Shorten a cwd/exe for display: $HOME -> ~, elide the middle of deep
+    paths (keep the first PATH_HEAD components + '..' + basename), and shorten
+    an over-long basename to 'prefix...suffix'. A trailing ' (deleted)' marker
+    (kernel-appended for a removed cwd) is preserved."""
+    if not path or path == "?":
+        return path
+    marker = " (deleted)"
+    suffix = ""
+    if path.endswith(marker):
+        path = path[:-len(marker)]
+        suffix = marker
+    if path.startswith(HOME):
+        path = "~" + path[len(HOME):]
+    parts = path.split("/")
+    parts[-1] = _compress_basename(parts[-1])
+    if len(parts) > PATH_HEAD + 1:
+        parts = parts[:PATH_HEAD] + ["..", parts[-1]]
+    return "/".join(parts) + suffix
 
 
 def _cpu_bit(node, sysinfo):
@@ -612,9 +637,9 @@ def _cpu_bit(node, sysinfo):
 def _detail(node, color, sysinfo=None):
     bits = []
     if node.cwd and node.cwd not in ("?", ""):
-        bits.append("cwd:" + _summarize_path(node.cwd))
+        bits.append("cwd:" + compress_path(node.cwd))
     if node.exe and node.exe not in ("?", ""):
-        bits.append("exe:" + _summarize_path(node.exe))
+        bits.append("exe:" + compress_path(node.exe))
     if node.sockets_str:
         bits.append(node.sockets_str)
     if sysinfo is not None:
