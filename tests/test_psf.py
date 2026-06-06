@@ -541,5 +541,58 @@ class TestGroupHelpers(unittest.TestCase):
         self.assertEqual(psf.range_str([5, 5], str), "5")
 
 
+# --- sibling grouping -------------------------------------------------------
+
+
+class TestGroupSiblings(unittest.TestCase):
+    def _kids(self):
+        # three identical (comm, exe) sshd siblings + one bash
+        out = []
+        for pid in (10, 11, 12):
+            p = _p(pid, 1, comm="sshd", cmdline="sshd: shemer@pts/%d" % pid)
+            p.exe = "/usr/sbin/sshd"
+            out.append(p)
+        b = _p(20, 1, comm="bash", cmdline="-bash")
+        b.exe = "/usr/bin/bash"
+        out.append(b)
+        return out
+
+    def test_forms_group_at_min(self):
+        items = psf.group_siblings(self._kids(), dedup_min=3,
+                                   never_merge=frozenset())
+        groups = [it for it in items if isinstance(it, psf.Group)]
+        singles = [it for it in items if isinstance(it, psf.Proc)]
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0].members), 3)
+        self.assertEqual([s.pid for s in singles], [20])    # bash stays single
+
+    def test_pair_below_min_stays_individual(self):
+        kids = self._kids()[:2] + self._kids()[3:]          # 2 sshd + bash
+        items = psf.group_siblings(kids, dedup_min=3, never_merge=frozenset())
+        self.assertTrue(all(isinstance(it, psf.Proc) for it in items))
+
+    def test_never_merge_keeps_focus_procs_separate(self):
+        kids = []
+        for pid in (30, 31, 32):
+            c = _p(pid, 1, comm="claude", cmdline="claude")
+            c.exe = "/usr/bin/node"
+            kids.append(c)
+        items = psf.group_siblings(kids, dedup_min=3,
+                                   never_merge=frozenset({"claude"}))
+        self.assertTrue(all(isinstance(it, psf.Proc) for it in items))
+
+    def test_dedup_min_none_disables(self):
+        items = psf.group_siblings(self._kids(), dedup_min=None,
+                                   never_merge=frozenset())
+        self.assertTrue(all(isinstance(it, psf.Proc) for it in items))
+
+    def test_ordering_stable_by_pid(self):
+        items = psf.group_siblings(self._kids(), dedup_min=3,
+                                   never_merge=frozenset())
+        firsts = [it.members[0].pid if isinstance(it, psf.Group) else it.pid
+                  for it in items]
+        self.assertEqual(firsts, sorted(firsts))
+
+
 if __name__ == "__main__":
     unittest.main()
