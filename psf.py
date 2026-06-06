@@ -627,31 +627,14 @@ def read_uptime():
         return 0.0
 
 
-def read_cpu_ticks(pid):
-    """Total CPU jiffies (utime + stime) for a pid right now, or None if its
-    stat is unreadable (vanished / permission)."""
-    try:
-        st = parse_stat(_read("%s/%d/stat" % (PROC, pid)))
-    except (OSError, ValueError, IndexError):
-        return None
-    return st.utime + st.stime
-
-
-def sample_current_cpu(nodes, interval, clk_tck=CLK_TCK):
-    """Measure each node's recent CPU fraction over a short window: read cpu
-    jiffies, sleep `interval`, read again, and set node.cpu_current. Only the
-    (few) printed nodes are sampled, so the fixed sleep is the whole cost."""
-    if interval <= 0 or not nodes:
-        return
-    start = time.monotonic()
-    first = {n.pid: read_cpu_ticks(n.pid) for n in nodes}
-    time.sleep(interval)
-    elapsed = time.monotonic() - start
-    for n in nodes:
-        before, after = first.get(n.pid), read_cpu_ticks(n.pid)
-        if before is None or after is None:
-            continue
-        n.cpu_current = cpu_fraction(after - before, elapsed, clk_tck)
+def _parents_map(*snaps):
+    """pid -> comm across one or more {pid: Proc} snapshots (for annotating the
+    parent of a born/died process)."""
+    out = {}
+    for snap in snaps:
+        for p in snap.values():
+            out[p.pid] = p.comm
+    return out
 
 
 # --- probe orchestration ----------------------------------------------------
@@ -878,6 +861,8 @@ def glossary(color):
         "+N est = N established TCP connections   unix:PATH = named socket",
         "  stats:   cpu X% (Y avg) = recent / lifetime-average CPU   "
         "rss = resident memory   up = time since start",
+        "  groups:  ×N = N near-identical siblings merged (pids/ranges on the "
+        "detail line)   lifecycle = procs born/died during the sample window",
     ]
     if color:
         lines = ["\x1b[2m%s\x1b[0m" % ln for ln in lines]
@@ -932,36 +917,62 @@ def main(argv=None):
                     default=SAMPLE_INTERVAL,
                     help="seconds slept to measure current CPU (default %.2g; "
                          "0 disables the current-CPU sample)" % SAMPLE_INTERVAL)
+    ap.add_argument("--no-dedup", action="store_true",
+                    help="do not merge near-identical sibling subtrees")
+    ap.add_argument("--dedup-min", type=int, default=DEDUP_MIN,
+                    help="min identical siblings to merge (default %d)"
+                         % DEDUP_MIN)
+    ap.add_argument("--no-lifecycle", action="store_true",
+                    help="suppress the born/died section")
     args = ap.parse_args(argv)
 
-    procs = scan()
-    roots = build_tree(procs)
-    select(procs, DEFAULT_MATCHERS)
-    suppressed = collapse(procs, threshold=args.threshold)
-
+    s_a = scan()
+    t_a = time.monotonic()
+    roots = build_tree(s_a)
+    select(s_a, DEFAULT_MATCHERS)
+    suppressed = collapse(s_a, threshold=args.threshold)
     visible_roots = [r for r in roots if r.kept]
     printed = [n for n in collect_printed(visible_roots, suppressed) if n.kept]
+
+    born, died, s_b, dt = [], [], None, 0.0
+    if args.sample_interval > 0:
+        time.sleep(args.sample_interval)
+        s_b = scan()
+        dt = time.monotonic() - t_a
+        for n in printed:                      # current CPU over the same window
+            other = s_b.get(n.pid)
+            if other is not None and other.starttime == n.starttime:
+                n.cpu_current = cpu_fraction(
+                    (other.utime + other.stime) - (n.utime + n.stime),
+                    dt, CLK_TCK)
+        born, died = diff_snapshots(s_a, s_b)
+
     if args.no_cache:
         cache = Cache(os.devnull, boot_id="", now=time.time())
     else:
         cache = Cache(cache_path(), boot_id=read_boot_id(), now=time.time())
     probe(printed, cache)
     if not args.no_cache:
-        cache.save(live_keys={(p.pid, p.starttime) for p in procs.values()})
-    sample_current_cpu(printed, args.sample_interval)
+        cache.save(live_keys={(p.pid, p.starttime) for p in s_a.values()})
 
     color = sys.stdout.isatty() and not args.no_color
-    sysinfo = SysInfo(clk_tck=CLK_TCK, page_size=PAGE_SIZE,
-                      uptime=read_uptime())
+    sysinfo = SysInfo(clk_tck=CLK_TCK, page_size=PAGE_SIZE, uptime=read_uptime())
+    dedup_min = None if args.no_dedup else args.dedup_min
+
     out = []
     if not args.no_glossary:
         out += glossary(color) + [""]
     out += render(visible_roots, suppressed, width=args.width, color=color,
-                  sysinfo=sysinfo)
+                  sysinfo=sysinfo, dedup_min=dedup_min, never_merge=NEVER_MERGE)
+    if s_b is not None and not args.no_lifecycle:
+        section = format_lifecycle(born, died, _parents_map(s_a, s_b),
+                                   sysinfo, dt, color=color)
+        if section:
+            out += [""] + section
     print("\n".join(out))
 
-    hidden = sum(1 for p in procs.values() if not p.kept)
-    kthreads = sum(1 for p in procs.values() if p.ppid == 2 or p.pid == 2)
+    hidden = sum(1 for p in s_a.values() if not p.kept)
+    kthreads = sum(1 for p in s_a.values() if p.ppid == 2 or p.pid == 2)
     sys.stderr.write("(hidden: %d procs, %d kernel threads)\n"
                      % (hidden, kthreads))
 
