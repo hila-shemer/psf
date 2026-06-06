@@ -249,3 +249,15 @@ def test_parse_windows_rejects_garbage():
         topf.parse_windows("2,abc")
     with pytest.raises(ValueError):
         topf.parse_windows("")
+
+
+def test_cores_count_positive():
+    assert topf.cores_count() >= 1
+
+
+def test_render_once_smoke():
+    # Drive render_once against the real /proc but with a tiny interval; assert
+    # it returns a non-empty list of strings and includes the header.
+    lines = topf.render_once(interval=0.05, args=topf._once_defaults())
+    assert isinstance(lines, list) and lines
+    assert any(ln.startswith("topf —") for ln in lines)
