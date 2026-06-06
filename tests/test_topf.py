@@ -232,3 +232,20 @@ def test_cpu_bit_once_mode_appends_avg():
 def test_cpu_bit_tint_ignores_none():
     _, level = topf._cpu_bit([0.05, None, None])  # 0.05 cores -> level 0
     assert level == 0
+
+
+def test_parse_windows_basic():
+    assert topf.parse_windows("2,10,60") == (2.0, 10.0, 60.0)
+
+
+def test_parse_windows_single_and_floats():
+    assert topf.parse_windows("0.2") == (0.2,)
+    assert topf.parse_windows("1, 5 , 30") == (1.0, 5.0, 30.0)
+
+
+def test_parse_windows_rejects_garbage():
+    import pytest
+    with pytest.raises(ValueError):
+        topf.parse_windows("2,abc")
+    with pytest.raises(ValueError):
+        topf.parse_windows("")
