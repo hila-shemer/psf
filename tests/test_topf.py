@@ -65,3 +65,20 @@ def test_update_history_drops_dead_pids():
     topf.update_history(hist, {5: _proc(5)}, 1.0, 60.0)
     assert (5, 1) in hist
     assert (6, 1) not in hist
+
+
+def test_compute_windows_sets_aligned_list():
+    procs = {5: _proc(5, starttime=1, ticks=300)}
+    hist = {(5, 1): [(0.0, 0), (1.0, 100), (2.0, 200), (3.0, 300)]}
+    topf.compute_windows(procs, hist, (1.0, 2.0), TCK)
+    w = procs[5].cpu_windows
+    assert len(w) == 2
+    # 1s window [2,3]: 100 ticks/(100*1s)=1.0 ; 2s window [1,3]: 200/(100*2)=1.0
+    assert abs(w[0] - 1.0) < 1e-9 and abs(w[1] - 1.0) < 1e-9
+
+
+def test_compute_windows_young_proc_gets_none():
+    procs = {5: _proc(5, starttime=1, ticks=100)}
+    hist = {(5, 1): [(3.0, 100)]}   # only one sample
+    topf.compute_windows(procs, hist, (1.0, 2.0), TCK)
+    assert procs[5].cpu_windows == [None, None]
