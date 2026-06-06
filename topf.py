@@ -89,7 +89,7 @@ class Proc:
     utime: int = 0                  # user jiffies (stat field 14)
     stime: int = 0                  # system jiffies (stat field 15)
     rss_pages: int = 0              # resident pages (stat field 24)
-    cpu_current: float = None       # recent CPU fraction from probe sampling
+    cpu_windows: list = None        # per-window CPU rate (cores), aligned to windows
     children: list = field(default_factory=list)   # list[Proc]
     interesting: bool = False
     kept: bool = False
@@ -404,6 +404,15 @@ def update_history(history, procs, now, longest_window):
     for key in list(history):
         if key not in seen:
             del history[key]
+
+
+def compute_windows(procs, history, windows, clk_tck):
+    """Set proc.cpu_windows: a list of per-window CPU rates (cores) aligned to
+    `windows`, computed from the proc's history ring. Entries are None where the
+    ring has < 2 samples."""
+    for p in procs.values():
+        ring = history.get((p.pid, p.starttime), [])
+        p.cpu_windows = [windowed_rate(ring, w, clk_tck) for w in windows]
 
 
 def fmt_pct(frac):
