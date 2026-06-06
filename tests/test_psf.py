@@ -519,5 +519,28 @@ class TestCompressPath(unittest.TestCase):
         self.assertEqual(psf.compress_path("?"), "?")
 
 
+# --- group display helpers --------------------------------------------------
+
+
+class TestGroupHelpers(unittest.TestCase):
+    def test_brace_summary_common_prefix(self):
+        self.assertEqual(psf.brace_summary(["~/a", "~/b"]), "~/{a,b}")
+
+    def test_brace_summary_single_value(self):
+        self.assertEqual(psf.brace_summary(["~/only"]), "~/only")
+
+    def test_brace_summary_truncates(self):
+        vals = ["p/%d" % i for i in range(10)]
+        out = psf.brace_summary(vals, max_items=3)
+        self.assertTrue(out.startswith("p/{"))
+        self.assertIn(",...}", out)
+
+    def test_range_str_low_high(self):
+        self.assertEqual(psf.range_str([1024, 2048], psf.fmt_bytes), "1.0K–2.0K")
+
+    def test_range_str_equal_is_single(self):
+        self.assertEqual(psf.range_str([5, 5], str), "5")
+
+
 if __name__ == "__main__":
     unittest.main()
