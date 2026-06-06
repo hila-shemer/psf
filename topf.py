@@ -962,11 +962,27 @@ def _group_detail(members, color, sysinfo):
     return _compose_dim(bits, color)
 
 
+def subtree_window_cpu(node, widx):
+    """Sum of the window `widx` CPU rate over `node` and ALL its descendants
+    (suppressed/collapsed included). None rates count as 0. Used to order
+    top-level subtrees by their true total load."""
+    total = 0.0
+    nodes = [node] + _descendants(node)
+    for n in nodes:
+        if n.cpu_windows:
+            v = n.cpu_windows[widx]
+            if v is not None:
+                total += v
+    return total
+
+
 def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
-           dedup_min=None, never_merge=frozenset()):
+           dedup_min=None, never_merge=frozenset(), top_sort_key=None,
+           show_avg=False):
     """Render kept Procs as an ascii tree. With sysinfo, detail lines carry
     cpu/rss/elapsed. With dedup_min, near-identical sibling subtrees merge into
-    one ×N entry that recurses over the union of members' children."""
+    one ×N entry that recurses over the union of members' children. With
+    top_sort_key, top-level items are ordered by it (descending)."""
     if color is None:
         color = False
     lines = []
@@ -998,7 +1014,12 @@ def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
             if isinstance(item, Proc) and item.collapsed and item.collapse_note:
                 lines.append(child_prefix + item.collapse_note)
 
-    walk_items(group_siblings(list(roots), dedup_min, never_merge), "")
+    top_items = group_siblings(list(roots), dedup_min, never_merge)
+    if top_sort_key is not None:
+        # group_siblings already orders by min-pid (stable); a stable sort by
+        # descending key therefore gives "load desc, pid asc" tiebreak.
+        top_items.sort(key=top_sort_key, reverse=True)
+    walk_items(top_items, "")
     return lines
 
 
