@@ -651,5 +651,25 @@ class TestGroupRender(unittest.TestCase):
         self.assertIn("shemer@pts/0", "\n".join(lines))   # each shown
 
 
+# --- lifecycle diff ---------------------------------------------------------
+
+
+class TestDiffSnapshots(unittest.TestCase):
+    def test_born_and_died(self):
+        before = {1: _p(1, 0), 2: _p(2, 1, comm="old")}
+        after = {1: _p(1, 0), 3: _p(3, 1, comm="new")}
+        born, died = psf.diff_snapshots(before, after)
+        self.assertEqual([p.pid for p in born], [3])
+        self.assertEqual([p.pid for p in died], [2])
+
+    def test_pid_reuse_counts_as_both(self):
+        # same pid, different starttime -> old one died and a new one was born
+        before = {5: _p(5, 1, comm="a", starttime=100)}
+        after = {5: _p(5, 1, comm="b", starttime=200)}
+        born, died = psf.diff_snapshots(before, after)
+        self.assertEqual([p.comm for p in born], ["b"])
+        self.assertEqual([p.comm for p in died], ["a"])
+
+
 if __name__ == "__main__":
     unittest.main()
