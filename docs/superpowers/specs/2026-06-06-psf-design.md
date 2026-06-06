@@ -126,20 +126,27 @@ so a stale entry can never be mistaken for the new process.
 **Cached payload:** the resolved socket summaries only (the expensive part).
 `cwd`/`exe` are not cached (re-read every run — they're free).
 
-**Freshness signal:** before re-walking a process's fds, `stat
-/proc/PID/fd` and compare `st_mtime_ns` to the cached value. The fd-directory
-mtime bumps when fds open/close, so:
+**Freshness signal:** the originally-planned `/proc/PID/fd` directory mtime
+trick was validated against this kernel (6.17.0-1017-aws) and **rejected** —
+neither `st_mtime_ns` nor `st_ctime_ns` of the fd directory changes when fds
+open/close. The only cheap signal that reliably moves is the **fd count**
+(`len(os.listdir('/proc/PID/fd'))`) — one readdir, zero readlinks, far cheaper
+than the full fd-walk + `/proc/net` parse it gates.
 
-- stable daemon (bazel server, sshd, tmux) → mtime unchanged → reuse cached
-  sockets; **no fd walk and no `/proc/net` parse for its namespace**.
-- changed fds → re-walk + targeted `/proc/net` parse for just its netns.
+A cached socket entry is reused iff **both**:
+- the fd count matches the cached fingerprint, **and**
+- the entry's age is under `CACHE_TTL` (default 30s).
+
+Otherwise the process is re-probed (fd-walk + targeted `/proc/net` parse for
+its netns). So:
+
+- stable daemon (bazel server, sshd, tmux) → fd count unchanged, within TTL →
+  reuse cached sockets; no fd-walk and no `/proc/net` parse for its namespace.
+- fds opened/closed → count changes → re-probe.
+- a same-count fd swap (close one socket, open another) is missed by the count
+  but corrected within `CACHE_TTL`.
 - short-lived actions (clang) → never stable long enough to benefit; they age
   out automatically.
-
-*Validation during implementation:* confirm fd-dir `st_mtime_ns` actually
-tracks fd open/close on this kernel (6.17). If unreliable, fall back to a
-per-entry TTL (re-probe if cached entry older than `CACHE_TTL`, default 30s),
-which still collapses a burst of repeated runs.
 
 **Self-cleaning:** on write, drop entries whose `(pid, starttime)` is absent
 from the current scan, so the file only ever holds live processes.
@@ -160,7 +167,7 @@ Color/dim only when stdout is a TTY.
 
 - `CMD_WIDTH = 50`
 - `COLLAPSE_THRESHOLD = 20`
-- `CACHE_TTL = 30` (fallback only)
+- `CACHE_TTL = 30` (max age before a cached socket entry is re-probed)
 - `INTERESTING = [...]` — list of matchers (label, regex, target=comm|cmdline)
 - HOME-summarization on/off
 
@@ -169,7 +176,7 @@ Color/dim only when stdout is a TTY.
 - One `/proc` pass, zero forks.
 - Deep readlinks bounded to the small set of printed nodes.
 - `/proc/net` parsed at most once per network namespace, and skipped entirely
-  for processes whose fd-dir mtime is unchanged.
+  for processes whose fd count is unchanged and cache entry is within TTL.
 - Effectively instant even with a large build running.
 - `sudo` needed only to read other users' `fd`/`exe`/`cwd` links.
 
@@ -178,7 +185,6 @@ Color/dim only when stdout is a TTY.
 - Unit-test each stage on synthetic `ProcInfo` dicts (tree building,
   selection, collapse, cwd/exe summarization, socket-line formatting).
 - Parse fixtures for `/proc/net/{tcp,tcp6,unix}` → socket summary.
-- Cache: identity-key reuse, boot_id invalidation, fd-mtime hit/miss,
-  self-cleaning of dead entries, TTL fallback.
-- Validate fd-dir mtime behavior against the live kernel as a precondition test.
+- Cache: identity-key reuse, boot_id invalidation, fd-count hit/miss,
+  TTL expiry, self-cleaning of dead entries.
 ```
