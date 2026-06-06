@@ -33,6 +33,7 @@ PATH_MAX_BASENAME = 30    # basename length above which it is itself shortened
 PATH_BASENAME_KEEP = 6    # chars kept each side of '...' in a long basename
 DEDUP_MIN = 3             # min identical siblings to merge into one ×N group
 NEVER_MERGE = frozenset({"claude"})   # comms never grouped, even when identical
+GROUP_PIDS = 8            # member pids listed on a group's detail line
 
 # System constants, read once. CLK_TCK converts stat jiffies -> seconds;
 # PAGE_SIZE converts stat rss (in pages) -> bytes.
@@ -714,34 +715,90 @@ def _detail(node, color, sysinfo=None):
     return "\x1b[2m%s\x1b[0m" % line if color else line
 
 
-def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None):
-    """Render kept Procs as an ascii tree. Returns a list of lines. When
-    `sysinfo` is given, each detail line also carries cpu/rss/elapsed."""
+def _visible_children(node, suppressed):
+    return [c for c in node.children if c.kept and c.pid not in suppressed]
+
+
+def _group_label(members, width):
+    return brace_summary([m.cmdline for m in members])[:width]
+
+
+def _group_detail(members, color, sysinfo):
+    """Aggregated detail line for a merged group: shared/braced cwd & exe,
+    member pids, and cpu/rss/up ranges (when sysinfo is given)."""
+    bits = []
+    for attr, prefix in (("cwd", "cwd:"), ("exe", "exe:")):
+        vals = [getattr(m, attr) for m in members
+                if getattr(m, attr) and getattr(m, attr) not in ("?", "")]
+        if vals:
+            bits.append(prefix + brace_summary([compress_path(v) for v in vals]))
+    pids = sorted(m.pid for m in members)
+    extra = " +%d" % (len(pids) - GROUP_PIDS) if len(pids) > GROUP_PIDS else ""
+    bits.append("pids:" + " ".join(str(x) for x in pids[:GROUP_PIDS]) + extra)
+    if sysinfo is not None:
+        avgs = [a for a in (
+            cpu_fraction(m.utime + m.stime,
+                         lifetime_secs(m.starttime, sysinfo.uptime,
+                                       sysinfo.clk_tck), sysinfo.clk_tck)
+            for m in members) if a is not None]
+        if avgs:
+            curs = [m.cpu_current for m in members if m.cpu_current is not None]
+            if curs:
+                bits.append("cpu %s (%s avg)" % (range_str(curs, fmt_pct),
+                                                 range_str(avgs, fmt_pct)))
+            else:
+                bits.append("cpu %s avg" % range_str(avgs, fmt_pct))
+        rss = [m.rss_pages * sysinfo.page_size for m in members
+               if m.rss_pages > 0]
+        if rss:
+            bits.append("rss:" + range_str(rss, fmt_bytes))
+        lifes = [lifetime_secs(m.starttime, sysinfo.uptime, sysinfo.clk_tck)
+                 for m in members]
+        bits.append("up:" + range_str(lifes, fmt_duration))
+    threads = max(m.num_threads for m in members)
+    if threads > 1:
+        bits.append("%d threads" % threads)
+    line = "  ".join(bits)
+    return "\x1b[2m%s\x1b[0m" % line if color else line
+
+
+def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
+           dedup_min=None, never_merge=frozenset()):
+    """Render kept Procs as an ascii tree. With sysinfo, detail lines carry
+    cpu/rss/elapsed. With dedup_min, near-identical sibling subtrees merge into
+    one ×N entry that recurses over the union of members' children."""
     if color is None:
         color = False
     lines = []
 
-    def walk(node, prefix, is_last):
-        if node.pid in suppressed:
-            return
-        connector = "" if prefix == "" and is_last else (
-            "└─ " if is_last else "├─ ")
-        cmd = node.cmdline[:width]
-        head = "%s%s%d %s" % (prefix, connector, node.pid, cmd)
-        lines.append(head)
-        child_prefix = prefix + ("   " if is_last else "│  ")
-        detail = _detail(node, color, sysinfo)
-        if detail is not None:
-            lines.append(child_prefix + detail)
-        visible = [c for c in node.children
-                   if c.kept and c.pid not in suppressed]
-        for i, child in enumerate(visible):
-            walk(child, child_prefix, i == len(visible) - 1)
-        if node.collapsed and node.collapse_note:
-            lines.append(child_prefix + node.collapse_note)
+    def walk_items(items, prefix):
+        for i, item in enumerate(items):
+            is_last = i == len(items) - 1
+            connector = "" if prefix == "" and is_last else (
+                "└─ " if is_last else "├─ ")
+            child_prefix = prefix + ("   " if is_last else "│  ")
+            if isinstance(item, Group):
+                head = "%s%s×%d %s" % (prefix, connector, len(item.members),
+                                       _group_label(item.members, width))
+                lines.append(head)
+                detail = _group_detail(item.members, color, sysinfo)
+                if detail is not None:
+                    lines.append(child_prefix + detail)
+                kids = [c for m in item.members
+                        for c in _visible_children(m, suppressed)]
+            else:
+                head = "%s%s%d %s" % (prefix, connector, item.pid,
+                                      item.cmdline[:width])
+                lines.append(head)
+                detail = _detail(item, color, sysinfo)
+                if detail is not None:
+                    lines.append(child_prefix + detail)
+                kids = _visible_children(item, suppressed)
+            walk_items(group_siblings(kids, dedup_min, never_merge), child_prefix)
+            if isinstance(item, Proc) and item.collapsed and item.collapse_note:
+                lines.append(child_prefix + item.collapse_note)
 
-    for i, root in enumerate(roots):
-        walk(root, "", True)
+    walk_items(group_siblings(list(roots), dedup_min, never_merge), "")
     return lines
 
 

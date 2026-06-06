@@ -595,5 +595,61 @@ class TestGroupSiblings(unittest.TestCase):
         self.assertEqual(firsts, sorted(firsts))
 
 
+# --- group rendering --------------------------------------------------------
+
+
+class TestGroupRender(unittest.TestCase):
+    def _tree(self):
+        # sshd -D with 3 identical sshd@pts children, each with a tmux child
+        procs = {1: _p(1, 0, comm="sshd", cmdline="sshd: /usr/sbin/sshd -D")}
+        procs[1].exe = "/usr/sbin/sshd"
+        tmux_pid = 100
+        for i, pts in enumerate((0, 7, 8)):
+            sp = _p(10 + i, 1, comm="sshd", cmdline="sshd: shemer@pts/%d" % pts)
+            sp.exe = "/usr/sbin/sshd"
+            procs[10 + i] = sp
+            tp = _p(tmux_pid, 10 + i, comm="tmux",
+                    cmdline="tmux attach-session -t s%d" % pts)
+            tp.exe = "/usr/bin/tmux"
+            procs[tmux_pid] = tp
+            tmux_pid += 1
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        return procs
+
+    def test_group_header_and_recursion(self):
+        procs = self._tree()
+        lines = psf.render([procs[1]], suppressed=set(), width=80, color=False,
+                           dedup_min=3, never_merge=frozenset())
+        text = "\n".join(lines)
+        self.assertIn("×3", text)                       # sshd@pts merged
+        self.assertIn("sshd: shemer@pts/{", text)       # brace label
+        self.assertIn("pids:10 11 12", text)            # member pids on detail
+        # recursion: the 3 tmux children of the group are themselves merged
+        self.assertIn("tmux attach-session -t s{0,7,8}", text)
+
+    def test_group_detail_shows_path_and_ranges(self):
+        procs = self._tree()
+        for i, pid in enumerate((10, 11, 12)):
+            procs[pid].cwd = "/home/shemer/proj%d" % i
+            procs[pid].rss_pages = 1000 + i * 1000      # differing rss
+            procs[pid].starttime = 1000
+        sysinfo = psf.SysInfo(clk_tck=100, page_size=4096, uptime=1100.0)
+        lines = psf.render([procs[1]], suppressed=set(), width=80, color=False,
+                           sysinfo=sysinfo, dedup_min=3, never_merge=frozenset())
+        text = "\n".join(lines)
+        self.assertIn("cwd:~/proj{0,1,2}", text)          # compressed + braced
+        self.assertIn("rss:", text)
+        self.assertIn("–", text)                          # an en-dash range
+
+    def test_no_dedup_renders_individually(self):
+        procs = self._tree()
+        lines = psf.render([procs[1]], suppressed=set(), width=80, color=False,
+                           dedup_min=None, never_merge=frozenset())
+        self.assertFalse(any("×3" in ln for ln in lines))
+        self.assertIn("shemer@pts/0", "\n".join(lines))   # each shown
+
+
 if __name__ == "__main__":
     unittest.main()
