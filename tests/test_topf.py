@@ -685,6 +685,12 @@ def test_parse_args_history_defaults():
     assert args.vmstat_halflife == topf.VMSTAT_HALFLIFE_DEFAULT
 
 
+def test_parse_args_rejects_nonpositive_halflife():
+    import pytest
+    with pytest.raises(SystemExit):
+        topf._parse_args(["--vmstat-halflife", "0"])
+
+
 # --- vmstat history-grounded coloring ---------------------------------------
 
 
