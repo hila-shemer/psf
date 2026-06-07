@@ -1432,6 +1432,95 @@ def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
         show_avg=show_avg, expanded=expanded, collapsible=collapsible)]
 
 
+# --- live UI state & viewport -----------------------------------------------
+
+
+@dataclass
+class UIState:
+    expanded: set = field(default_factory=set)
+    cursor: tuple = None
+    scroll_top: int = 0
+    frozen: bool = False
+    sort_idx: int = 0
+    vmstat_on: bool = True
+
+
+def selectable_ids(rows):
+    """Ordered item ids of the selectable head rows."""
+    return [r.item_id for r in rows if r.selectable]
+
+
+def move_cursor(ids, cursor, delta):
+    """Move the cursor `delta` selectable rows, clamped to the ends. A cursor of
+    None (or one no longer present) starts from the first row."""
+    if not ids:
+        return None
+    try:
+        i = ids.index(cursor)
+    except ValueError:
+        return ids[0]
+    return ids[max(0, min(len(ids) - 1, i + delta))]
+
+
+def _row_index_of(rows, item_id):
+    for i, r in enumerate(rows):
+        if r.selectable and r.item_id == item_id:
+            return i
+    return None
+
+
+def present_viewport(rows, ui, height, color):
+    """Slice `rows` to a `height`-row viewport around the cursor and decorate it:
+    a 2-col gutter (▸ closed / ▾ open on expandable rows, else blank), reverse
+    video on the cursor's row, and dim ▲/▼ 'more' markers on the first/last line
+    when content extends past the viewport. The markers occupy whole lines, so
+    when the content overflows the cursor is held one row inside each edge (an
+    'inner band') — a marker never overwrites the cursor's row. Returns (lines,
+    resolved_cursor, scroll_top). Pure: no terminal I/O."""
+    sel = [i for i, r in enumerate(rows) if r.selectable]
+    if not sel:
+        return ([r.text for r in rows[:height]], None, 0)
+
+    cur_idx = _row_index_of(rows, ui.cursor)
+    if cur_idx is None:
+        cur_idx = sel[0]
+    cursor = rows[cur_idx].item_id
+    n = len(rows)
+
+    def dim(s):
+        return ("\x1b[2m%s\x1b[0m" % s) if color else s
+
+    if n <= height:                       # everything fits, no markers/scroll
+        top = 0
+    else:
+        # reserve one line at each edge for a potential marker; keep the cursor
+        # within [top+1, top+height-2] so a marker can never land on it.
+        band = max(1, height - 2)
+        top = max(0, min(ui.scroll_top, n - height))
+        if cur_idx - top < 1:
+            top = cur_idx - 1
+        elif cur_idx - top > band:
+            top = cur_idx - band
+        top = max(0, min(top, n - height))
+
+    window = rows[top:top + height]
+    out = []
+    for off, r in enumerate(window):
+        idx = top + off
+        gutter = ("▾ " if r.item_id in ui.expanded else "▸ ") if r.expandable \
+            else "  "
+        text = gutter + r.text
+        if idx == cur_idx and color:
+            text = "\x1b[7m" + text + "\x1b[0m"
+        out.append(text)
+
+    if top > 0:                           # content hidden above
+        out[0] = dim("▲ %d more above" % top)
+    if top + height < n:                  # content hidden below
+        out[-1] = dim("▼ %d more below" % (n - (top + height)))
+    return out, cursor, top
+
+
 def glossary(color):
     """A short legend printed at the head of the output explaining the
     annotations (notably what '+N est' means). Returns a list of lines."""
