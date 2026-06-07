@@ -644,3 +644,17 @@ def test_split_regions_off_when_toggled():
     region, pane, show = topf.split_regions(rows=40, cols=200, vmstat_on=False,
                                             vmstat_rows_cap=12, sample_rows=10)
     assert show is False and region == 39
+
+
+# --- key decoder ------------------------------------------------------------
+
+
+def test_read_key_decodes_arrows_and_plain():
+    import io
+    assert topf._read_key(io.StringIO("q")) == "q"
+    assert topf._read_key(io.StringIO("\x1b[A")) == "up"
+    assert topf._read_key(io.StringIO("\x1b[B")) == "down"
+    assert topf._read_key(io.StringIO("\x1b[5~")) == "pgup"
+    assert topf._read_key(io.StringIO("\x1b[6~")) == "pgdn"
+    # a lone ESC (no following bytes) is returned as escape, not a hang
+    assert topf._read_key(io.StringIO("\x1b")) == "esc"

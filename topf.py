@@ -1608,59 +1608,137 @@ def _draw_frame(out, lines):
     out.flush()
 
 
+def _read_key(stream, pending=lambda: True):
+    """Decode one logical key from `stream`. Returns a plain char, or one of
+    'up'/'down'/'pgup'/'pgdn'/'home'/'end'/'esc'/'enter'. `pending()` says
+    whether more bytes are immediately available (used so a lone ESC returns
+    'esc' instead of blocking on a CSI read)."""
+    ch = stream.read(1)
+    if ch == "\r" or ch == "\n":
+        return "enter"
+    if ch != "\x1b":
+        return ch
+    if not pending():
+        return "esc"
+    if stream.read(1) != "[":
+        return "esc"
+    seq = ""
+    while True:
+        c = stream.read(1)
+        if not c:
+            break
+        seq += c
+        if c.isalpha() or c == "~":
+            break
+    return {"A": "up", "B": "down", "H": "home", "F": "end",
+            "5~": "pgup", "6~": "pgdn", "1~": "home", "4~": "end"}.get(seq, "esc")
+
+
 def run_live(args):
-    """Full-screen live loop: raw ANSI alt-screen + termios cbreak + select
-    polling. Read-only keys: q/Ctrl-C quit, space freeze, w cycle sort window.
-    Terminal state is always restored (finally), even on exception/signal."""
+    """Full-screen live loop with a pinned header, a scrolling/cursored process
+    tree, and a pinned vmstat pane. Keys: q/Ctrl-C quit, f freeze, w sort window,
+    v toggle vmstat, ↑/k ↓/j move cursor, PgUp/PgDn page, g/G top/bottom,
+    Space/Enter expand-collapse the selected group/subtree. Terminal state is
+    always restored."""
     fd = sys.stdin.fileno()
     out = sys.stdout
     old_attr = termios.tcgetattr(fd)
     windows = args.windows
     longest = max(windows)
     history = {}
-    cache = (Cache(os.devnull, boot_id="", now=time.time()) if args.no_cache
-             else Cache(cache_path(), boot_id=read_boot_id(), now=time.time()))
-    sysinfo_base = (read_uptime(), cores_count())
-    sort_idx = 0
-    frozen = False
+    vmring = []
+    ui = UIState(vmstat_on=not args.no_vmstat)
+    sysinfo_cores = cores_count()
     prev, t_prev = None, None
+    cur, rows, sysinfo = {}, [], None
+
+    def repaint():
+        """Re-present the current `rows` + vmstat ring without resampling (used
+        after navigation/expand/freeze so input feels instant)."""
+        cols, term_rows = os.get_terminal_size()
+        rate_rows = vmstat_rate_rows(vmring)
+        region_h, pane_h, show = split_regions(
+            term_rows, cols, ui.vmstat_on, args.vmstat_rows, len(rate_rows))
+        body, ui.cursor, ui.scroll_top = present_viewport(
+            rows, ui, region_h, color=not args.no_color)
+        if show:
+            body += [""] * (region_h - len(body))   # pad so the pane pins to bottom
+        frame = [header_line((t_prev and (time.monotonic() - t_prev)) or 0.0,
+                             sysinfo, len(cur),
+                             sum(1 for p in cur.values() if not p.kept),
+                             args.sample_interval, ui.frozen)]
+        frame += body
+        if show:
+            swap_on = any(s.swap_total for s in vmring if s.swap_total)
+            frame.append("─" * cols)
+            frame += format_vmstat_pane(rate_rows, swap_on, cols, pane_h - 1,
+                                        color=not args.no_color)
+        _draw_frame(out, [visible_truncate(ln, cols) for ln in frame[:term_rows]])
+
+    def sample_and_build():
+        nonlocal prev, t_prev, cur, rows, sysinfo
+        cur = scan()
+        t_now = time.monotonic()
+        update_history(history, cur, t_now, longest)
+        compute_windows(cur, history, windows, CLK_TCK)
+        vmring.append(read_vmstat_sample(t_now))
+        if len(vmring) > args.vmstat_rows + 1:
+            del vmring[0]
+        sysinfo = SysInfo(clk_tck=CLK_TCK, page_size=PAGE_SIZE,
+                          uptime=read_uptime(), cores=sysinfo_cores)
+        visible_roots, suppressed, collapsible = prepare_frame(
+            cur, args, sysinfo, expanded=ui.expanded)
+        dedup_min = None if args.no_dedup else args.dedup_min
+        key = lambda item: subtree_window_cpu(
+            item.members[0] if isinstance(item, Group) else item, ui.sort_idx)
+        rows = build_rows(visible_roots, suppressed, width=args.width,
+                          color=not args.no_color, sysinfo=sysinfo,
+                          dedup_min=dedup_min, never_merge=NEVER_MERGE,
+                          top_sort_key=key, expanded=ui.expanded,
+                          collapsible=collapsible)
+        prev, t_prev = cur, t_now
 
     try:
         tty.setcbreak(fd)
         out.write("\x1b[?1049h")
         out.flush()
+        sample_and_build()
+        repaint()
         while True:
-            if not frozen:
-                cur = scan()
-                t_now = time.monotonic()
-                update_history(history, cur, t_now, longest)
-                compute_windows(cur, history, windows, CLK_TCK)
-                color = not args.no_color
-                sysinfo = SysInfo(clk_tck=CLK_TCK, page_size=PAGE_SIZE,
-                                  uptime=read_uptime(), cores=sysinfo_base[1])
-                lines = build_frame(prev, cur, history, t_prev or t_now, t_now,
-                                    args, color, sysinfo, sort_idx,
-                                    show_avg=False, frozen=frozen)
-                cols, rows = os.get_terminal_size()
-                _draw_frame(out, clip_frame(lines, rows, cols))
-                prev, t_prev = cur, t_now
-
             r, _w, _e = _select.select([fd], [], [], args.sample_interval)
             if r:
-                ch = sys.stdin.read(1)
-                if ch in ("q", "\x03"):     # q or Ctrl-C
+                key = _read_key(
+                    sys.stdin,
+                    pending=lambda: bool(_select.select([fd], [], [], 0)[0]))
+                ids = selectable_ids(rows)
+                if key in ("q", "\x03"):
                     break
-                if ch == " ":
-                    frozen = not frozen
-                    if frozen:              # repaint once to show FROZEN marker
-                        cols, rows = os.get_terminal_size()
-                        lines[0] = header_line(
-                            (t_now - (t_prev or t_now)), sysinfo, len(cur),
-                            sum(1 for p in cur.values() if not p.kept),
-                            args.sample_interval, frozen=True)
-                        _draw_frame(out, clip_frame(lines, rows, cols))
-                elif ch == "w":
-                    sort_idx = (sort_idx + 1) % len(windows)
+                elif key == "f":
+                    ui.frozen = not ui.frozen
+                elif key == "w":
+                    ui.sort_idx = (ui.sort_idx + 1) % len(windows)
+                elif key == "v":
+                    ui.vmstat_on = not ui.vmstat_on
+                elif key in ("up", "k"):
+                    ui.cursor = move_cursor(ids, ui.cursor, -1)
+                elif key in ("down", "j"):
+                    ui.cursor = move_cursor(ids, ui.cursor, +1)
+                elif key == "pgup":
+                    ui.cursor = move_cursor(ids, ui.cursor, -10)
+                elif key == "pgdn":
+                    ui.cursor = move_cursor(ids, ui.cursor, +10)
+                elif key in ("g", "home"):
+                    ui.cursor = ids[0] if ids else None
+                elif key in ("G", "end"):
+                    ui.cursor = ids[-1] if ids else None
+                elif key in (" ", "enter"):
+                    if ui.cursor is not None:
+                        ui.expanded ^= {ui.cursor}      # toggle membership
+                        sample_and_build()              # tree shape changed
+                repaint()                               # instant feedback
+            elif not ui.frozen:
+                sample_and_build()
+                repaint()
     except KeyboardInterrupt:
         pass
     finally:
@@ -1668,15 +1746,15 @@ def run_live(args):
         out.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
         if not args.no_cache:
-            cache.now = time.time()
-            cache.save(live_keys=set())     # nothing forced live; entries already pruned
+            Cache(cache_path(), boot_id=read_boot_id(),
+                  now=time.time()).save(live_keys=set())
 
 
 def header_line(frame_dt, sysinfo, nprocs, hidden, interval, frozen=False):
     """Top-style status line."""
     state = "  FROZEN" if frozen else ""
     return ("topf — %.2gs, %d cores, %d procs (%d hidden)   every %.2gs   "
-            "[q]uit  [space]freeze  [w]indow%s"
+            "[q]uit [f]reeze [w]in [v]mstat [↑↓]nav [␣]expand%s"
             % (frame_dt, sysinfo.cores, nprocs, hidden, interval, state))
 
 
