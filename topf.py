@@ -1207,6 +1207,29 @@ def vmstat_hist_fold(col, value, kind, d):
     col["count"] += 1
 
 
+def vmstat_cdf(col, value, kind):
+    """Fraction of `col`'s histogram mass below `value`'s bucket, plus half that
+    bucket's own mass (mid-bucket interpolation smooths the boundary). 0.0 when
+    there is no mass yet."""
+    h = col["hist"]
+    total = sum(h)
+    if total <= 0:
+        return 0.0
+    b = vmstat_bucket(value, kind)
+    return (sum(h[:b]) + 0.5 * h[b]) / total
+
+
+def vmstat_relative_level(col, value, kind):
+    """High-tail percentile tint 0..3, gated by the kind's noise floor and the
+    per-column warmup count. Levels come from VMSTAT_PCT_ANCHORS."""
+    if value is None or value < VMSTAT_FLOOR[kind]:
+        return 0
+    if col["count"] < VMSTAT_WARMUP:
+        return 0
+    c = vmstat_cdf(col, value, kind)
+    return sum(1 for a in VMSTAT_PCT_ANCHORS if c >= a)
+
+
 def format_vmstat_pane(rate_rows, swap_on, width, height, color):
     """Render the pinned vmstat pane: a header row of column names plus up to
     height-1 data rows (oldest..newest, top..bottom), columns right-aligned to

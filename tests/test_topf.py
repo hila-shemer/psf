@@ -728,3 +728,36 @@ def test_vmstat_hist_fold_halflife_decays_old_mass():
 def test_once_defaults_have_vmstat_fields():
     d = topf._once_defaults()
     assert hasattr(d, "no_vmstat") and hasattr(d, "vmstat_rows")
+
+
+# --- vmstat CDF and relative tint level --------------------------------------
+
+def _warm_col(kind, *values, d=0.99):
+    col = {"hist": [0.0] * topf.VMSTAT_NBUCKETS, "count": 0}
+    for v in values:
+        topf.vmstat_hist_fold(col, v, kind, d)
+    return col
+
+
+def test_vmstat_cdf_empty_is_zero():
+    col = {"hist": [0.0] * topf.VMSTAT_NBUCKETS, "count": 0}
+    assert topf.vmstat_cdf(col, 10.0, "pct") == 0.0
+
+
+def test_vmstat_cdf_high_value_near_one():
+    # mass concentrated low; a far-higher value sits near the top of the cdf
+    col = _warm_col("count", *([20.0] * 200))
+    assert topf.vmstat_cdf(col, 20.0, "count") < 0.6     # mid-bucket of the mass
+    assert topf.vmstat_cdf(col, 10 ** 8, "count") > 0.99
+
+
+def test_vmstat_relative_level_floor_and_warmup():
+    col = _warm_col("count", *([20.0] * 200))            # warm (count >= WARMUP)
+    assert topf.vmstat_relative_level(col, 10 ** 8, "count") == 3
+    # below the kind's floor -> never tints
+    assert topf.vmstat_relative_level(col, 0.0, "count") == 0
+    # cold column (count < WARMUP) -> never tints
+    cold = _warm_col("count", *([20.0] * 10))
+    assert topf.vmstat_relative_level(cold, 10 ** 8, "count") == 0
+    # None -> 0
+    assert topf.vmstat_relative_level(col, None, "count") == 0
