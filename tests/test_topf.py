@@ -817,3 +817,26 @@ def test_vmstat_cell_level_is_max_of_ceiling_and_relative():
     assert topf.vmstat_cell_level("id", "pct", 2.0, cold, cores=4) == 3
     # neither fires -> 0
     assert topf.vmstat_cell_level("us", "pct", 1.0, cold, cores=4) == 0
+
+
+def test_vmstat_ceiling_exact_boundaries():
+    # inclusive at both thresholds; t3 wins over t2
+    assert topf.vmstat_ceiling_level("id", 10.0, cores=4) == 2   # == t2 (low)
+    assert topf.vmstat_ceiling_level("id", 3.0, cores=4) == 3    # == t3 (low)
+    assert topf.vmstat_ceiling_level("wa", 20.0, cores=4) == 2   # == t2 (high)
+    assert topf.vmstat_ceiling_level("wa", 40.0, cores=4) == 3   # == t3 (high)
+    # high_cores just-below boundaries (cores=4 -> t2=4, t3=8)
+    assert topf.vmstat_ceiling_level("r", 7, cores=4) == 2       # below scaled t3
+    assert topf.vmstat_ceiling_level("r", 3, cores=4) == 0       # below scaled t2
+    # single-core: one runnable process == one full core -> level 2
+    assert topf.vmstat_ceiling_level("r", 1, cores=1) == 2
+
+
+def test_vmstat_cell_level_max_when_both_fire():
+    # warm "int" col with all mass low so cdf(5) lands at the top -> relative 3
+    col = {"hist": [0.0] * topf.VMSTAT_NBUCKETS, "count": topf.VMSTAT_WARMUP}
+    col["hist"][topf.vmstat_bucket(2, "int")] = 1.0
+    assert topf.vmstat_relative_level(col, 5, "int") == 3
+    assert topf.vmstat_ceiling_level("r", 5, cores=4) == 2       # 5 >= 1*4, < 2*4
+    # both fire (relative 3, ceiling 2) -> max picks the larger
+    assert topf.vmstat_cell_level("r", "int", 5, col, cores=4) == 3
