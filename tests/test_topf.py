@@ -694,6 +694,37 @@ def test_vmstat_bucket_monotonic_and_clamped():
     assert topf.vmstat_bucket(0.5, "bps") == 1   # positive but below lo -> clamped to 1
 
 
+def test_vmstat_hist_new_shape():
+    state = topf.vmstat_hist_new()
+    assert set(state) == {k for k, _h, _ki in topf.VMSTAT_COLS}
+    assert state["us"]["count"] == 0
+    assert state["us"]["hist"] == [0.0] * topf.VMSTAT_NBUCKETS
+
+
+def test_vmstat_hist_fold_counts_and_skips_none():
+    col = {"hist": [0.0] * topf.VMSTAT_NBUCKETS, "count": 0}
+    topf.vmstat_hist_fold(col, 50.0, "pct", 0.5)
+    assert col["count"] == 1
+    assert sum(col["hist"]) > 0
+    topf.vmstat_hist_fold(col, None, "pct", 0.5)   # None ignored
+    assert col["count"] == 1
+
+
+def test_vmstat_hist_fold_halflife_decays_old_mass():
+    # Saturate bucket for value A, then fold value B for one half-life worth of
+    # samples; A's bucket mass should be ~halved (decayed by d ** H == 0.5).
+    H = 8
+    d = 0.5 ** (1.0 / H)
+    col = {"hist": [0.0] * topf.VMSTAT_NBUCKETS, "count": 0}
+    a_bucket = topf.vmstat_bucket(50.0, "pct")
+    for _ in range(500):                 # saturate toward (1-d) steady mass
+        topf.vmstat_hist_fold(col, 50.0, "pct", d)
+    peak = col["hist"][a_bucket]
+    for _ in range(H):                   # one half-life of a different value
+        topf.vmstat_hist_fold(col, 5.0, "pct", d)
+    assert abs(col["hist"][a_bucket] - peak * 0.5) < peak * 0.02
+
+
 def test_once_defaults_have_vmstat_fields():
     d = topf._once_defaults()
     assert hasattr(d, "no_vmstat") and hasattr(d, "vmstat_rows")
