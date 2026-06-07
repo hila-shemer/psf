@@ -1786,24 +1786,27 @@ def _draw_frame(out, lines):
     out.flush()
 
 
-def _read_key(stream, pending=lambda: True):
-    """Decode one logical key from `stream`. Returns a plain char, or one of
-    'up'/'down'/'pgup'/'pgdn'/'home'/'end'/'esc'/'enter'. `pending()` says
-    whether more bytes are immediately available (used so a lone ESC returns
-    'esc' instead of blocking on a CSI read)."""
-    ch = stream.read(1)
+def _read_key(fd):
+    """Decode one logical key from `fd` (unbuffered). Returns a plain char, or
+    one of 'up'/'down'/'pgup'/'pgdn'/'home'/'end'/'esc'/'enter'.  Uses os.read
+    to avoid the stdio-buffering mismatch where select sees an empty fd but
+    sys.stdin still has buffered bytes."""
+    def _read1():
+        b = os.read(fd, 1)
+        return b.decode() if b else ""
+    ch = _read1()
     if ch == "\r" or ch == "\n":
         return "enter"
     if ch != "\x1b":
         return ch
-    if not pending():
+    if not _select.select([fd], [], [], 0.01)[0]:
         return "esc"
-    nxt = stream.read(1)
+    nxt = _read1()
     if nxt not in ("[", "O"):
         return "esc"
     seq = ""
     while True:
-        c = stream.read(1)
+        c = _read1()
         if not c:
             break
         seq += c
@@ -1904,9 +1907,7 @@ def run_live(args):
         while True:
             r, _w, _e = _select.select([fd], [], [], args.sample_interval)
             if r:
-                key = _read_key(
-                    sys.stdin,
-                    pending=lambda: bool(_select.select([fd], [], [], 0)[0]))
+                key = _read_key(fd)
                 ids = selectable_ids(rows)
                 if key in ("q", "\x03"):
                     break
