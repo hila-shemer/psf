@@ -925,3 +925,29 @@ def test_vmstat_hist_save_overwrites_existing(tmp_path):
     s2["cs"]["count"] = 99
     topf.vmstat_hist_save(path, s2)               # atomic overwrite of existing
     assert topf.vmstat_hist_load(path)["cs"]["count"] == 99
+
+
+def test_vmstat_colored_row_freezes_levels_and_folds():
+    # two adjacent samples 1s apart; use the file's _vs helper.
+    # prev_s: baseline counters at t=0
+    prev_s = _vs(0.0, procs_running=1, cpu_user=0, cpu_total=100,
+                 cpu_idle=100, intr=0, ctxt=0)
+    # cur_s: t=1; run-queue r=9 (> 2*cores=8 for cores=4 -> ceiling level 3);
+    # some cpu activity to get a non-trivial us/id split.
+    cur_s = _vs(1.0, procs_running=9, cpu_user=50, cpu_total=200,
+                cpu_idle=150, intr=100, ctxt=200)
+    hist = topf.vmstat_hist_new()
+    row, levels = topf.vmstat_colored_row(prev_s, cur_s, 1.0, hist, d=0.99,
+                                          cores=4)
+    # returns a (rate_row dict, levels dict) pair
+    assert set(levels) == {k for k, _h, _ki in topf.VMSTAT_COLS}
+    assert isinstance(row, dict)
+    # history was folded exactly once per column (warmup counter bumped for
+    # columns whose value is not None)
+    assert all(hist[k]["count"] == 1 for k, _h, _ki in topf.VMSTAT_COLS
+               if row.get(k) is not None)
+    # level-before-fold + cold histogram: relative coloring can't fire yet
+    # (count < WARMUP), so any nonzero level must come from the absolute ceiling.
+    for k, _h, ki in topf.VMSTAT_COLS:
+        if levels[k]:
+            assert levels[k] == topf.vmstat_ceiling_level(k, row.get(k), 4)

@@ -595,6 +595,21 @@ def _vmstat_row(prev, cur, dt):
     }
 
 
+def vmstat_colored_row(prev_s, cur_s, dt, hist, d, cores):
+    """Build one (rate_row, levels) pair from an adjacent sample pair and fold
+    the row into `hist`. Each cell's level is computed against the histogram as
+    it stands (absolute ceiling + high-tail percentile), THEN the value is folded
+    in — a value is judged against history, then becomes part of it. levels[k] is
+    0..3 (frozen). Mutates `hist`."""
+    row = _vmstat_row(prev_s, cur_s, dt)
+    levels = {}
+    for k, _h, ki in VMSTAT_COLS:
+        val = row.get(k)
+        levels[k] = vmstat_cell_level(k, ki, val, hist[k], cores)
+        vmstat_hist_fold(hist[k], val, ki, d)        # fold AFTER reading level
+    return row, levels
+
+
 def vmstat_rate_rows(ring):
     """Turn a ring of VmstatSamples (ascending t) into one rate-row dict per
     adjacent pair. Pairs with non-positive dt are skipped. < 2 samples -> []."""
@@ -1851,14 +1866,8 @@ def run_live(args):
             prev_s, cur_s = vmring[-2], vmring[-1]
             dt = cur_s.t - prev_s.t
             if dt > 0:
-                row = _vmstat_row(prev_s, cur_s, dt)
-                levels = {}
-                for k, _h, ki in VMSTAT_COLS:
-                    val = row.get(k)
-                    levels[k] = vmstat_cell_level(k, ki, val, vmhist[k],
-                                                  sysinfo_cores)
-                    vmstat_hist_fold(vmhist[k], val, ki, vmd)   # fold AFTER level
-                vmcolored.append((row, levels))
+                vmcolored.append(vmstat_colored_row(prev_s, cur_s, dt, vmhist,
+                                                    vmd, sysinfo_cores))
                 if len(vmcolored) > args.vmstat_rows * 2 + 2:
                     del vmcolored[0]
                 vm_write_ctr += 1
