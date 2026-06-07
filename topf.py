@@ -1521,6 +1521,35 @@ def present_viewport(rows, ui, height, color):
     return out, cursor, top
 
 
+def split_regions(rows, cols, vmstat_on, vmstat_rows_cap, sample_rows):
+    """Divide the screen height into (tree_region, vmstat_pane, show_pane).
+    One row is the pinned header. The pane (separator + header + k sample rows)
+    is shown only when the terminal clears the size thresholds, the user hasn't
+    toggled it off, and there is room to keep at least MIN_TREE_ROWS for the
+    tree and MIN_VMSTAT_SAMPLE_ROWS samples. sample_rows is how many rate rows
+    are actually available so a cold start doesn't reserve empty space."""
+    body = rows - 1
+    if (not vmstat_on or rows < MIN_ROWS_FOR_VMSTAT
+            or cols < MIN_COLS_FOR_VMSTAT):
+        return body, 0, False
+    k = min(vmstat_rows_cap, max(sample_rows, MIN_VMSTAT_SAMPLE_ROWS))
+    k = min(k, body - MIN_TREE_ROWS - 2)        # 2 = separator + pane header
+    if k < MIN_VMSTAT_SAMPLE_ROWS:
+        return body, 0, False
+    pane = 2 + k
+    return body - pane, pane, True
+
+
+def lifecycle_section(prev, cur, sysinfo, frame_dt, color):
+    """The born/died lines (empty list when nothing changed). Shared by the
+    once frame and the live loop."""
+    if prev is None:
+        return []
+    born, died = diff_snapshots(prev, cur)
+    return format_lifecycle(born, died, _parents_map(prev, cur), sysinfo,
+                            frame_dt, color=color)
+
+
 def glossary(color):
     """A short legend printed at the head of the output explaining the
     annotations (notably what '+N est' means). Returns a list of lines."""
