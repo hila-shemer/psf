@@ -1188,6 +1188,26 @@ def vmstat_bucket(value, kind):
     return max(1, min(VMSTAT_NBUCKETS - 1, idx))
 
 
+def vmstat_hist_new():
+    """Fresh per-column histogram state: {col_key: {hist: [floats], count}}."""
+    return {k: {"hist": [0.0] * VMSTAT_NBUCKETS, "count": 0}
+            for k, _h, _ki in VMSTAT_COLS}
+
+
+def vmstat_hist_fold(col, value, kind, d):
+    """Decay all of `col`'s bucket mass by `d` and add the new sample's (1-d)
+    unit to its bucket; bump the warmup count. None values are ignored (no
+    decay, no count). Mutates `col` in place."""
+    if value is None:
+        return
+    h = col["hist"]
+    b = vmstat_bucket(value, kind)
+    for i in range(len(h)):
+        h[i] *= d
+    h[b] += (1.0 - d)
+    col["count"] += 1
+
+
 def format_vmstat_pane(rate_rows, swap_on, width, height, color):
     """Render the pinned vmstat pane: a header row of column names plus up to
     height-1 data rows (oldest..newest, top..bottom), columns right-aligned to
