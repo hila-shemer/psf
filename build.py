@@ -84,3 +84,40 @@ def build_template(src):
     for start, end, marker in sorted(spans, reverse=True):
         out = out[:start] + '"""@@TOPFIG:%s@@"""' % marker + out[end:]
     return out, defaults
+
+
+def _eval_literal(text):
+    """Evaluate a numeric / tuple / string literal expression with no names or
+    builtins. Handles arithmetic such as ``100 * 1024 ** 2`` that
+    ast.literal_eval rejects. Only ever fed our own trusted topf.py literals."""
+    code = compile(ast.parse(text, mode="eval"), "<knob>", "eval")
+    return eval(code, {"__builtins__": {}}, {})  # noqa: S307 (trusted input)
+
+
+def _to_jsonable(value):
+    """Tuples -> lists, recursively, so values serialize and compare cleanly."""
+    if isinstance(value, (tuple, list)):
+        return [_to_jsonable(item) for item in value]
+    return value
+
+
+def _parse_matchers(text):
+    """Parse the DEFAULT_MATCHERS list literal into [{name, kind, regex}]."""
+    tree = ast.parse(text, mode="eval")
+    rows = []
+    for elt in tree.body.elts:                 # each elt: (label, target, Call)
+        label, target, call = elt.elts
+        pattern = call.args[0].value           # re.compile(r"...").args[0]
+        rows.append({"name": label.value, "kind": target.value, "regex": pattern})
+    return rows
+
+
+def extract_values(defaults):
+    """{marker: parsed initial form value} from the captured default literals."""
+    values = {}
+    for marker, text in defaults.items():
+        if marker == "interesting_names":
+            values[marker] = _parse_matchers(text)
+        else:
+            values[marker] = _to_jsonable(_eval_literal(text))
+    return values
