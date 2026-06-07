@@ -785,3 +785,35 @@ def test_vmstat_cdf_monotonic():
     col = _warm_col("count", *([20.0] * 100 + [10 ** 5] * 50 + [10 ** 8] * 10))
     cdfs = [topf.vmstat_cdf(col, v, "count") for v in (1, 20, 10 ** 4, 10 ** 6, 10 ** 9)]
     assert cdfs == sorted(cdfs)                       # non-decreasing in value
+
+
+def test_vmstat_ceiling_low_idle():
+    assert topf.vmstat_ceiling_level("id", 2.0, cores=4) == 3
+    assert topf.vmstat_ceiling_level("id", 8.0, cores=4) == 2
+    assert topf.vmstat_ceiling_level("id", 50.0, cores=4) == 0
+
+
+def test_vmstat_ceiling_high_wait_and_blocked():
+    assert topf.vmstat_ceiling_level("wa", 45.0, cores=4) == 3
+    assert topf.vmstat_ceiling_level("wa", 25.0, cores=4) == 2
+    assert topf.vmstat_ceiling_level("b", 5, cores=4) == 3
+    assert topf.vmstat_ceiling_level("b", 0, cores=4) == 0
+
+
+def test_vmstat_ceiling_runqueue_scales_with_cores():
+    assert topf.vmstat_ceiling_level("r", 8, cores=4) == 3      # >= 2*cores
+    assert topf.vmstat_ceiling_level("r", 4, cores=4) == 2      # >= 1*cores
+    assert topf.vmstat_ceiling_level("r", 1, cores=4) == 0
+
+
+def test_vmstat_ceiling_unlisted_and_none():
+    assert topf.vmstat_ceiling_level("free", 10 ** 12, cores=4) == 0
+    assert topf.vmstat_ceiling_level("id", None, cores=4) == 0
+
+
+def test_vmstat_cell_level_is_max_of_ceiling_and_relative():
+    # relative says 0 (cold), ceiling says 3 -> final 3
+    cold = {"hist": [0.0] * topf.VMSTAT_NBUCKETS, "count": 0}
+    assert topf.vmstat_cell_level("id", "pct", 2.0, cold, cores=4) == 3
+    # neither fires -> 0
+    assert topf.vmstat_cell_level("us", "pct", 1.0, cold, cores=4) == 0
