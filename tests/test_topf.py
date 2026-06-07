@@ -604,3 +604,43 @@ def test_present_viewport_snaps_when_cursor_gone():
     ui = topf.UIState(cursor=("p", 99, 1))  # not present
     lines, cursor, top = topf.present_viewport(rows, ui, height=10, color=False)
     assert cursor == ("p", 0, 1)            # snapped to first selectable
+
+
+# --- region layout ----------------------------------------------------------
+
+
+def test_split_regions_hidden_when_small():
+    # below MIN_ROWS_FOR_VMSTAT -> pane hidden, tree gets the whole body
+    region, pane, show = topf.split_regions(rows=12, cols=200, vmstat_on=True,
+                                            vmstat_rows_cap=12, sample_rows=10)
+    assert show is False and pane == 0 and region == 11   # rows-1 header
+
+
+def test_split_regions_narrow_hides_pane():
+    region, pane, show = topf.split_regions(rows=40, cols=50, vmstat_on=True,
+                                            vmstat_rows_cap=12, sample_rows=10)
+    assert show is False
+
+
+def test_split_regions_shows_pane_when_room():
+    # 40 rows: header 1, tree gets the rest minus a pane of 2 + k sample rows
+    region, pane, show = topf.split_regions(rows=40, cols=200, vmstat_on=True,
+                                            vmstat_rows_cap=12, sample_rows=10)
+    assert show is True
+    assert pane == 2 + 10                 # separator + header + 10 samples
+    assert region == (40 - 1) - pane
+
+
+def test_split_regions_caps_pane_to_keep_tree():
+    # tiny body: ensure tree keeps >= MIN_TREE_ROWS and pane >= MIN samples or hides
+    region, pane, show = topf.split_regions(rows=18, cols=200, vmstat_on=True,
+                                            vmstat_rows_cap=12, sample_rows=10)
+    assert region >= topf.MIN_TREE_ROWS
+    if show:
+        assert pane >= 2 + topf.MIN_VMSTAT_SAMPLE_ROWS
+
+
+def test_split_regions_off_when_toggled():
+    region, pane, show = topf.split_regions(rows=40, cols=200, vmstat_on=False,
+                                            vmstat_rows_cap=12, sample_rows=10)
+    assert show is False and region == 39
