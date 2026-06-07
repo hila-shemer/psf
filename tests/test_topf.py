@@ -331,3 +331,48 @@ def test_parse_net_dev_sums_excluding_lo():
            "  eth1: 30 1 0 0 0 0 0 0 40 1 0 0 0 0 0 0\n")
     rx, tx = topf.parse_net_dev(txt)
     assert rx == 1000 + 30 and tx == 2000 + 40   # lo excluded
+
+
+# --- vmstat sample model ----------------------------------------------------
+
+
+def _vs(t, **kw):
+    base = dict(procs_running=0, procs_blocked=0, cpu_user=0, cpu_nice=0,
+                cpu_system=0, cpu_idle=0, cpu_iowait=0, cpu_total=0, intr=0,
+                ctxt=0, pgpgin=0, pgpgout=0, pswpin=0, pswpout=0, rx=0, tx=0,
+                free=0, buff=0, cache=0, swap_total=0)
+    base.update(kw)
+    return topf.VmstatSample(t=t, **base)
+
+
+def test_vmstat_rate_rows_deltas_per_second():
+    a = _vs(0.0, pgpgin=0, pgpgout=0, rx=0, tx=0, intr=0, ctxt=0,
+            cpu_user=0, cpu_total=0, procs_running=2)
+    b = _vs(2.0, pgpgin=2048, pgpgout=0, rx=4000, tx=8000, intr=200, ctxt=400,
+            cpu_user=50, cpu_total=100, procs_running=3)
+    rows = topf.vmstat_rate_rows([a, b])
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["r"] == 3                       # instantaneous (from newest)
+    assert row["bi"] == 2048 * 1024 / 2.0      # pgpgin kB -> bytes/s
+    assert row["ni"] == 4000 / 2.0 and row["no"] == 8000 / 2.0
+    assert row["in"] == 200 / 2.0 and row["cs"] == 400 / 2.0
+    assert row["us"] == 50.0                    # 50 of 100 total jiffies -> 50%
+
+
+def test_vmstat_rate_rows_needs_two_samples():
+    assert topf.vmstat_rate_rows([_vs(0.0)]) == []
+
+
+def test_vmstat_rate_rows_none_counter_gives_none_cell():
+    a = _vs(0.0, intr=None)
+    b = _vs(1.0, intr=None)
+    assert topf.vmstat_rate_rows([a, b])[0]["in"] is None
+
+
+def test_fmt_count():
+    assert topf.fmt_count(0) == "0"
+    assert topf.fmt_count(950) == "950"
+    assert topf.fmt_count(9100) == "9.1k"
+    assert topf.fmt_count(44000) == "44k"
+    assert topf.fmt_count(None) == "—"
