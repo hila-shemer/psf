@@ -1,6 +1,6 @@
 # topfig — a static config editor that emits a topf.py
 
-**Status:** design approved (2026-06-07)
+**Status:** implemented (2026-06-07)
 
 ## Summary
 
