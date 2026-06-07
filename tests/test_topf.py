@@ -428,6 +428,29 @@ def test_format_vmstat_pane_tints_from_supplied_levels():
     assert "\x1b[%sm" % topf.TINT_SGR[3] in lines[-1]   # bold-red wrap present
 
 
+def test_format_vmstat_pane_level0_cells_not_wrapped():
+    row = _rate_row(us=99, sy=10)
+    lines = topf.format_vmstat_pane([(row, {"us": 3})], swap_on=False,
+                                    width=200, height=3, color=True)
+    # only the single tinted cell carries SGR: one open + one reset escape
+    assert lines[-1].count("\x1b[") == 2
+
+
+def test_format_vmstat_pane_oldest_at_top():
+    older = _rate_row(cs=111)
+    newer = _rate_row(cs=222)
+    lines = topf.format_vmstat_pane([(older, {}), (newer, {})], swap_on=False,
+                                    width=200, height=4, color=False)
+    assert "111" in lines[1] and "222" in lines[2]   # oldest first, below header
+
+
+def test_format_vmstat_pane_height_one_is_header_only():
+    row = _rate_row(us=50)
+    lines = topf.format_vmstat_pane([(row, {})], swap_on=False, width=200,
+                                    height=1, color=False)
+    assert len(lines) == 1                            # height<=1 -> header only
+
+
 # --- row identities & collapse/expand ---------------------------------------
 
 
