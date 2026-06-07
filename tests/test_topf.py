@@ -1,4 +1,5 @@
 import os
+import types as _types
 
 import topf
 
@@ -864,3 +865,24 @@ def test_vmstat_hist_from_json_bad_input_is_fresh():
     # "columns" present but not an object -> fresh
     bad_cols = '{"version": 1, "nbuckets": %d, "columns": [1, 2]}' % topf.VMSTAT_NBUCKETS
     assert topf.vmstat_hist_from_json(bad_cols)["us"]["count"] == 0
+
+
+def test_vmstat_hist_path_explicit_and_xdg(monkeypatch):
+    args = _types.SimpleNamespace(history_file="/tmp/explicit.json")
+    assert topf.vmstat_hist_path(args) == "/tmp/explicit.json"
+    args = _types.SimpleNamespace(history_file=None)
+    monkeypatch.setenv("XDG_STATE_HOME", "/xdg/state")
+    assert topf.vmstat_hist_path(args) == "/xdg/state/topf/vmstat-hist.json"
+
+
+def test_vmstat_hist_save_then_load_roundtrip(tmp_path):
+    path = str(tmp_path / "sub" / "hist.json")     # parent dir created on save
+    state = topf.vmstat_hist_new()
+    state["cs"]["count"] = 42
+    topf.vmstat_hist_save(path, state)
+    assert topf.vmstat_hist_load(path)["cs"]["count"] == 42
+
+
+def test_vmstat_hist_load_missing_file_is_fresh(tmp_path):
+    path = str(tmp_path / "nope.json")
+    assert topf.vmstat_hist_load(path)["cs"]["count"] == 0

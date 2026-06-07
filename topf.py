@@ -1287,6 +1287,40 @@ def vmstat_hist_from_json(text):
         return vmstat_hist_new()
 
 
+def vmstat_hist_path(args):
+    """Resolve the history-file path: --history-file if given, else
+    $XDG_STATE_HOME/topf/vmstat-hist.json (default ~/.local/state)."""
+    if args.history_file:
+        return args.history_file
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser(
+        "~/.local/state")
+    return os.path.join(base, "topf", "vmstat-hist.json")
+
+
+def vmstat_hist_load(path):
+    """Load histogram state from `path`; a missing/unreadable file -> fresh."""
+    try:
+        with open(path) as f:
+            return vmstat_hist_from_json(f.read())
+    except OSError:
+        return vmstat_hist_new()
+
+
+def vmstat_hist_save(path, state):
+    """Atomically write state to `path` (temp file + os.replace). Best-effort:
+    any OSError is swallowed so a read-only state dir never crashes topf."""
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(vmstat_hist_to_json(state))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def format_vmstat_pane(rate_rows, swap_on, width, height, color):
     """Render the pinned vmstat pane: a header row of column names plus up to
     height-1 data rows (oldest..newest, top..bottom), columns right-aligned to
