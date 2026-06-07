@@ -1812,7 +1812,7 @@ def run_live(args):
               else vmstat_hist_load(vmstat_hist_path(args)))
     vmd = 0.5 ** (1.0 / max(1, args.vmstat_halflife))
     vmcolored = []          # ring of (rate_row, levels), frozen at sample
-    vm_write_ctr = [0]
+    vm_write_ctr = 0
     prev, t_prev = None, None
     cur, rows, sysinfo = {}, [], None
 
@@ -1839,7 +1839,7 @@ def run_live(args):
         _draw_frame(out, [visible_truncate(ln, cols) for ln in frame[:term_rows]])
 
     def sample_and_build():
-        nonlocal prev, t_prev, cur, rows, sysinfo
+        nonlocal prev, t_prev, cur, rows, sysinfo, vm_write_ctr
         cur = scan()
         t_now = time.monotonic()
         update_history(history, cur, t_now, longest)
@@ -1861,9 +1861,9 @@ def run_live(args):
                 vmcolored.append((row, levels))
                 if len(vmcolored) > args.vmstat_rows * 2 + 2:
                     del vmcolored[0]
-                vm_write_ctr[0] += 1
+                vm_write_ctr += 1
                 if not args.no_history and \
-                        vm_write_ctr[0] % VMSTAT_WRITE_EVERY == 0:
+                        vm_write_ctr % VMSTAT_WRITE_EVERY == 0:
                     vmstat_hist_save(vmstat_hist_path(args), vmhist)
         sysinfo = SysInfo(clk_tck=CLK_TCK, page_size=PAGE_SIZE,
                           uptime=read_uptime(), cores=sysinfo_cores)
@@ -2089,7 +2089,10 @@ def _parse_args(argv):
                     default=VMSTAT_HALFLIFE_DEFAULT,
                     help="samples for a vmstat coloring weight to halve "
                          "(default %d)" % VMSTAT_HALFLIFE_DEFAULT)
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    if args.vmstat_halflife < 1:
+        ap.error("--vmstat-halflife must be a positive integer")
+    return args
 
 
 def main(argv=None):
