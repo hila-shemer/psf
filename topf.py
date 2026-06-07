@@ -1808,6 +1808,11 @@ def run_live(args):
     vmring = []
     ui = UIState(vmstat_on=not args.no_vmstat)
     sysinfo_cores = cores_count()
+    vmhist = (vmstat_hist_new() if args.no_history
+              else vmstat_hist_load(vmstat_hist_path(args)))
+    vmd = 0.5 ** (1.0 / max(1, args.vmstat_halflife))
+    vmcolored = []          # ring of (rate_row, levels), frozen at sample
+    vm_write_ctr = [0]
     prev, t_prev = None, None
     cur, rows, sysinfo = {}, [], None
 
@@ -1815,9 +1820,8 @@ def run_live(args):
         """Re-present the current `rows` + vmstat ring without resampling (used
         after navigation/expand/freeze so input feels instant)."""
         cols, term_rows = os.get_terminal_size()
-        rate_rows = vmstat_rate_rows(vmring)
         region_h, pane_h, show = split_regions(
-            term_rows, cols, ui.vmstat_on, args.vmstat_rows, len(rate_rows))
+            term_rows, cols, ui.vmstat_on, args.vmstat_rows, len(vmcolored))
         body, ui.cursor, ui.scroll_top = present_viewport(
             rows, ui, region_h, color=not args.no_color)
         if show:
@@ -1830,7 +1834,7 @@ def run_live(args):
         if show:
             swap_on = any(s.swap_total for s in vmring if s.swap_total)
             frame.append("─" * cols)
-            frame += format_vmstat_pane(rate_rows, swap_on, cols, pane_h - 1,
+            frame += format_vmstat_pane(vmcolored, swap_on, cols, pane_h - 1,
                                         color=not args.no_color)
         _draw_frame(out, [visible_truncate(ln, cols) for ln in frame[:term_rows]])
 
@@ -1843,6 +1847,24 @@ def run_live(args):
         vmring.append(read_vmstat_sample(t_now))
         if len(vmring) > args.vmstat_rows + 1:
             del vmring[0]
+        if len(vmring) >= 2:
+            prev_s, cur_s = vmring[-2], vmring[-1]
+            dt = cur_s.t - prev_s.t
+            if dt > 0:
+                row = _vmstat_row(prev_s, cur_s, dt)
+                levels = {}
+                for k, _h, ki in VMSTAT_COLS:
+                    val = row.get(k)
+                    levels[k] = vmstat_cell_level(k, ki, val, vmhist[k],
+                                                  sysinfo_cores)
+                    vmstat_hist_fold(vmhist[k], val, ki, vmd)   # fold AFTER level
+                vmcolored.append((row, levels))
+                if len(vmcolored) > args.vmstat_rows * 2 + 2:
+                    del vmcolored[0]
+                vm_write_ctr[0] += 1
+                if not args.no_history and \
+                        vm_write_ctr[0] % VMSTAT_WRITE_EVERY == 0:
+                    vmstat_hist_save(vmstat_hist_path(args), vmhist)
         sysinfo = SysInfo(clk_tck=CLK_TCK, page_size=PAGE_SIZE,
                           uptime=read_uptime(), cores=sysinfo_cores)
         visible_roots, suppressed, collapsible = prepare_frame(
@@ -1904,6 +1926,8 @@ def run_live(args):
         out.write("\x1b[?1049l")
         out.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
+        if not args.no_history:
+            vmstat_hist_save(vmstat_hist_path(args), vmhist)
         if not args.no_cache:
             Cache(cache_path(), boot_id=read_boot_id(),
                   now=time.time()).save(live_keys=set())
@@ -1998,7 +2022,9 @@ def _once_defaults():
         no_color=True, no_glossary=False, sample_interval=REFRESH_INTERVAL,
         no_dedup=False, dedup_min=DEDUP_MIN, no_lifecycle=False,
         windows=DEFAULT_WINDOWS, promote_level=PROMOTE_LEVEL,
-        rss_needs_cpu=True, no_vmstat=False, vmstat_rows=VMSTAT_ROWS_DEFAULT)
+        rss_needs_cpu=True, no_vmstat=False, vmstat_rows=VMSTAT_ROWS_DEFAULT,
+        history_file=None, no_history=True,
+        vmstat_halflife=VMSTAT_HALFLIFE_DEFAULT)
 
 
 def parse_windows(text):
@@ -2055,6 +2081,14 @@ def _parse_args(argv):
     ap.add_argument("--vmstat-rows", type=int, default=VMSTAT_ROWS_DEFAULT,
                     help="max vmstat sample rows in the pane (default %d)"
                          % VMSTAT_ROWS_DEFAULT)
+    ap.add_argument("--history-file", default=None,
+                    help="vmstat coloring history file (default: XDG state dir)")
+    ap.add_argument("--no-history", action="store_true",
+                    help="do not load or save vmstat coloring history")
+    ap.add_argument("--vmstat-halflife", type=int,
+                    default=VMSTAT_HALFLIFE_DEFAULT,
+                    help="samples for a vmstat coloring weight to halve "
+                         "(default %d)" % VMSTAT_HALFLIFE_DEFAULT)
     return ap.parse_args(argv)
 
 
