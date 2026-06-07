@@ -191,13 +191,16 @@ as usual).
 {
   "version": 1,
   "nbuckets": 40,
-  "kinds": { "pct": {"lo":1,"hi":100}, ... },
   "columns": {
-    "us": {"count": 8123.0, "hist": [.. NBUCKETS floats ..]},
+    "us": {"count": 8123, "hist": [.. NBUCKETS floats ..]},
     ...
   }
 }
 ```
+
+(The per-kind `(lo, hi)` brackets are compile-time constants, not persisted —
+the loader only needs `version` + `nbuckets` to validate shape. `count` is an
+integer sample counter; `hist` holds float bucket mass.)
 
 Human-inspectable, tiny (~17 × 40 floats). On load, a version/shape mismatch is
 ignored (start fresh) rather than fatal. On clean exit and every `WRITE_EVERY`
