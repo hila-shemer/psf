@@ -376,3 +376,26 @@ def test_fmt_count():
     assert topf.fmt_count(9100) == "9.1k"
     assert topf.fmt_count(44000) == "44k"
     assert topf.fmt_count(None) == "—"
+
+
+# --- vmstat outlier coloring ------------------------------------------------
+
+
+def test_outlier_level_flat_window_is_zero():
+    assert topf.outlier_level(5, [5, 5, 5, 5]) == 0
+    assert topf.outlier_level(99, [5, 5, 5]) == 0     # zero spread -> no tint
+
+
+def test_outlier_level_spike_is_high():
+    window = [10, 11, 9, 10, 200]            # 200 is a gross outlier
+    assert topf.outlier_level(200, window) == 3
+
+
+def test_outlier_level_small_deviation_is_zero():
+    window = [10, 11, 9, 10, 12]
+    assert topf.outlier_level(11, window) == 0
+
+
+def test_outlier_level_too_few_or_none():
+    assert topf.outlier_level(5, [5, 5]) == 0        # < 3 samples
+    assert topf.outlier_level(None, [1, 2, 3, 4]) == 0
