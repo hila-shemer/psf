@@ -373,6 +373,85 @@ def format_sockets(inodes, netmap):
     return "  ".join(parts)
 
 
+# --- pure core: vmstat parsing ----------------------------------------------
+
+
+def parse_proc_stat_counters(content):
+    """Parse the bits of /proc/stat we need into a flat dict. cpu_total is the
+    sum of ALL fields on the aggregate 'cpu' line (so the dropped irq/steal/...
+    time still counts toward the denominator). Absent lines -> None values."""
+    out = {"cpu_user": None, "cpu_nice": None, "cpu_system": None,
+           "cpu_idle": None, "cpu_iowait": None, "cpu_total": None,
+           "intr": None, "ctxt": None,
+           "procs_running": None, "procs_blocked": None}
+    for line in content.splitlines():
+        f = line.split()
+        if not f:
+            continue
+        if f[0] == "cpu":
+            nums = [int(x) for x in f[1:]]
+            out["cpu_total"] = sum(nums)
+            names = ["cpu_user", "cpu_nice", "cpu_system", "cpu_idle", "cpu_iowait"]
+            for i, name in enumerate(names):
+                out[name] = nums[i] if i < len(nums) else None
+        elif f[0] == "intr":
+            out["intr"] = int(f[1])
+        elif f[0] == "ctxt":
+            out["ctxt"] = int(f[1])
+        elif f[0] == "procs_running":
+            out["procs_running"] = int(f[1])
+        elif f[0] == "procs_blocked":
+            out["procs_blocked"] = int(f[1])
+    return out
+
+
+def parse_meminfo(content):
+    """Parse /proc/meminfo. Return {free, buff, cache, swap_total} in BYTES
+    (meminfo is kB). Missing keys -> None (swap_total -> 0 so swap-off is the
+    safe default)."""
+    raw = {}
+    for line in content.splitlines():
+        f = line.split()
+        if len(f) >= 2 and f[0].endswith(":"):
+            try:
+                raw[f[0][:-1]] = int(f[1]) * 1024     # kB -> bytes
+            except ValueError:
+                pass
+    return {"free": raw.get("MemFree"), "buff": raw.get("Buffers"),
+            "cache": raw.get("Cached"), "swap_total": raw.get("SwapTotal", 0)}
+
+
+def parse_vmstat_counters(content):
+    """Parse /proc/vmstat 'name value' lines for the page/swap counters we use."""
+    want = ("pgpgin", "pgpgout", "pswpin", "pswpout")
+    out = {k: None for k in want}
+    for line in content.splitlines():
+        f = line.split()
+        if len(f) >= 2 and f[0] in out:
+            out[f[0]] = int(f[1])
+    return out
+
+
+def parse_net_dev(content):
+    """Sum rx/tx bytes across all interfaces except loopback. /proc/net/dev has
+    two header lines; each data line is 'iface: rxbytes ... txbytes ...' with rx
+    bytes in column 0 and tx bytes in column 8 after the colon. Returns
+    (rx_total, tx_total) bytes."""
+    rx = tx = 0
+    for line in content.splitlines()[2:]:
+        if ":" not in line:
+            continue
+        name, _, rest = line.partition(":")
+        if name.strip() == "lo":
+            continue
+        f = rest.split()
+        if len(f) < 9:
+            continue
+        rx += int(f[0])
+        tx += int(f[8])
+    return rx, tx
+
+
 # --- pure core: resource stats ----------------------------------------------
 
 
