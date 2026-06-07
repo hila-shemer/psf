@@ -678,6 +678,13 @@ def test_main_parses_vmstat_flags():
     assert ns2.no_vmstat is False and ns2.vmstat_rows == topf.VMSTAT_ROWS_DEFAULT
 
 
+def test_parse_args_history_defaults():
+    args = topf._parse_args([])
+    assert args.history_file is None
+    assert args.no_history is False
+    assert args.vmstat_halflife == topf.VMSTAT_HALFLIFE_DEFAULT
+
+
 # --- vmstat history-grounded coloring ---------------------------------------
 
 
