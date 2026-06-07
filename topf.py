@@ -50,6 +50,41 @@ LIFECYCLE_MAX = 40        # max born (and max died) comm-groups listed
 TINT_SGR = ("2", "2;33", "33", "1;31")          # dim, dim-yellow, yellow, bold-red
 RSS_TINT_ANCHORS = (100 * 1024**2, 1024**3, 5 * 1024**3)   # 100M, 1G, 5G
 CPU_TINT_ANCHORS = (0.10, 1.0, 4.0)                        # 10%, 100%, 400%
+
+# --- vmstat history-grounded coloring ---------------------------------------
+# A per-column decaying log-scale histogram is the sole frame of reference for
+# tinting a vmstat cell: a value is red because it is high *for this machine
+# over time*, not because it differs from the rows currently on screen. The
+# histogram decays per sample (exponential, by half-life) and is persisted so
+# coloring is grounded from the first line of the next run.
+VMSTAT_NBUCKETS = 40
+# Per-kind log brackets [lo, hi] for buckets 1..NBUCKETS-1 (bucket 0 = zero).
+VMSTAT_KIND_RANGE = {
+    "pct": (1.0, 100.0),
+    "int": (1.0, 4096.0),
+    "bytes": (1024.0 ** 2, 1024.0 ** 4),     # 1 MiB .. 1 TiB
+    "bps": (1.0, 1e10),
+    "count": (1.0, 1e10),
+}
+# Loose absolute noise floors: below these we never *relative*-tint (a backstop
+# for an all-idle history whose own p99.9 is a trivially small number). bytes=0
+# because memory-level columns are not suppressed (design: high-tail only).
+VMSTAT_FLOOR = {"pct": 2.0, "int": 1.0, "bytes": 0.0, "bps": 4096.0,
+                "count": 10.0}
+VMSTAT_PCT_ANCHORS = (0.90, 0.99, 0.999)    # cdf thresholds -> tint level 1..3
+VMSTAT_WARMUP = 100         # per-column samples before relative coloring engages
+VMSTAT_WRITE_EVERY = 100    # samples between history-file writes
+VMSTAT_HALFLIFE_DEFAULT = 200   # samples to halve a sample's weight (~3min @1s)
+# Absolute ceiling: objectively-extreme, machine-independent columns forced to a
+# minimum tint regardless of history. (mode, lvl2, lvl3); "r" scales by cores.
+# Every other column relies purely on the histogram.
+VMSTAT_CEILING = {
+    "id": ("low", 10.0, 3.0),
+    "wa": ("high", 20.0, 40.0),
+    "r":  ("high_cores", 1.0, 2.0),
+    "b":  ("high", 1.0, 3.0),
+}
+
 DEFAULT_WINDOWS = (2.0, 10.0, 60.0)   # CPU window seconds (shortest..longest)
 PROMOTE_LEVEL = 2         # tint-anchor level required to promote (>= 1.0 core / >= 1G)
 RSS_GATE_LEVEL = 1        # longest-window CPU floor for RSS-only promotion (~10%)
@@ -1139,6 +1174,18 @@ def _fmt_vmstat_cell(value, kind):
     if kind == "pct":
         return "%d" % round(value)
     return str(value)
+
+
+def vmstat_bucket(value, kind):
+    """Log-scale bucket index 0..NBUCKETS-1 for `value` of column `kind`.
+    Bucket 0 is zero/non-positive; 1..NBUCKETS-1 are log-spaced over the kind's
+    [lo, hi] range, clamped at both ends."""
+    if value is None or value <= 0:
+        return 0
+    lo, hi = VMSTAT_KIND_RANGE[kind]
+    frac = (math.log(value) - math.log(lo)) / (math.log(hi) - math.log(lo))
+    idx = 1 + int(frac * (VMSTAT_NBUCKETS - 1))
+    return max(1, min(VMSTAT_NBUCKETS - 1, idx))
 
 
 def format_vmstat_pane(rate_rows, swap_on, width, height, color):
