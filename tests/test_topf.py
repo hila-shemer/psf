@@ -886,3 +886,22 @@ def test_vmstat_hist_save_then_load_roundtrip(tmp_path):
 def test_vmstat_hist_load_missing_file_is_fresh(tmp_path):
     path = str(tmp_path / "nope.json")
     assert topf.vmstat_hist_load(path)["cs"]["count"] == 0
+
+
+def test_vmstat_hist_path_default_when_no_xdg(monkeypatch):
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    args = _types.SimpleNamespace(history_file=None)
+    expected = os.path.join(os.path.expanduser("~/.local/state"),
+                            "topf", "vmstat-hist.json")
+    assert topf.vmstat_hist_path(args) == expected
+
+
+def test_vmstat_hist_save_overwrites_existing(tmp_path):
+    path = str(tmp_path / "hist.json")
+    s1 = topf.vmstat_hist_new()
+    s1["cs"]["count"] = 1
+    topf.vmstat_hist_save(path, s1)
+    s2 = topf.vmstat_hist_new()
+    s2["cs"]["count"] = 99
+    topf.vmstat_hist_save(path, s2)               # atomic overwrite of existing
+    assert topf.vmstat_hist_load(path)["cs"]["count"] == 99
