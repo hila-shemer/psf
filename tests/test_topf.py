@@ -840,3 +840,20 @@ def test_vmstat_cell_level_max_when_both_fire():
     assert topf.vmstat_ceiling_level("r", 5, cores=4) == 2       # 5 >= 1*4, < 2*4
     # both fire (relative 3, ceiling 2) -> max picks the larger
     assert topf.vmstat_cell_level("r", "int", 5, col, cores=4) == 3
+
+
+def test_vmstat_hist_json_roundtrip():
+    state = topf.vmstat_hist_new()
+    topf.vmstat_hist_fold(state["us"], 50.0, "pct", 0.99)
+    state["us"]["count"] = 7
+    back = topf.vmstat_hist_from_json(topf.vmstat_hist_to_json(state))
+    assert back["us"]["count"] == 7
+    assert back["us"]["hist"] == state["us"]["hist"]
+
+
+def test_vmstat_hist_from_json_bad_input_is_fresh():
+    assert topf.vmstat_hist_from_json("not json")["us"]["count"] == 0
+    assert topf.vmstat_hist_from_json('{"version": 99}')["us"]["count"] == 0
+    # right version, wrong bucket count -> fresh
+    bad = '{"version": 1, "nbuckets": 3, "columns": {}}'
+    assert topf.vmstat_hist_from_json(bad)["us"]["count"] == 0
