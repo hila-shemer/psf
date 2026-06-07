@@ -103,7 +103,6 @@ VMSTAT_COLS = [
     ("us", "us", "pct"), ("sy", "sy", "pct"), ("id", "id", "pct"), ("wa", "wa", "pct"),
 ]
 SWAP_KEYS = frozenset({"si", "so"})
-VMSTAT_OUTLIER_ANCHORS = (3.0, 6.0, 10.0)   # robust z-score levels -> TINT_SGR 1..3
 VMSTAT_GUTTER = "vmstat"
 MIN_ROWS_FOR_VMSTAT = 18      # terminal rows below which the pane is hidden
 MIN_COLS_FOR_VMSTAT = 60      # terminal cols below which the pane is hidden
@@ -1139,28 +1138,6 @@ def _tint_level(value, anchors):
     return sum(1 for a in anchors if value >= a)
 
 
-def outlier_level(value, window_values):
-    """How much `value` deviates from its column's recent distribution, as a
-    tint level 0..3 (indexing TINT_SGR). Robust: deviation measured in units of
-    1.4826*MAD (a normal-consistent sigma estimate) against the median. Returns
-    0 for None, < 3 samples, or a zero-spread window (so steady columns never
-    tint). Levels come from VMSTAT_OUTLIER_ANCHORS."""
-    if value is None:
-        return 0
-    vals = [v for v in window_values if v is not None]
-    if len(vals) < 3:
-        return 0
-    s = sorted(vals)
-    med = s[len(s) // 2] if len(s) % 2 else (s[len(s) // 2 - 1] + s[len(s) // 2]) / 2.0
-    devs = sorted(abs(v - med) for v in vals)
-    mad = devs[len(devs) // 2] if len(devs) % 2 else \
-        (devs[len(devs) // 2 - 1] + devs[len(devs) // 2]) / 2.0
-    sigma = 1.4826 * mad
-    if sigma <= 0:
-        return 0
-    z = abs(value - med) / sigma
-    return min(3, sum(1 for a in VMSTAT_OUTLIER_ANCHORS if z >= a))
-
 
 def _fmt_vmstat_cell(value, kind):
     if value is None:
@@ -1321,18 +1298,18 @@ def vmstat_hist_save(path, state):
         pass
 
 
-def format_vmstat_pane(rate_rows, swap_on, width, height, color):
+def format_vmstat_pane(colored_rows, swap_on, width, height, color):
     """Render the pinned vmstat pane: a header row of column names plus up to
     height-1 data rows (oldest..newest, top..bottom), columns right-aligned to
-    their content, each data cell tinted by outlier_level against its column's
-    values across the shown rows. swap_on=False drops the si/so columns. With no
-    data rows, only the header is returned (so the layout is stable)."""
+    their content, each data cell tinted by its *precomputed* level. colored_rows
+    is a list of (rate_row dict, levels dict) — levels[k] is 0..3 indexing
+    TINT_SGR and was frozen when the row was sampled, so scrolling never recolors.
+    swap_on=False drops si/so. No data rows -> header only (stable layout)."""
     cols = [(k, h, ki) for (k, h, ki) in VMSTAT_COLS
             if swap_on or k not in SWAP_KEYS]
-    shown = rate_rows[-(height - 1):] if height > 1 else []
+    shown = colored_rows[-(height - 1):] if height > 1 else []
 
-    # per-column formatted cells + width
-    formatted = {k: [_fmt_vmstat_cell(r.get(k), ki) for r in shown]
+    formatted = {k: [_fmt_vmstat_cell(r.get(k), ki) for r, _lv in shown]
                  for (k, _h, ki) in cols}
     colw = {k: max(len(h), max((len(c) for c in formatted[k]), default=0))
             for (k, h, _ki) in cols}
@@ -1346,17 +1323,15 @@ def format_vmstat_pane(rate_rows, swap_on, width, height, color):
 
     lines = [gutter + "  " + join_cells([h for (_k, h, _ki) in cols])]
 
-    # column value windows for outlier coloring
-    windows = {k: [r.get(k) for r in shown] for (k, _h, _ki) in cols}
-    for ri, r in enumerate(shown):
+    for ri, (_r, lv) in enumerate(shown):
         cells = []
         for (k, _h, _ki) in cols:
             cell = formatted[k][ri]
             lpad = " " * (colw[k] - len(cell))       # right-align padding
             if color:
-                lvl = outlier_level(r.get(k), windows[k])
-                if lvl:
-                    cell = "\x1b[%sm%s\x1b[0m" % (TINT_SGR[lvl], cell)
+                level = lv.get(k, 0)
+                if level:
+                    cell = "\x1b[%sm%s\x1b[0m" % (TINT_SGR[level], cell)
             cells.append(lpad + cell)                # pad OUTSIDE the SGR wrap
         lines.append(pad + "  " + "  ".join(cells))
     return lines
