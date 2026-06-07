@@ -483,3 +483,65 @@ def test_collapse_expanded_node_not_suppressed_but_still_collapsible():
         kids, threshold=3, expanded={topf.proc_id(root)})
     assert topf.proc_id(root) in collapsible    # still a candidate
     assert suppressed == set()                  # but nothing hidden
+
+
+# --- build_rows / render wrapper --------------------------------------------
+
+
+def test_build_rows_proc_is_selectable_detail_is_not():
+    p = _rproc(20, ppid=0, comm="hot", windows=[5.0, 0, 0])
+    procs = {20: p}
+    topf.build_tree(procs)
+    p.kept = True
+    rows = topf.build_rows([p], set(), sysinfo=None)
+    heads = [r for r in rows if r.selectable]
+    assert len(heads) == 1
+    assert heads[0].item_id == topf.proc_id(p)
+    assert heads[0].selectable and not heads[0].expandable
+
+
+def test_build_rows_group_is_expandable_with_group_id():
+    members = {i: _rproc(i, ppid=1, comm="clang") for i in range(10, 14)}
+    for m in members.values():
+        m.kept = True
+        m.exe = "/usr/bin/clang"
+    root = _rproc(1, ppid=0, comm="root")
+    root.kept = True
+    procs = {1: root, **members}
+    topf.build_tree(procs)
+    rows = topf.build_rows([root], set(), dedup_min=3)
+    groups = [r for r in rows if r.expandable and r.item_id[0] == "g"]
+    assert len(groups) == 1
+    gid = topf.group_id(topf.proc_id(root), "clang", "/usr/bin/clang")
+    assert groups[0].item_id == gid
+
+
+def test_build_rows_expanded_group_shows_members():
+    members = {i: _rproc(i, ppid=1, comm="clang") for i in range(10, 14)}
+    for m in members.values():
+        m.kept = True
+        m.exe = "/usr/bin/clang"
+    root = _rproc(1, ppid=0, comm="root")
+    root.kept = True
+    procs = {1: root, **members}
+    topf.build_tree(procs)
+    gid = topf.group_id(topf.proc_id(root), "clang", "/usr/bin/clang")
+    rows = topf.build_rows([root], set(), dedup_min=3, expanded={gid})
+    member_ids = {topf.proc_id(m) for m in members.values()}
+    sel_ids = {r.item_id for r in rows if r.selectable}
+    assert member_ids <= sel_ids        # all 4 members now individual rows
+    assert gid in sel_ids               # group header still present (re-collapse target)
+
+
+def test_render_still_returns_strings():
+    cold = _rproc(10, ppid=0, comm="cold", windows=[0.1, 0, 0])
+    hot = _rproc(20, ppid=0, comm="hot", windows=[5.0, 0, 0])
+    procs = {10: cold, 20: hot}
+    topf.build_tree(procs)
+    for p in procs.values():
+        p.kept = True
+    key = lambda item: topf.subtree_window_cpu(
+        item.members[0] if isinstance(item, topf.Group) else item, 0)
+    lines = topf.render([cold, hot], set(), top_sort_key=key)
+    assert all(isinstance(ln, str) for ln in lines)
+    assert lines[0].endswith("hot")
