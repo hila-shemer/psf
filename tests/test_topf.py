@@ -650,14 +650,39 @@ def test_split_regions_off_when_toggled():
 
 
 def test_read_key_decodes_arrows_and_plain():
-    import io
-    assert topf._read_key(io.StringIO("q")) == "q"
-    assert topf._read_key(io.StringIO("\x1b[A")) == "up"
-    assert topf._read_key(io.StringIO("\x1b[B")) == "down"
-    assert topf._read_key(io.StringIO("\x1b[5~")) == "pgup"
-    assert topf._read_key(io.StringIO("\x1b[6~")) == "pgdn"
-    # a lone ESC (no following bytes) is returned as escape, not a hang
-    assert topf._read_key(io.StringIO("\x1b")) == "esc"
+    r, w = os.pipe()
+    os.write(w, b"q");  assert topf._read_key(r) == "q"
+    os.close(r); os.close(w)
+
+    r, w = os.pipe()
+    os.write(w, b"\x1b[A");  assert topf._read_key(r) == "up"
+    os.close(r); os.close(w)
+
+    r, w = os.pipe()
+    os.write(w, b"\x1b[B");  assert topf._read_key(r) == "down"
+    os.close(r); os.close(w)
+
+    r, w = os.pipe()
+    os.write(w, b"\x1b[5~");  assert topf._read_key(r) == "pgup"
+    os.close(r); os.close(w)
+
+    r, w = os.pipe()
+    os.write(w, b"\x1b[6~");  assert topf._read_key(r) == "pgdn"
+    os.close(r); os.close(w)
+
+    r, w = os.pipe()
+    os.write(w, b"\x1bOA");  assert topf._read_key(r) == "up"
+    os.close(r); os.close(w)
+
+    r, w = os.pipe()
+    os.write(w, b"\x1bOB");  assert topf._read_key(r) == "down"
+    os.close(r); os.close(w)
+
+    r, w = os.pipe()
+    os.write(w, b"\x1b")
+    os.close(w)
+    assert topf._read_key(r) == "esc"
+    os.close(r)
 
 
 # --- CLI flags --------------------------------------------------------------
