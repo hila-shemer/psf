@@ -441,3 +441,45 @@ def test_format_vmstat_pane_dashes_when_empty():
                                     color=False)
     assert lines and lines[0].startswith(topf.VMSTAT_GUTTER)   # header still drawn
     assert len(lines) == 1                                     # no data rows
+
+
+# --- row identities & collapse/expand ---------------------------------------
+
+
+def test_proc_and_group_id():
+    p = _rproc(7, starttime=3, comm="clang")
+    p.exe = "/usr/bin/clang"
+    assert topf.proc_id(p) == ("p", 7, 3)
+    assert topf.group_id(topf.ROOT_ID, "clang", "/usr/bin/clang") == \
+        ("g", topf.ROOT_ID, "clang", "/usr/bin/clang")
+
+
+def _kept(p):
+    p.kept = True
+    return p
+
+
+def test_collapse_returns_collapsible_and_suppresses():
+    root = _kept(_rproc(1, ppid=0, comm="root"))
+    root.interesting = True
+    kids = {1: root}
+    for i in range(2, 8):                       # 6 noise children > threshold 3
+        c = _kept(_rproc(i, ppid=1, comm="noise"))
+        kids[i] = c
+    topf.build_tree(kids)
+    suppressed, collapsible = topf.collapse(kids, threshold=3)
+    assert topf.proc_id(root) in collapsible
+    assert len(suppressed) == 6
+
+
+def test_collapse_expanded_node_not_suppressed_but_still_collapsible():
+    root = _kept(_rproc(1, ppid=0, comm="root"))
+    root.interesting = True
+    kids = {1: root}
+    for i in range(2, 8):
+        kids[i] = _kept(_rproc(i, ppid=1, comm="noise"))
+    topf.build_tree(kids)
+    suppressed, collapsible = topf.collapse(
+        kids, threshold=3, expanded={topf.proc_id(root)})
+    assert topf.proc_id(root) in collapsible    # still a candidate
+    assert suppressed == set()                  # but nothing hidden
