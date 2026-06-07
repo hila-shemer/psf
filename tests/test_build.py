@@ -35,3 +35,19 @@ def test_missing_constant_raises():
     """A source lacking the knob constants fails loudly, not silently."""
     with pytest.raises(ValueError, match="missing knob constants"):
         build.build_template("X = 1\n")
+
+
+def test_value_extraction():
+    """Initial knob values parsed from source match current topf defaults."""
+    _, defaults = build.build_template(SRC)
+    values = build.extract_values(defaults)
+    assert values["cmd_width"] == 50
+    assert values["cache_ttl"] == 30
+    names = {row["name"] for row in values["interesting_names"]}
+    assert {"bazel", "sshd", "tmux", "claude"} <= names
+    kinds = {row["kind"] for row in values["interesting_names"]}
+    assert kinds <= {"comm", "cmdline"}
+    assert values["cpu_windows"] == [2.0, 10.0, 60.0]
+    assert values["tint_sgr"] == ["2", "2;33", "33", "1;31"]
+    # arithmetic literal (100 * 1024**2) evaluates to a number
+    assert values["rss_tint_anchors"][0] == 100 * 1024 ** 2
