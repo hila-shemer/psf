@@ -46,7 +46,7 @@ def test_value_extraction():
     names = {row["name"] for row in values["interesting_names"]}
     assert {"bazel", "sshd", "tmux", "claude"} <= names
     kinds = {row["kind"] for row in values["interesting_names"]}
-    assert kinds <= {"comm", "cmdline"}
+    assert kinds == {"comm", "cmdline"}
     assert values["cpu_windows"] == [2.0, 10.0, 60.0]
     assert values["tint_sgr"] == ["2", "2;33", "33", "1;31"]
     # arithmetic literal (100 * 1024**2) evaluates to a number

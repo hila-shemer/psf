@@ -87,9 +87,10 @@ def build_template(src):
 
 
 def _eval_literal(text):
-    """Evaluate a numeric / tuple / string literal expression with no names or
-    builtins. Handles arithmetic such as ``100 * 1024 ** 2`` that
-    ast.literal_eval rejects. Only ever fed our own trusted topf.py literals."""
+    """Evaluate a numeric / tuple / string literal expression with no free names
+    (empty builtins). Handles arithmetic such as ``100 * 1024 ** 2`` that
+    ast.literal_eval rejects. Not a security sandbox; only ever fed our own
+    trusted topf.py literals."""
     code = compile(ast.parse(text, mode="eval"), "<knob>", "eval")
     return eval(code, {"__builtins__": {}}, {})  # noqa: S307 (trusted input)
 
