@@ -1359,51 +1359,77 @@ def subtree_window_cpu(node, widx):
     return total
 
 
-def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
-           dedup_min=None, never_merge=frozenset(), top_sort_key=None,
-           show_avg=False):
-    """Render kept Procs as an ascii tree. With sysinfo, detail lines carry
-    cpu/rss/elapsed. With dedup_min, near-identical sibling subtrees merge into
-    one ×N entry that recurses over the union of members' children. With
-    top_sort_key, top-level items are ordered by it (descending)."""
+def build_rows(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
+               dedup_min=None, never_merge=frozenset(), top_sort_key=None,
+               show_avg=False, expanded=frozenset(), collapsible=frozenset()):
+    """Build the tree as Row records (text, item_id, expandable, selectable).
+    Head rows (Proc/Group) are selectable; detail/collapse-note rows are
+    continuation lines. A Group whose id is in `expanded` renders a header row
+    followed by its members individually (so you can re-collapse it); otherwise
+    it renders the merged ×N line and recurses over the union of children. A
+    Proc head is expandable iff its id is in `collapsible`."""
     if color is None:
         color = False
-    lines = []
+    rows = []
 
-    def walk_items(items, prefix):
+    def emit(text, item_id=None, expandable=False, selectable=False):
+        rows.append(Row(text, item_id, expandable, selectable))
+
+    def walk_items(items, prefix, parent_id):
         for i, item in enumerate(items):
             is_last = i == len(items) - 1
             connector = "" if prefix == "" and is_last else (
                 "└─ " if is_last else "├─ ")
             child_prefix = prefix + ("   " if is_last else "│  ")
             if isinstance(item, Group):
+                gid = group_id(parent_id, item.members[0].comm,
+                               item.members[0].exe)
                 head = "%s%s×%d %s" % (prefix, connector, len(item.members),
                                        _group_label(item.members, width))
-                lines.append(head)
+                emit(head, item_id=gid, expandable=True, selectable=True)
                 detail = _group_detail(item.members, color, sysinfo, show_avg)
                 if detail is not None:
-                    lines.append(child_prefix + detail)
-                kids = [c for m in item.members
-                        for c in _visible_children(m, suppressed)]
+                    emit(child_prefix + detail)
+                if gid in expanded:
+                    walk_items(list(item.members), child_prefix, gid)
+                else:
+                    kids = [c for m in item.members
+                            for c in _visible_children(m, suppressed)]
+                    walk_items(group_siblings(kids, dedup_min, never_merge),
+                               child_prefix, gid)
             else:
+                pid_id = proc_id(item)
                 head = "%s%s%d %s" % (prefix, connector, item.pid,
                                       compress_cmdline(item.cmdline, width))
-                lines.append(head)
+                emit(head, item_id=pid_id, expandable=pid_id in collapsible,
+                     selectable=True)
                 detail = _detail(item, color, sysinfo, show_avg)
                 if detail is not None:
-                    lines.append(child_prefix + detail)
+                    emit(child_prefix + detail)
                 kids = _visible_children(item, suppressed)
-            walk_items(group_siblings(kids, dedup_min, never_merge), child_prefix)
-            if isinstance(item, Proc) and item.collapsed and item.collapse_note:
-                lines.append(child_prefix + item.collapse_note)
+                walk_items(group_siblings(kids, dedup_min, never_merge),
+                           child_prefix, pid_id)
+                if item.collapsed and item.collapse_note:
+                    emit(child_prefix + item.collapse_note)
 
     top_items = group_siblings(list(roots), dedup_min, never_merge)
     if top_sort_key is not None:
         # group_siblings already orders by min-pid (stable); a stable sort by
         # descending key therefore gives "load desc, pid asc" tiebreak.
         top_items.sort(key=top_sort_key, reverse=True)
-    walk_items(top_items, "")
-    return lines
+    walk_items(top_items, "", ROOT_ID)
+    return rows
+
+
+def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
+           dedup_min=None, never_merge=frozenset(), top_sort_key=None,
+           show_avg=False, expanded=frozenset(), collapsible=frozenset()):
+    """Backward-compatible string view of build_rows (used by the once/piped
+    path and by tests)."""
+    return [r.text for r in build_rows(
+        roots, suppressed, width=width, color=color, sysinfo=sysinfo,
+        dedup_min=dedup_min, never_merge=never_merge, top_sort_key=top_sort_key,
+        show_avg=show_avg, expanded=expanded, collapsible=collapsible)]
 
 
 def glossary(color):
@@ -1540,19 +1566,17 @@ def header_line(frame_dt, sysinfo, nprocs, hidden, interval, frozen=False):
             % (frame_dt, sysinfo.cores, nprocs, hidden, interval, state))
 
 
-def build_frame(prev, cur, history, t_prev, t_now, args, color, sysinfo,
-                sort_idx, show_avg, frozen=False):
-    """Pure-ish assembly of one frame's lines (no clipping, no terminal I/O):
-    tree (ordered) + optional lifecycle, with a header on top. `prev` may be
-    None (first frame / once-mode primes). `history` already updated & windows
-    already computed for `cur`. Returns a list of lines."""
+def prepare_frame(cur, args, sysinfo, expanded=frozenset()):
+    """Shared pipeline: build the tree, select interesting/heavy nodes, collapse
+    (honoring expanded), probe the printed nodes. Returns
+    (visible_roots, suppressed, collapsible)."""
     roots = build_tree(cur)
     select(cur, DEFAULT_MATCHERS, sysinfo.page_size, args.promote_level,
            args.rss_needs_cpu)
-    suppressed, collapsible = collapse(cur, threshold=args.threshold)
+    suppressed, collapsible = collapse(cur, threshold=args.threshold,
+                                       expanded=expanded)
     visible_roots = [r for r in roots if r.kept]
     printed = [n for n in collect_printed(visible_roots, suppressed) if n.kept]
-
     if args.no_cache:
         cache = Cache(os.devnull, boot_id="", now=time.time())
     else:
@@ -1560,7 +1584,16 @@ def build_frame(prev, cur, history, t_prev, t_now, args, color, sysinfo,
     probe(printed, cache)
     if not args.no_cache:
         cache.save(live_keys={(p.pid, p.starttime) for p in cur.values()})
+    return visible_roots, suppressed, collapsible
 
+
+def build_frame(prev, cur, history, t_prev, t_now, args, color, sysinfo,
+                sort_idx, show_avg, frozen=False):
+    """Pure-ish assembly of one frame's lines (no clipping, no terminal I/O):
+    tree (ordered) + optional lifecycle, with a header on top. `prev` may be
+    None (first frame / once-mode primes). `history` already updated & windows
+    already computed for `cur`. Returns a list of lines."""
+    visible_roots, suppressed, collapsible = prepare_frame(cur, args, sysinfo)
     dedup_min = None if args.no_dedup else args.dedup_min
     key = lambda item: subtree_window_cpu(
         item.members[0] if isinstance(item, Group) else item, sort_idx)
@@ -1574,7 +1607,7 @@ def build_frame(prev, cur, history, t_prev, t_now, args, color, sysinfo,
     out += [""]
     out += render(visible_roots, suppressed, width=args.width, color=color,
                   sysinfo=sysinfo, dedup_min=dedup_min, never_merge=NEVER_MERGE,
-                  top_sort_key=key, show_avg=show_avg)
+                  top_sort_key=key, show_avg=show_avg, collapsible=collapsible)
     if prev is not None and not args.no_lifecycle:
         born, died = diff_snapshots(prev, cur)
         section = format_lifecycle(born, died, _parents_map(prev, cur),
