@@ -98,6 +98,13 @@ VmstatSample = namedtuple("VmstatSample",
     "cpu_iowait cpu_total intr ctxt pgpgin pgpgout pswpin pswpout rx tx "
     "free buff cache swap_total")
 
+# One rendered tree line + its selection metadata. Head rows (Proc/Group) are
+# selectable; detail/collapse-note rows are non-selectable continuation lines.
+Row = namedtuple("Row", "text item_id expandable selectable")
+
+# Sentinel parent id for the top-level sibling set (see group_id / build_rows).
+ROOT_ID = ("root",)
+
 # Each matcher: (label, target, regex) where target is "comm" or "cmdline".
 DEFAULT_MATCHERS = [
     ("bazel", "comm", re.compile(r"^bazel")),
@@ -214,6 +221,18 @@ def _descendants(proc):
     return out
 
 
+def proc_id(proc):
+    """Stable identity for a process row: (pid, starttime) survives re-sorting;
+    starttime distinguishes a reused pid."""
+    return ("p", proc.pid, proc.starttime)
+
+
+def group_id(parent_id, comm, exe):
+    """Stable identity for a merged group row, qualified by its parent so the
+    same (comm, exe) under different parents are distinct."""
+    return ("g", parent_id, comm, exe)
+
+
 def is_promoted(proc, page_size, promote_level, rss_needs_cpu, is_kthread):
     """A process is promoted (interesting because heavy) when it clears
     tint-anchor level >= promote_level on any CPU window, or (non-kthreads only)
@@ -296,12 +315,13 @@ def group_siblings(procs, dedup_min, never_merge):
 # --- pure core: collapse ----------------------------------------------------
 
 
-def collapse(procs, threshold=COLLAPSE_THRESHOLD):
-    """For each kept node whose kept-descendant count exceeds threshold, set
-    .collapsed and a .collapse_note histogram, and add its *non-interesting*
-    kept descendants to the suppressed set (interesting descendants stay
-    visible). Returns the set of suppressed pids."""
+def collapse(procs, threshold=COLLAPSE_THRESHOLD, expanded=frozenset()):
+    """For each kept node whose non-interesting kept descendants exceed
+    threshold, record it as collapsible. Unless its id is in `expanded`, also
+    mark it .collapsed with a histogram note and suppress those descendants.
+    Returns (suppressed_pids, collapsible_ids)."""
     suppressed = set()
+    collapsible = set()
     for p in procs.values():
         if not p.kept:
             continue
@@ -311,6 +331,9 @@ def collapse(procs, threshold=COLLAPSE_THRESHOLD):
         hide = [d for d in kept_desc if not d.interesting and d.pid not in suppressed]
         if len(hide) <= threshold:
             continue
+        collapsible.add(proc_id(p))
+        if proc_id(p) in expanded:
+            continue                    # user forced open: reveal, don't suppress
         p.collapsed = True
         suppressed.update(d.pid for d in hide)
         hist = Counter(d.comm for d in hide)
@@ -320,7 +343,7 @@ def collapse(procs, threshold=COLLAPSE_THRESHOLD):
         if extra > 0:
             top += ", …"
         p.collapse_note = "… (+%d descendants: %s)" % (len(hide), top)
-    return suppressed
+    return suppressed, collapsible
 
 
 # --- pure core: socket parsing ----------------------------------------------
@@ -1526,7 +1549,7 @@ def build_frame(prev, cur, history, t_prev, t_now, args, color, sysinfo,
     roots = build_tree(cur)
     select(cur, DEFAULT_MATCHERS, sysinfo.page_size, args.promote_level,
            args.rss_needs_cpu)
-    suppressed = collapse(cur, threshold=args.threshold)
+    suppressed, collapsible = collapse(cur, threshold=args.threshold)
     visible_roots = [r for r in roots if r.kept]
     printed = [n for n in collect_printed(visible_roots, suppressed) if n.kept]
 
