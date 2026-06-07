@@ -284,3 +284,50 @@ def test_cache_get_expires_with_advancing_now(tmp_path):
     # a stale fd count also misses
     c4 = topf.Cache(path=path, boot_id="b", now=105.0, ttl=30)
     assert c4.get(5, 1, 99) is None
+
+
+# --- vmstat parsing ---------------------------------------------------------
+
+
+def test_parse_proc_stat_counters_basic():
+    txt = ("cpu  100 5 30 1000 20 1 2 0 0 0\n"
+           "cpu0 50 2 15 500 10 0 1 0 0 0\n"
+           "intr 12345 0 0\n"
+           "ctxt 67890\n"
+           "procs_running 3\n"
+           "procs_blocked 1\n")
+    c = topf.parse_proc_stat_counters(txt)
+    assert c["cpu_user"] == 100 and c["cpu_nice"] == 5
+    assert c["cpu_system"] == 30 and c["cpu_idle"] == 1000 and c["cpu_iowait"] == 20
+    assert c["cpu_total"] == 100 + 5 + 30 + 1000 + 20 + 1 + 2  # all fields on the cpu line
+    assert c["intr"] == 12345 and c["ctxt"] == 67890
+    assert c["procs_running"] == 3 and c["procs_blocked"] == 1
+
+
+def test_parse_proc_stat_counters_missing_fields_are_none():
+    c = topf.parse_proc_stat_counters("cpu 1 1 1 1 1\n")
+    assert c["intr"] is None and c["procs_blocked"] is None
+
+
+def test_parse_meminfo_to_bytes():
+    txt = "MemFree:  1024 kB\nBuffers: 2048 kB\nCached: 4096 kB\nSwapTotal: 0 kB\n"
+    m = topf.parse_meminfo(txt)
+    assert m["free"] == 1024 * 1024 and m["buff"] == 2048 * 1024
+    assert m["cache"] == 4096 * 1024 and m["swap_total"] == 0
+
+
+def test_parse_vmstat_counters_basic():
+    txt = "pgpgin 10\npgpgout 20\npswpin 3\npswpout 4\nnr_free_pages 999\n"
+    v = topf.parse_vmstat_counters(txt)
+    assert v["pgpgin"] == 10 and v["pgpgout"] == 20
+    assert v["pswpin"] == 3 and v["pswpout"] == 4
+
+
+def test_parse_net_dev_sums_excluding_lo():
+    txt = ("Inter-|   Receive                    |  Transmit\n"
+           " face |bytes    packets ... |bytes    packets ...\n"
+           "    lo: 500 1 0 0 0 0 0 0 600 1 0 0 0 0 0 0\n"
+           "  eth0: 1000 5 0 0 0 0 0 0 2000 7 0 0 0 0 0 0\n"
+           "  eth1: 30 1 0 0 0 0 0 0 40 1 0 0 0 0 0 0\n")
+    rx, tx = topf.parse_net_dev(txt)
+    assert rx == 1000 + 30 and tx == 2000 + 40   # lo excluded
