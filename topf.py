@@ -55,6 +55,27 @@ PROMOTE_LEVEL = 2         # tint-anchor level required to promote (>= 1.0 core /
 RSS_GATE_LEVEL = 1        # longest-window CPU floor for RSS-only promotion (~10%)
 REFRESH_INTERVAL = 1.0    # default sample == redraw cadence (seconds)
 
+# vmstat pane: columns (key, header, kind), kind in {int, bytes, bps, count, pct}.
+# si/so are dropped when swap is off; the four cpu cols are us/sy/id/wa (the
+# "rest" — nice already folded into us, plus irq/steal/guest — is not shown).
+VMSTAT_COLS = [
+    ("r", "r", "int"), ("b", "b", "int"),
+    ("free", "free", "bytes"), ("buff", "buff", "bytes"), ("cache", "cache", "bytes"),
+    ("si", "si", "bps"), ("so", "so", "bps"),
+    ("bi", "bi", "bps"), ("bo", "bo", "bps"),
+    ("ni", "ni", "bps"), ("no", "no", "bps"),
+    ("in", "in", "count"), ("cs", "cs", "count"),
+    ("us", "us", "pct"), ("sy", "sy", "pct"), ("id", "id", "pct"), ("wa", "wa", "pct"),
+]
+SWAP_KEYS = frozenset({"si", "so"})
+VMSTAT_OUTLIER_ANCHORS = (3.0, 6.0, 10.0)   # robust z-score levels -> TINT_SGR 1..3
+VMSTAT_GUTTER = "vmstat"
+MIN_ROWS_FOR_VMSTAT = 18      # terminal rows below which the pane is hidden
+MIN_COLS_FOR_VMSTAT = 60      # terminal cols below which the pane is hidden
+MIN_TREE_ROWS = 5             # tree region never shrinks below this for the pane
+MIN_VMSTAT_SAMPLE_ROWS = 3    # fewer pane sample rows than this -> hide the pane
+VMSTAT_ROWS_DEFAULT = 12      # default cap on pane sample rows
+
 # System constants, read once. CLK_TCK converts stat jiffies -> seconds;
 # PAGE_SIZE converts stat rss (in pages) -> bytes.
 CLK_TCK = os.sysconf("SC_CLK_TCK")
@@ -69,6 +90,13 @@ Stat = namedtuple("Stat", "comm state ppid num_threads starttime "
 
 # A merged set of >= DEDUP_MIN near-identical sibling Procs.
 Group = namedtuple("Group", "members")
+
+# One vmstat sample: raw /proc counters at monotonic time t. Any field may be
+# None if /proc lacked it; rates are deltas between adjacent samples.
+VmstatSample = namedtuple("VmstatSample",
+    "t procs_running procs_blocked cpu_user cpu_nice cpu_system cpu_idle "
+    "cpu_iowait cpu_total intr ctxt pgpgin pgpgout pswpin pswpout rx tx "
+    "free buff cache swap_total")
 
 # Each matcher: (label, target, regex) where target is "comm" or "cmdline".
 DEFAULT_MATCHERS = [
@@ -454,6 +482,112 @@ def parse_net_dev(content):
         rx += int(f[0])
         tx += int(f[8])
     return rx, tx
+
+
+# --- pure core: vmstat sampling ---------------------------------------------
+
+
+def _d(a, b):
+    """a-b, or None if either operand is None."""
+    return None if a is None or b is None else a - b
+
+
+def _delta_rate(cur, prev, dt, scale=1.0):
+    """(cur-prev)*scale/dt, or None if either counter is None."""
+    if cur is None or prev is None:
+        return None
+    return (cur - prev) * scale / dt
+
+
+def _vmstat_row(prev, cur, dt):
+    """One vmstat rate-row dict (column key -> number or None) from an adjacent
+    sample pair. Levels (r/b/free/buff/cache) come from the newer sample;
+    byte/count columns are per-second deltas; cpu columns are a share of the
+    total jiffie delta as a percentage. us folds nice into user (vmstat
+    convention). Any missing counter yields None for that cell."""
+    cpu_dtot = _d(cur.cpu_total, prev.cpu_total)
+
+    def pct(cur_a, prev_a, cur_b=None, prev_b=None):
+        if not cpu_dtot:                       # None or 0
+            return None
+        num = _d(cur_a, prev_a)
+        if num is None:
+            return None
+        if cur_b is not None or prev_b is not None:
+            extra = _d(cur_b, prev_b)
+            if extra is None:
+                return None
+            num += extra
+        return num / cpu_dtot * 100.0
+
+    return {
+        "r": cur.procs_running, "b": cur.procs_blocked,
+        "free": cur.free, "buff": cur.buff, "cache": cur.cache,
+        "si": _delta_rate(cur.pswpin, prev.pswpin, dt, PAGE_SIZE),
+        "so": _delta_rate(cur.pswpout, prev.pswpout, dt, PAGE_SIZE),
+        "bi": _delta_rate(cur.pgpgin, prev.pgpgin, dt, 1024),
+        "bo": _delta_rate(cur.pgpgout, prev.pgpgout, dt, 1024),
+        "ni": _delta_rate(cur.rx, prev.rx, dt),
+        "no": _delta_rate(cur.tx, prev.tx, dt),
+        "in": _delta_rate(cur.intr, prev.intr, dt),
+        "cs": _delta_rate(cur.ctxt, prev.ctxt, dt),
+        "us": pct(cur.cpu_user, prev.cpu_user, cur.cpu_nice, prev.cpu_nice),
+        "sy": pct(cur.cpu_system, prev.cpu_system),
+        "id": pct(cur.cpu_idle, prev.cpu_idle),
+        "wa": pct(cur.cpu_iowait, prev.cpu_iowait),
+    }
+
+
+def vmstat_rate_rows(ring):
+    """Turn a ring of VmstatSamples (ascending t) into one rate-row dict per
+    adjacent pair. Pairs with non-positive dt are skipped. < 2 samples -> []."""
+    rows = []
+    for prev, cur in zip(ring, ring[1:]):
+        dt = cur.t - prev.t
+        if dt <= 0:
+            continue
+        rows.append(_vmstat_row(prev, cur, dt))
+    return rows
+
+
+def read_vmstat_sample(t):
+    """I/O: read the four /proc files once and assemble a VmstatSample at
+    monotonic time t. Any unreadable file degrades to None fields, never raises."""
+    def safe(fn, default):
+        try:
+            return fn()
+        except (OSError, ValueError, IndexError):
+            return default
+    stat = safe(lambda: parse_proc_stat_counters(_read("/proc/stat")),
+                parse_proc_stat_counters(""))
+    mem = safe(lambda: parse_meminfo(_read("/proc/meminfo")),
+               {"free": None, "buff": None, "cache": None, "swap_total": 0})
+    vm = safe(lambda: parse_vmstat_counters(_read("/proc/vmstat")),
+              {"pgpgin": None, "pgpgout": None, "pswpin": None, "pswpout": None})
+    rx, tx = safe(lambda: parse_net_dev(_read("/proc/net/dev")), (None, None))
+    return VmstatSample(
+        t=t, procs_running=stat["procs_running"], procs_blocked=stat["procs_blocked"],
+        cpu_user=stat["cpu_user"], cpu_nice=stat["cpu_nice"],
+        cpu_system=stat["cpu_system"], cpu_idle=stat["cpu_idle"],
+        cpu_iowait=stat["cpu_iowait"], cpu_total=stat["cpu_total"],
+        intr=stat["intr"], ctxt=stat["ctxt"], pgpgin=vm["pgpgin"],
+        pgpgout=vm["pgpgout"], pswpin=vm["pswpin"], pswpout=vm["pswpout"],
+        rx=rx, tx=tx, free=mem["free"], buff=mem["buff"], cache=mem["cache"],
+        swap_total=mem["swap_total"])
+
+
+def fmt_count(n):
+    """Compact decimal-SI count: 950 -> '950', 9100 -> '9.1k', 44000 -> '44k'.
+    None -> em dash."""
+    if n is None:
+        return "—"
+    if n < 1000:
+        return "%d" % n
+    val = float(n)
+    for unit in ("k", "M", "G", "T"):
+        val /= 1000.0
+        if val < 1000 or unit == "T":
+            return "%.1f%s" % (val, unit) if val < 10 else "%d%s" % (round(val), unit)
 
 
 # --- pure core: resource stats ----------------------------------------------
