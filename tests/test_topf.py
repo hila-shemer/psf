@@ -545,3 +545,62 @@ def test_render_still_returns_strings():
     lines = topf.render([cold, hot], set(), top_sort_key=key)
     assert all(isinstance(ln, str) for ln in lines)
     assert lines[0].endswith("hot")
+
+
+# --- viewport presenter -----------------------------------------------------
+
+
+def _rows(n_select):
+    # n_select selectable head rows, each with a non-selectable detail line
+    rows = []
+    for i in range(n_select):
+        rows.append(topf.Row("head%d" % i, ("p", i, 1),
+                             expandable=(i % 2 == 0), selectable=True))
+        rows.append(topf.Row("  detail%d" % i, ("p", i, 1), False, False))
+    return rows
+
+
+def test_selectable_ids_in_order():
+    rows = _rows(3)
+    assert topf.selectable_ids(rows) == [("p", 0, 1), ("p", 1, 1), ("p", 2, 1)]
+
+
+def test_move_cursor_clamps():
+    ids = [("p", i, 1) for i in range(3)]
+    assert topf.move_cursor(ids, ("p", 0, 1), +1) == ("p", 1, 1)
+    assert topf.move_cursor(ids, ("p", 0, 1), -1) == ("p", 0, 1)   # clamp at top
+    assert topf.move_cursor(ids, ("p", 2, 1), +1) == ("p", 2, 1)   # clamp at bottom
+    assert topf.move_cursor(ids, None, +1) == ("p", 0, 1)          # none -> first
+
+
+def test_present_viewport_highlights_cursor_and_glyph():
+    rows = _rows(2)
+    ui = topf.UIState(cursor=("p", 0, 1))
+    lines, cursor, top = topf.present_viewport(rows, ui, height=10, color=True)
+    assert cursor == ("p", 0, 1) and top == 0
+    assert "\x1b[7m" in lines[0]            # cursor row reverse-video
+    assert "▸ " in lines[0]                 # expandable glyph
+
+
+def test_present_viewport_scrolls_to_keep_cursor_visible():
+    rows = _rows(20)                        # 40 rows total
+    ui = topf.UIState(cursor=("p", 19, 1))  # bottom selectable
+    lines, cursor, top = topf.present_viewport(rows, ui, height=6, color=False)
+    assert len(lines) == 6
+    assert cursor == ("p", 19, 1)
+    assert any("head19" in ln for ln in lines)        # cursor visible
+    assert lines[0].startswith("▲")                   # "more above" marker
+
+
+def test_present_viewport_bottom_marker_when_overflow_below():
+    rows = _rows(20)
+    ui = topf.UIState(cursor=("p", 0, 1))
+    lines, cursor, top = topf.present_viewport(rows, ui, height=6, color=False)
+    assert lines[-1].startswith("▼")                  # "more below" marker
+
+
+def test_present_viewport_snaps_when_cursor_gone():
+    rows = _rows(3)
+    ui = topf.UIState(cursor=("p", 99, 1))  # not present
+    lines, cursor, top = topf.present_viewport(rows, ui, height=10, color=False)
+    assert cursor == ("p", 0, 1)            # snapped to first selectable
