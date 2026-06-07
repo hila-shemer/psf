@@ -658,3 +658,18 @@ def test_read_key_decodes_arrows_and_plain():
     assert topf._read_key(io.StringIO("\x1b[6~")) == "pgdn"
     # a lone ESC (no following bytes) is returned as escape, not a hang
     assert topf._read_key(io.StringIO("\x1b")) == "esc"
+
+
+# --- CLI flags --------------------------------------------------------------
+
+
+def test_main_parses_vmstat_flags():
+    ns = topf._parse_args(["--no-vmstat", "--vmstat-rows", "5"])
+    assert ns.no_vmstat is True and ns.vmstat_rows == 5
+    ns2 = topf._parse_args([])
+    assert ns2.no_vmstat is False and ns2.vmstat_rows == topf.VMSTAT_ROWS_DEFAULT
+
+
+def test_once_defaults_have_vmstat_fields():
+    d = topf._once_defaults()
+    assert hasattr(d, "no_vmstat") and hasattr(d, "vmstat_rows")
