@@ -1300,8 +1300,8 @@ def vmstat_hist_path(args):
 def vmstat_hist_load(path):
     """Load histogram state from `path`; a missing/unreadable file -> fresh."""
     try:
-        with open(path) as f:
-            return vmstat_hist_from_json(f.read())
+        with open(path) as fh:
+            return vmstat_hist_from_json(fh.read())
     except OSError:
         return vmstat_hist_new()
 
@@ -1314,8 +1314,8 @@ def vmstat_hist_save(path, state):
         if d:
             os.makedirs(d, exist_ok=True)
         tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            f.write(vmstat_hist_to_json(state))
+        with open(tmp, "w") as fh:
+            fh.write(vmstat_hist_to_json(state))
         os.replace(tmp, path)
     except OSError:
         pass
