@@ -62,7 +62,7 @@ def build_template(src):
     """
     tree = ast.parse(src)
     starts = _line_starts(src)
-    spans = []          # (start, end, marker), filled right-to-left later
+    spans = []          # (start, end, marker); sorted right-to-left at substitution time
     defaults = {}
     for node in tree.body:
         if not isinstance(node, ast.Assign) or len(node.targets) != 1:
@@ -78,7 +78,7 @@ def build_template(src):
         spans.append((start, end, marker))
     missing = set(CONST_TO_MARKER.values()) - set(defaults)
     if missing:
-        raise SystemExit("topf.py is missing knob constants: %s"
+        raise ValueError("topf.py is missing knob constants: %s"
                          % ", ".join(sorted(missing)))
     out = src
     for start, end, marker in sorted(spans, reverse=True):
