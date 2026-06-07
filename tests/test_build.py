@@ -1,6 +1,8 @@
 import ast
 import os
 
+import pytest
+
 import build
 
 SRC = open(build.TOPF, encoding="utf-8").read()
@@ -27,3 +29,9 @@ def test_template_parses():
     """The markered template is still importable/ast-parseable Python."""
     template, _ = build.build_template(SRC)
     ast.parse(template)  # markers live inside string literals -> no SyntaxError
+
+
+def test_missing_constant_raises():
+    """A source lacking the knob constants fails loudly, not silently."""
+    with pytest.raises(ValueError, match="missing knob constants"):
+        build.build_template("X = 1\n")
