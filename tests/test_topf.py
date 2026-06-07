@@ -857,3 +857,10 @@ def test_vmstat_hist_from_json_bad_input_is_fresh():
     # right version, wrong bucket count -> fresh
     bad = '{"version": 1, "nbuckets": 3, "columns": {}}'
     assert topf.vmstat_hist_from_json(bad)["us"]["count"] == 0
+    # non-dict JSON roots must not raise -> fresh
+    assert topf.vmstat_hist_from_json("[1, 2, 3]")["us"]["count"] == 0
+    assert topf.vmstat_hist_from_json("5")["us"]["count"] == 0
+    assert topf.vmstat_hist_from_json("null")["us"]["count"] == 0
+    # "columns" present but not an object -> fresh
+    bad_cols = '{"version": 1, "nbuckets": %d, "columns": [1, 2]}' % topf.VMSTAT_NBUCKETS
+    assert topf.vmstat_hist_from_json(bad_cols)["us"]["count"] == 0

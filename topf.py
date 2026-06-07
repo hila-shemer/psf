@@ -1283,7 +1283,7 @@ def vmstat_hist_from_json(text):
                 state[k]["hist"] = [float(x) for x in c["hist"]]
                 state[k]["count"] = int(c["count"])
         return state
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, AttributeError):
         return vmstat_hist_new()
 
 
