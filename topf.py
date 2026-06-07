@@ -1081,6 +1081,29 @@ def _tint_level(value, anchors):
     return sum(1 for a in anchors if value >= a)
 
 
+def outlier_level(value, window_values):
+    """How much `value` deviates from its column's recent distribution, as a
+    tint level 0..3 (indexing TINT_SGR). Robust: deviation measured in units of
+    1.4826*MAD (a normal-consistent sigma estimate) against the median. Returns
+    0 for None, < 3 samples, or a zero-spread window (so steady columns never
+    tint). Levels come from VMSTAT_OUTLIER_ANCHORS."""
+    if value is None:
+        return 0
+    vals = [v for v in window_values if v is not None]
+    if len(vals) < 3:
+        return 0
+    s = sorted(vals)
+    med = s[len(s) // 2] if len(s) % 2 else (s[len(s) // 2 - 1] + s[len(s) // 2]) / 2.0
+    devs = sorted(abs(v - med) for v in vals)
+    mad = devs[len(devs) // 2] if len(devs) % 2 else \
+        (devs[len(devs) // 2 - 1] + devs[len(devs) // 2]) / 2.0
+    sigma = 1.4826 * mad
+    if sigma <= 0:
+        return 0
+    z = abs(value - med) / sigma
+    return min(3, sum(1 for a in VMSTAT_OUTLIER_ANCHORS if z >= a))
+
+
 def _cpu_bit(windows_fracs, avg_frac=None):
     """Format a per-window CPU headline: 'cpu 400% 200% 50%' (one figure per
     window; None -> '—'). Tint level = max _tint_level across the non-None
