@@ -1100,6 +1100,61 @@ def outlier_level(value, window_values):
     return min(3, sum(1 for a in VMSTAT_OUTLIER_ANCHORS if z >= a))
 
 
+def _fmt_vmstat_cell(value, kind):
+    if value is None:
+        return "—"
+    if kind == "int":
+        return "%d" % value
+    if kind in ("bytes", "bps"):
+        return fmt_bytes(value)
+    if kind == "count":
+        return fmt_count(value)
+    if kind == "pct":
+        return "%d" % round(value)
+    return str(value)
+
+
+def format_vmstat_pane(rate_rows, swap_on, width, height, color):
+    """Render the pinned vmstat pane: a header row of column names plus up to
+    height-1 data rows (oldest..newest, top..bottom), columns right-aligned to
+    their content, each data cell tinted by outlier_level against its column's
+    values across the shown rows. swap_on=False drops the si/so columns. With no
+    data rows, only the header is returned (so the layout is stable)."""
+    cols = [(k, h, ki) for (k, h, ki) in VMSTAT_COLS
+            if swap_on or k not in SWAP_KEYS]
+    shown = rate_rows[-(height - 1):] if height > 1 else []
+
+    # per-column formatted cells + width
+    formatted = {k: [_fmt_vmstat_cell(r.get(k), ki) for r in shown]
+                 for (k, _h, ki) in cols}
+    colw = {k: max(len(h), max((len(c) for c in formatted[k]), default=0))
+            for (k, h, _ki) in cols}
+
+    gutter = VMSTAT_GUTTER
+    pad = " " * len(gutter)
+
+    def join_cells(cell_strs):
+        return "  ".join(s.rjust(colw[k]) for (k, _h, _ki), s in
+                         zip(cols, cell_strs))
+
+    lines = [gutter + "  " + join_cells([h for (_k, h, _ki) in cols])]
+
+    # column value windows for outlier coloring
+    windows = {k: [r.get(k) for r in shown] for (k, _h, _ki) in cols}
+    for ri, r in enumerate(shown):
+        cells = []
+        for (k, _h, _ki) in cols:
+            cell = formatted[k][ri]
+            lpad = " " * (colw[k] - len(cell))       # right-align padding
+            if color:
+                lvl = outlier_level(r.get(k), windows[k])
+                if lvl:
+                    cell = "\x1b[%sm%s\x1b[0m" % (TINT_SGR[lvl], cell)
+            cells.append(lpad + cell)                # pad OUTSIDE the SGR wrap
+        lines.append(pad + "  " + "  ".join(cells))
+    return lines
+
+
 def _cpu_bit(windows_fracs, avg_frac=None):
     """Format a per-window CPU headline: 'cpu 400% 200% 50%' (one figure per
     window; None -> '—'). Tint level = max _tint_level across the non-None
