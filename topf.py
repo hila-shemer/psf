@@ -1183,7 +1183,7 @@ def vmstat_bucket(value, kind):
     if value is None or value <= 0:
         return 0
     lo, hi = VMSTAT_KIND_RANGE[kind]
-    frac = (math.log(value) - math.log(lo)) / (math.log(hi) - math.log(lo))
+    frac = math.log(value / lo) / math.log(hi / lo)
     idx = 1 + int(frac * (VMSTAT_NBUCKETS - 1))
     return max(1, min(VMSTAT_NBUCKETS - 1, idx))
 
