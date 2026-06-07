@@ -379,29 +379,6 @@ def test_fmt_count():
     assert topf.fmt_count(None) == "—"
 
 
-# --- vmstat outlier coloring ------------------------------------------------
-
-
-def test_outlier_level_flat_window_is_zero():
-    assert topf.outlier_level(5, [5, 5, 5, 5]) == 0
-    assert topf.outlier_level(99, [5, 5, 5]) == 0     # zero spread -> no tint
-
-
-def test_outlier_level_spike_is_high():
-    window = [10, 11, 9, 10, 200]            # 200 is a gross outlier
-    assert topf.outlier_level(200, window) == 3
-
-
-def test_outlier_level_small_deviation_is_zero():
-    window = [10, 11, 9, 10, 12]
-    assert topf.outlier_level(11, window) == 0
-
-
-def test_outlier_level_too_few_or_none():
-    assert topf.outlier_level(5, [5, 5]) == 0        # < 3 samples
-    assert topf.outlier_level(None, [1, 2, 3, 4]) == 0
-
-
 # --- vmstat pane rendering --------------------------------------------------
 
 
@@ -412,27 +389,27 @@ def _rate_row(**kw):
 
 
 def test_format_vmstat_pane_header_and_swap_off():
-    rows = [_rate_row(free=3 * 1024**3, bi=0, ni=1024**2)]
-    rows[0]["in"] = 9100                 # "in" is an ordinary dict key here
-    lines = topf.format_vmstat_pane(rows, swap_on=False, width=200, height=4,
-                                    color=False)
+    row = _rate_row(free=3 * 1024**3, bi=0, ni=1024**2)
+    row["in"] = 9100
+    lines = topf.format_vmstat_pane([(row, {})], swap_on=False, width=200,
+                                    height=4, color=False)
     header = lines[0]
     assert header.startswith(topf.VMSTAT_GUTTER)
-    assert " si " not in header and " so " not in header   # swap off -> dropped
-    assert " ni " in header and " no " in header           # network present
+    assert " si " not in header and " so " not in header
+    assert " ni " in header and " no " in header
     assert " us " in header and " id " in header
 
 
 def test_format_vmstat_pane_swap_on_includes_si_so():
-    lines = topf.format_vmstat_pane([_rate_row()], swap_on=True, width=200,
+    lines = topf.format_vmstat_pane([(_rate_row(), {})], swap_on=True, width=200,
                                     height=3, color=False)
     assert " si " in lines[0] and " so " in lines[0]
 
 
 def test_format_vmstat_pane_uses_human_units():
-    rows = [_rate_row(free=2 * 1024**3, ni=4 * 1024**2)]
-    lines = topf.format_vmstat_pane(rows, swap_on=False, width=200, height=3,
-                                    color=False)
+    row = _rate_row(free=2 * 1024**3, ni=4 * 1024**2)
+    lines = topf.format_vmstat_pane([(row, {})], swap_on=False, width=200,
+                                    height=3, color=False)
     body = lines[-1]
     assert "2.0G" in body and "4.0M" in body
 
@@ -440,8 +417,15 @@ def test_format_vmstat_pane_uses_human_units():
 def test_format_vmstat_pane_dashes_when_empty():
     lines = topf.format_vmstat_pane([], swap_on=False, width=200, height=3,
                                     color=False)
-    assert lines and lines[0].startswith(topf.VMSTAT_GUTTER)   # header still drawn
-    assert len(lines) == 1                                     # no data rows
+    assert lines and lines[0].startswith(topf.VMSTAT_GUTTER)
+    assert len(lines) == 1
+
+
+def test_format_vmstat_pane_tints_from_supplied_levels():
+    row = _rate_row(us=99)
+    lines = topf.format_vmstat_pane([(row, {"us": 3})], swap_on=False,
+                                    width=200, height=3, color=True)
+    assert "\x1b[%sm" % topf.TINT_SGR[3] in lines[-1]   # bold-red wrap present
 
 
 # --- row identities & collapse/expand ---------------------------------------
