@@ -79,9 +79,10 @@ function pyRaw(s) {                                 // raw-string regex literal
   return "r" + q + s.replace(new RegExp(q, "g"), "\\" + q) + q;
 }
 function pyFloat(n) { return Number.isInteger(n) ? n.toFixed(1) : String(n); }
-function pyTupleFloat(a) { return "(" + a.map(pyFloat).join(", ") + ")"; }
-function pyTupleInt(a) { return "(" + a.map(n => String(Math.round(n))).join(", ") + ")"; }
-function pyTupleStr(a) { return "(" + a.map(pyStr).join(", ") + ")"; }
+function pyTuple(inner) { return "(" + inner.join(", ") + (inner.length === 1 ? "," : "") + ")"; }
+function pyTupleFloat(a) { return pyTuple(a.map(pyFloat)); }
+function pyTupleInt(a) { return pyTuple(a.map(n => String(Math.round(n)))); }
+function pyTupleStr(a) { return pyTuple(a.map(pyStr)); }
 function renderMatchers(rows) {
   const body = rows.map(r =>
     "    (" + pyStr(r.name) + ", " + pyStr(r.kind) +
