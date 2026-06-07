@@ -705,7 +705,7 @@ def test_vmstat_hist_fold_counts_and_skips_none():
     col = {"hist": [0.0] * topf.VMSTAT_NBUCKETS, "count": 0}
     topf.vmstat_hist_fold(col, 50.0, "pct", 0.5)
     assert col["count"] == 1
-    assert sum(col["hist"]) > 0
+    assert abs(sum(col["hist"]) - 0.5) < 1e-12   # mass after one fold == 1-d
     topf.vmstat_hist_fold(col, None, "pct", 0.5)   # None ignored
     assert col["count"] == 1
 

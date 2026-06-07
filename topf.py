@@ -1202,8 +1202,7 @@ def vmstat_hist_fold(col, value, kind, d):
         return
     h = col["hist"]
     b = vmstat_bucket(value, kind)
-    for i in range(len(h)):
-        h[i] *= d
+    h[:] = [v * d for v in h]        # decay every bucket (in place)
     h[b] += (1.0 - d)
     col["count"] += 1
 
