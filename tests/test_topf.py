@@ -761,3 +761,27 @@ def test_vmstat_relative_level_floor_and_warmup():
     assert topf.vmstat_relative_level(cold, 10 ** 8, "count") == 0
     # None -> 0
     assert topf.vmstat_relative_level(col, None, "count") == 0
+
+
+def test_vmstat_relative_level_intermediate():
+    # craft a histogram with known mass: a mid value lands in p90-p99 (level 1)
+    # and a higher value in p99-p99.9 (level 2). Verifies the anchor mapping
+    # between the two extremes the other tests already cover (0 and 3).
+    col = {"hist": [0.0] * topf.VMSTAT_NBUCKETS, "count": topf.VMSTAT_WARMUP}
+    lo_b = topf.vmstat_bucket(20.0, "count")
+    mid_b = topf.vmstat_bucket(10 ** 6, "count")
+    hi_b = topf.vmstat_bucket(10 ** 9, "count")
+    assert lo_b < mid_b < hi_b                       # distinct, ascending buckets
+    col["hist"][lo_b] = 0.940
+    col["hist"][mid_b] = 0.055
+    col["hist"][hi_b] = 0.005                         # total mass == 1.0
+    # cdf(mid) = 0.940 + 0.5*0.055 = 0.9675 -> [0.90, 0.99) -> level 1
+    assert topf.vmstat_relative_level(col, 10 ** 6, "count") == 1
+    # cdf(hi)  = 0.995 + 0.5*0.005 = 0.9975 -> [0.99, 0.999) -> level 2
+    assert topf.vmstat_relative_level(col, 10 ** 9, "count") == 2
+
+
+def test_vmstat_cdf_monotonic():
+    col = _warm_col("count", *([20.0] * 100 + [10 ** 5] * 50 + [10 ** 8] * 10))
+    cdfs = [topf.vmstat_cdf(col, v, "count") for v in (1, 20, 10 ** 4, 10 ** 6, 10 ** 9)]
+    assert cdfs == sorted(cdfs)                       # non-decreasing in value
