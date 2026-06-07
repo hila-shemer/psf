@@ -691,6 +691,7 @@ def test_vmstat_bucket_monotonic_and_clamped():
     assert topf.vmstat_bucket(10 ** 12, "bps") == topf.VMSTAT_NBUCKETS - 1
     # at/below lo lands in bucket 1
     assert topf.vmstat_bucket(1, "bps") == 1
+    assert topf.vmstat_bucket(0.5, "bps") == 1   # positive but below lo -> clamped to 1
 
 
 def test_once_defaults_have_vmstat_fields():
