@@ -1599,10 +1599,14 @@ def collect_printed(roots, suppressed):
 
 def _draw_frame(out, lines):
     """Home the cursor, write each line with clear-to-EOL, then clear to end of
-    screen so a shorter frame doesn't leave stale rows behind."""
+    screen so a shorter frame doesn't leave stale rows behind. No trailing
+    newline on the last line — writing \\n on the bottom row would scroll the
+    terminal and push the top line off-screen."""
     buf = ["\x1b[H"]
-    for ln in lines:
+    for ln in lines[:-1]:
         buf.append(ln + "\x1b[K\r\n")
+    if lines:
+        buf.append(lines[-1] + "\x1b[K")
     buf.append("\x1b[J")
     out.write("".join(buf))
     out.flush()
@@ -1620,7 +1624,8 @@ def _read_key(stream, pending=lambda: True):
         return ch
     if not pending():
         return "esc"
-    if stream.read(1) != "[":
+    nxt = stream.read(1)
+    if nxt not in ("[", "O"):
         return "esc"
     seq = ""
     while True:
@@ -1630,6 +1635,8 @@ def _read_key(stream, pending=lambda: True):
         seq += c
         if c.isalpha() or c == "~":
             break
+    if nxt == "O":
+        return {"A": "up", "B": "down", "H": "home", "F": "end"}.get(seq, "esc")
     return {"A": "up", "B": "down", "H": "home", "F": "end",
             "5~": "pgup", "6~": "pgdn", "1~": "home", "4~": "end"}.get(seq, "esc")
 
