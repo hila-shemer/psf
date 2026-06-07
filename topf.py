@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 # --- config -----------------------------------------------------------------
 
 CMD_WIDTH = 50            # chars of cmdline shown per process
-COLLAPSE_THRESHOLD = 20   # kept-descendant count above which a subtree collapses
+COLLAPSE_THRESHOLD = 30   # kept-descendant count above which a subtree collapses
 CACHE_TTL = 30            # seconds before a cached socket entry is re-probed
 REPR_COMMS = 4            # distinct comms named in a collapse summary
 SAMPLE_INTERVAL = 0.2     # seconds slept to measure current CPU (0 disables)
@@ -39,7 +39,7 @@ PATH_HEAD = 2             # leading path components kept when compressing
 PATH_MAX_BASENAME = 30    # basename length above which it is itself shortened
 PATH_BASENAME_KEEP = 6    # chars kept each side of '...' in a long basename
 DEDUP_MIN = 3             # min identical siblings to merge into one ×N group
-NEVER_MERGE = frozenset({"claude"})   # comms never grouped, even when identical
+NEVER_MERGE = frozenset({"qemu", "claude"})   # comms never grouped, even when identical
 GROUP_PIDS = 8            # member pids listed on a group's detail line
 LIFECYCLE_MAX = 40        # max born (and max died) comm-groups listed
 # Graduated tint for the cpu/rss detail bits. A value's level = how many of its
@@ -74,6 +74,10 @@ Group = namedtuple("Group", "members")
 DEFAULT_MATCHERS = [
     ("bazel", "comm", re.compile(r"^bazel")),
     ("bazel", "cmdline", re.compile(r"\bbazel\(")),
+    ("qemu-vp", "comm", re.compile(r"qemu-vp")),
+    ("qemu-vp", "cmdline", re.compile(r"\bqemu-vp\b")),
+    ("qemu", "comm", re.compile(r"qemu")),
+    ("qemu", "cmdline", re.compile(r"\bqemu\b")),
     ("sshd", "cmdline", re.compile(r"^sshd: ")),
     ("tmux", "comm", re.compile(r"^tmux")),
     ("claude", "comm", re.compile(r"claude")),
