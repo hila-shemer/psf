@@ -121,3 +121,33 @@ def extract_values(defaults):
         else:
             values[marker] = _to_jsonable(_eval_literal(text))
     return values
+
+
+def render_html(src=None):
+    """Inject {template, defaults, values, knobs} as JSON into the UI scaffold
+    and return the self-contained index.html text."""
+    if src is None:
+        with open(TOPF, encoding="utf-8") as f:
+            src = f.read()
+    template, defaults = build_template(src)
+    data = {
+        "template": template,
+        "defaults": defaults,
+        "values": extract_values(defaults),
+        "knobs": [{"marker": m, "const": c, "group": g} for m, c, g in KNOBS],
+    }
+    with open(TEMPLATE_HTML, encoding="utf-8") as f:
+        scaffold = f.read()
+    blob = json.dumps(data).replace("</", "<\\/")    # never break out of <script>
+    return scaffold.replace("/*__TOPFIG_DATA__*/null", blob, 1)
+
+
+def main():
+    html = render_html()
+    with open(OUT_HTML, "w", encoding="utf-8") as f:
+        f.write(html)
+    print("wrote %s (%d bytes)" % (OUT_HTML, len(html)))
+
+
+if __name__ == "__main__":
+    main()

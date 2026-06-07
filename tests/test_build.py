@@ -51,3 +51,25 @@ def test_value_extraction():
     assert values["tint_sgr"] == ["2", "2;33", "33", "1;31"]
     # arithmetic literal (100 * 1024**2) evaluates to a number
     assert values["rss_tint_anchors"][0] == 100 * 1024 ** 2
+
+
+def test_render_html_smoke():
+    """Generated HTML is non-empty, carries the template + all knob markers,
+    and has the injection point consumed."""
+    html = build.render_html(SRC)
+    assert html.strip()
+    assert "@@TOPFIG:interesting_names@@" in html      # template baked in
+    for marker in build.CONST_TO_MARKER.values():
+        assert marker in html                           # four knob groups + ids
+    assert "/*__TOPFIG_DATA__*/null" not in html        # injection happened
+
+
+def test_render_html_data_is_valid_json():
+    """The injected blob parses as JSON and exposes the contract keys."""
+    import json
+    html = build.render_html(SRC)
+    blob = html.split("const TOPFIG = ", 1)[1].split(";\n", 1)[0]
+    data = json.loads(blob)
+    assert set(data) == {"template", "defaults", "values", "knobs"}
+    assert data["values"]["cmd_width"] == 50
+    assert len(data["knobs"]) == len(build.KNOBS)
