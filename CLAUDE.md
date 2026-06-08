@@ -4,18 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-**topf** — a `top`-like, full-screen Linux process viewer that shows only interesting/heavy subtrees, with windowed CPU, vmstat pane, disk pane, and interactive expand/collapse. **topfig** — a static HTML config editor generated from topf.py's knob constants. **psf** — a process session finder: classify, group, and summarize running processes by session type, detect venvs.
+**topf** — a `top`-like, full-screen Linux process viewer that shows only interesting/heavy subtrees, with windowed CPU, vmstat pane, disk pane, and interactive expand/collapse. **psf** — a process session finder: classify, group, and summarize running processes by session type, detect venvs.
 
 ## Commands
 
 - **Run tests:** `pytest tests/`
-- **Run a single test file:** `pytest tests/test_topf.py`, `pytest tests/test_build.py`, or `pytest tests/test_psf.py`
+- **Run a single test file:** `pytest tests/test_topf.py` or `pytest tests/test_psf.py`
 - **Run a single test by name:** `pytest tests/test_topf.py -k "test_windowed_rate_constant_one_core"`
 - **Run topf once (piped):** `topf --once` or `python topf.py --once`
 - **Run topf live (interactive TUI):** `topf` or `python topf.py`
 - **Run psf (snapshot):** `psf` or `python psf.py`
 - **Run psf (watch mode):** `psf --watch`
-- **Regenerate index.html:** `python build.py`
 - **Install editable:** `pip install -e .`
 
 ## Architecture
@@ -55,16 +54,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | **render** | `render_psf` — session-first display with category badges |
 | **CLI** | `_parse_args`, `main` — `--once`/`--watch` modes |
 
-### build.py (~150 lines)
-
-Parses topf.py's AST, replaces knob constants with sentinels, injects data as JSON into `topfig_template.html` → `index.html`. The `KNOBS` list must stay in sync with topf.py.
-
 ### tests/
 
 - `test_topf.py` — pure-core + integration tests for topf (header, vmstat, disk pane, breakout, collapse, render, etc.)
-- `test_build.py` — template round-trip, marker coverage, value extraction
 - `test_psf.py` — classification, venv detection, sessions, glue, clusters
-- `conftest.py` — empty; exists so `import topf` / `import build` / `import psf` resolves
+- `conftest.py` — empty; exists so `import topf` / `import psf` resolves
 
 ## Key interactions
 
@@ -74,7 +68,6 @@ Parses topf.py's AST, replaces knob constants with sentinels, injects data as JS
 
 ## Conventions
 
-- `index.html` is a **generated artifact** — never edit directly.
 - pytest is a dev dependency: `pip install -e ".[dev]"` or `pip install pytest`.
 - Git remote `origin` is `hila-shemer/psf.git`; never push to any Majestic-Labs remote.
 - Some tests read real `/proc` — pass on Linux only (macOS/WSL1 will fail).
