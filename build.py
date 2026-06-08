@@ -31,7 +31,7 @@ KNOBS = [
     ("cache_ttl",              "CACHE_TTL",              "timing"),
     ("rss_tint_anchors",       "RSS_TINT_ANCHORS",       "colors"),
     ("cpu_tint_anchors",       "CPU_TINT_ANCHORS",       "colors"),
-    ("vmstat_outlier_anchors", "VMSTAT_OUTLIER_ANCHORS", "colors"),
+    ("vmstat_pct_anchors", "VMSTAT_PCT_ANCHORS", "colors"),
     ("tint_sgr",               "TINT_SGR",               "colors"),
 ]
 CONST_TO_MARKER = {const: marker for marker, const, _ in KNOBS}
