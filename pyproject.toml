@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "psf"
+version = "0.1.0"
+description = "topf — focused live process viewer; psf — process session finder"
+requires-python = ">=3.9"
+license = "MIT"
+
+[project.scripts]
+topf = "topf:main"
+psf = "psf:main"
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["topf.py", "psf.py"]

@@ -341,7 +341,8 @@ def _vs(t, **kw):
     base = dict(procs_running=0, procs_blocked=0, cpu_user=0, cpu_nice=0,
                 cpu_system=0, cpu_idle=0, cpu_iowait=0, cpu_total=0, intr=0,
                 ctxt=0, pgpgin=0, pgpgout=0, pswpin=0, pswpout=0, rx=0, tx=0,
-                free=0, buff=0, cache=0, swap_total=0)
+                free=0, buff=0, cache=0, swap_total=0, swap_free=None,
+                mem_total=None)
     base.update(kw)
     return topf.VmstatSample(t=t, **base)
 
@@ -493,6 +494,87 @@ def test_collapse_expanded_node_not_suppressed_but_still_collapsible():
     assert suppressed == set()                  # but nothing hidden
 
 
+# --- breakout rows ----------------------------------------------------------
+
+
+def test_find_breakouts_identifies_promoted_descendants():
+    root = _kept(_rproc(1, ppid=0, comm="root"))
+    root.interesting = True
+    kids = {1: root}
+    for i in range(2, 8):                       # 6 noise children
+        c = _kept(_rproc(i, ppid=1, comm="noise"))
+        kids[i] = c
+    # Make one descendant heavy (3 cores -> promoted at level 2)
+    kids[5].cpu_windows = [3.0, 3.0, 3.0]
+    topf.build_tree(kids)
+    suppressed, collapsible = topf.collapse(kids, threshold=3)
+    assert topf.proc_id(root) in collapsible
+    b_pids, b_map = topf.find_breakouts(
+        kids, suppressed, collapsible, topf.PAGE_SIZE, 2, True)
+    assert 5 in b_pids
+    assert topf.proc_id(root) in b_map
+    assert kids[5] in b_map[topf.proc_id(root)]
+
+
+def test_find_breakouts_respects_max():
+    root = _kept(_rproc(1, ppid=0, comm="root"))
+    root.interesting = True
+    kids = {1: root}
+    for i in range(2, 12):                     # 10 noise children
+        c = _kept(_rproc(i, ppid=1, comm="noise", windows=[3.0, 3.0, 3.0]))
+        kids[i] = c
+    topf.build_tree(kids)
+    suppressed, collapsible = topf.collapse(kids, threshold=3)
+    b_pids, b_map = topf.find_breakouts(
+        kids, suppressed, collapsible, topf.PAGE_SIZE, 2, True)
+    # All 10 are promoted, but only BREAKOUT_MAX make it through
+    assert len(b_map[topf.proc_id(root)]) <= topf.BREAKOUT_MAX
+
+
+def test_build_rows_includes_breakout_rows():
+    root = _kept(_rproc(1, ppid=0, comm="root"))
+    root.interesting = True
+    kids = {1: root}
+    heavy = _kept(_rproc(5, ppid=1, comm="heavy", windows=[3.0, 3.0, 3.0]))
+    kids[5] = heavy
+    for i in range(10, 16):
+        kids[i] = _kept(_rproc(i, ppid=1, comm="noise"))
+    topf.build_tree(kids)
+    suppressed, collapsible = topf.collapse(kids, threshold=3)
+    b_pids, b_map = topf.find_breakouts(
+        kids, suppressed, collapsible, topf.PAGE_SIZE, 2, True)
+    suppressed -= b_pids
+    rows = topf.build_rows([root], suppressed, collapsible=collapsible,
+                            breakout_map=b_map)
+    texts = [r.text for r in rows]
+    # The heavy proc should appear as a breakout row with >> marker
+    assert any(">> 5 heavy" in t for t in texts)
+
+
+# --- expand-all-groups key --------------------------------------------------
+
+
+def test_expand_all_groups_adds_only_group_ids():
+    """Simulating the E key: only group ids (item_id[0]=='g') are added."""
+    rows = [
+        topf.Row("proc1", ("p", 10, 1), expandable=True, selectable=True),
+        topf.Row("group1", ("g", topf.ROOT_ID, "x", "/x"), expandable=True,
+                 selectable=True),
+        topf.Row("proc2", ("p", 20, 1), expandable=True, selectable=True),
+        topf.Row("group2", ("g", topf.ROOT_ID, "y", "/y"), expandable=True,
+                 selectable=True),
+    ]
+    expanded = set()
+    for r in rows:
+        if r.expandable and r.item_id[0] == "g":
+            expanded.add(r.item_id)
+    assert len(expanded) == 2
+    assert all(id[0] == "g" for id in expanded)
+    # Proc ids were not added
+    assert ("p", 10, 1) not in expanded
+    assert ("p", 20, 1) not in expanded
+
+
 # --- build_rows / render wrapper --------------------------------------------
 
 
@@ -619,39 +701,78 @@ def test_present_viewport_snaps_when_cursor_gone():
 
 def test_split_regions_hidden_when_small():
     # below MIN_ROWS_FOR_VMSTAT -> pane hidden, tree gets the whole body
-    region, pane, show = topf.split_regions(rows=12, cols=200, vmstat_on=True,
-                                            vmstat_rows_cap=12, sample_rows=10)
-    assert show is False and pane == 0 and region == 11   # rows-1 header
+    region, vp, dp, sv, sd = topf.split_regions(
+        rows=12, cols=200, vmstat_on=True, vmstat_rows_cap=12, sample_rows=10)
+    assert sv is False and vp == 0 and region == 11   # rows-1 header
 
 
 def test_split_regions_narrow_hides_pane():
-    region, pane, show = topf.split_regions(rows=40, cols=50, vmstat_on=True,
-                                            vmstat_rows_cap=12, sample_rows=10)
-    assert show is False
+    region, vp, dp, sv, sd = topf.split_regions(
+        rows=40, cols=50, vmstat_on=True, vmstat_rows_cap=12, sample_rows=10)
+    assert sv is False
 
 
 def test_split_regions_shows_pane_when_room():
     # 40 rows: header 1, tree gets the rest minus a pane of 2 + k sample rows
-    region, pane, show = topf.split_regions(rows=40, cols=200, vmstat_on=True,
-                                            vmstat_rows_cap=12, sample_rows=10)
-    assert show is True
-    assert pane == 2 + 10                 # separator + header + 10 samples
-    assert region == (40 - 1) - pane
+    region, vp, dp, sv, sd = topf.split_regions(
+        rows=40, cols=200, vmstat_on=True, vmstat_rows_cap=12, sample_rows=10)
+    assert sv is True
+    assert vp == 2 + 10                 # separator + header + 10 samples
+    assert region == (40 - 1) - vp
 
 
 def test_split_regions_caps_pane_to_keep_tree():
     # tiny body: ensure tree keeps >= MIN_TREE_ROWS and pane >= MIN samples or hides
-    region, pane, show = topf.split_regions(rows=18, cols=200, vmstat_on=True,
-                                            vmstat_rows_cap=12, sample_rows=10)
+    region, vp, dp, sv, sd = topf.split_regions(
+        rows=18, cols=200, vmstat_on=True, vmstat_rows_cap=12, sample_rows=10)
     assert region >= topf.MIN_TREE_ROWS
-    if show:
-        assert pane >= 2 + topf.MIN_VMSTAT_SAMPLE_ROWS
+    if sv:
+        assert vp >= 2 + topf.MIN_VMSTAT_SAMPLE_ROWS
 
 
 def test_split_regions_off_when_toggled():
-    region, pane, show = topf.split_regions(rows=40, cols=200, vmstat_on=False,
-                                            vmstat_rows_cap=12, sample_rows=10)
-    assert show is False and region == 39
+    region, vp, dp, sv, sd = topf.split_regions(
+        rows=40, cols=200, vmstat_on=False, vmstat_rows_cap=12, sample_rows=10)
+    assert sv is False and region == 39
+
+
+def test_split_regions_with_disk_pane():
+    # Both panes on: vmstat gets its rows, disk gets its rows, tree gets the rest
+    region, vp, dp, sv, sd = topf.split_regions(
+        rows=50, cols=200, vmstat_on=True, vmstat_rows_cap=8, sample_rows=6,
+        disk_on=True, disk_rows_cap=6, disk_mounts_count=3)
+    assert sv is True and sd is True
+    assert vp > 0 and dp > 0
+    assert region == 49 - vp - dp
+
+
+def test_split_regions_disk_hides_when_no_mounts():
+    region, vp, dp, sv, sd = topf.split_regions(
+        rows=50, cols=200, vmstat_on=True, vmstat_rows_cap=8, sample_rows=6,
+        disk_on=True, disk_rows_cap=6, disk_mounts_count=0)
+    assert sd is False and dp == 0
+
+
+# --- disk pane --------------------------------------------------------------
+
+
+def test_format_disk_pane_sorts_by_pct():
+    mounts = [
+        topf.MountInfo("/a", "", "", total=100, used=10, avail=90, pct=10.0),
+        topf.MountInfo("/b", "", "", total=100, used=90, avail=10, pct=90.0),
+        topf.MountInfo("/c", "", "", total=100, used=50, avail=50, pct=50.0),
+    ]
+    lines = topf.format_disk_pane(mounts, width=120, height=4, color=False)
+    # First data row should be /b (highest pct)
+    assert "/b" in lines[1]
+
+
+def test_format_disk_pane_tints_high_usage():
+    mounts = [
+        topf.MountInfo("/full", "", "", total=100, used=97, avail=3, pct=97.0),
+    ]
+    lines = topf.format_disk_pane(mounts, width=120, height=3, color=True)
+    assert "\x1b[1;31m" in lines[1]   # critical tint
 
 
 # --- key decoder ------------------------------------------------------------
@@ -776,203 +897,74 @@ def test_once_defaults_have_vmstat_fields():
     assert hasattr(d, "no_vmstat") and hasattr(d, "vmstat_rows")
 
 
-# --- vmstat CDF and relative tint level --------------------------------------
-
-def _warm_col(kind, *values, d=0.99):
-    col = {"hist": [0.0] * topf.VMSTAT_NBUCKETS, "count": 0}
-    for v in values:
-        topf.vmstat_hist_fold(col, v, kind, d)
-    return col
-
-
-def test_vmstat_cdf_empty_is_zero():
-    col = {"hist": [0.0] * topf.VMSTAT_NBUCKETS, "count": 0}
-    assert topf.vmstat_cdf(col, 10.0, "pct") == 0.0
-
-
-def test_vmstat_cdf_high_value_near_one():
-    # mass concentrated low; a far-higher value sits near the top of the cdf
-    col = _warm_col("count", *([20.0] * 200))
-    assert topf.vmstat_cdf(col, 20.0, "count") < 0.6     # mid-bucket of the mass
-    assert topf.vmstat_cdf(col, 10 ** 8, "count") > 0.99
+def test_once_defaults_has_all_parse_args_attrs():
+    """_once_defaults (now derived from _parse_args) has every flag."""
+    defaults = topf._once_defaults()
+    parsed = topf._parse_args([])
+    # Every attribute from _parse_args([]) must also exist in _once_defaults
+    for attr in vars(parsed):
+        assert hasattr(defaults, attr), (
+            "_once_defaults missing attr %s (was it added to _parse_args "
+            "but not to _once_defaults?)" % attr)
+    # Test overrides
+    assert defaults.no_cache is True
+    assert defaults.no_color is True
 
 
-def test_vmstat_relative_level_floor_and_warmup():
-    col = _warm_col("count", *([20.0] * 200))            # warm (count >= WARMUP)
-    assert topf.vmstat_relative_level(col, 10 ** 8, "count") == 3
-    # below the kind's floor -> never tints
-    assert topf.vmstat_relative_level(col, 0.0, "count") == 0
-    # cold column (count < WARMUP) -> never tints
-    cold = _warm_col("count", *([20.0] * 10))
-    assert topf.vmstat_relative_level(cold, 10 ** 8, "count") == 0
-    # None -> 0
-    assert topf.vmstat_relative_level(col, None, "count") == 0
+# --- header enrichment ------------------------------------------------------
 
 
-def test_vmstat_relative_level_intermediate():
-    # craft a histogram with known mass: a mid value lands in p90-p99 (level 1)
-    # and a higher value in p99-p99.9 (level 2). Verifies the anchor mapping
-    # between the two extremes the other tests already cover (0 and 3).
-    col = {"hist": [0.0] * topf.VMSTAT_NBUCKETS, "count": topf.VMSTAT_WARMUP}
-    lo_b = topf.vmstat_bucket(20.0, "count")
-    mid_b = topf.vmstat_bucket(10 ** 6, "count")
-    hi_b = topf.vmstat_bucket(10 ** 9, "count")
-    assert lo_b < mid_b < hi_b                       # distinct, ascending buckets
-    col["hist"][lo_b] = 0.940
-    col["hist"][mid_b] = 0.055
-    col["hist"][hi_b] = 0.005                         # total mass == 1.0
-    # cdf(mid) = 0.940 + 0.5*0.055 = 0.9675 -> [0.90, 0.99) -> level 1
-    assert topf.vmstat_relative_level(col, 10 ** 6, "count") == 1
-    # cdf(hi)  = 0.995 + 0.5*0.005 = 0.9975 -> [0.99, 0.999) -> level 2
-    assert topf.vmstat_relative_level(col, 10 ** 9, "count") == 2
+def test_parse_meminfo_includes_swap_free_and_mem_total():
+    txt = ("MemTotal:  64000 kB\nMemFree:  1024 kB\nBuffers: 2048 kB\n"
+           "Cached: 4096 kB\nSwapTotal: 8192 kB\nSwapFree: 2048 kB\n")
+    m = topf.parse_meminfo(txt)
+    assert m["mem_total"] == 64000 * 1024
+    assert m["swap_free"] == 2048 * 1024
+    assert m["swap_total"] == 8192 * 1024
+    assert m["free"] == 1024 * 1024
 
 
-def test_vmstat_cdf_monotonic():
-    col = _warm_col("count", *([20.0] * 100 + [10 ** 5] * 50 + [10 ** 8] * 10))
-    cdfs = [topf.vmstat_cdf(col, v, "count") for v in (1, 20, 10 ** 4, 10 ** 6, 10 ** 9)]
-    assert cdfs == sorted(cdfs)                       # non-decreasing in value
+def test_count_states_classifies_states():
+    procs = {}
+    for i, state in enumerate(["R", "S", "D", "I", "Z", "R", "S", "Z"]):
+        procs[i] = topf.Proc(pid=i, ppid=0, comm="x", cmdline="x", state=state,
+                             num_threads=1, starttime=1, uid=0)
+    r, s, z = topf.count_states(procs)
+    assert r == 2 and s == 4 and z == 2   # S, D, I all count as sleeping
 
 
-def test_vmstat_ceiling_low_idle():
-    assert topf.vmstat_ceiling_level("id", 2.0, cores=4) == 3
-    assert topf.vmstat_ceiling_level("id", 8.0, cores=4) == 2
-    assert topf.vmstat_ceiling_level("id", 50.0, cores=4) == 0
+def test_header_line_includes_load_avg():
+    h = topf.header_line(1.0, topf.SysInfo(100, 4096, 100, 8),
+                         nprocs=100, hidden=50, interval=1.0,
+                         loadavg=(0.5, 0.6, 0.7))
+    assert "load 0.50/0.60/0.70" in h
 
 
-def test_vmstat_ceiling_high_wait_and_blocked():
-    assert topf.vmstat_ceiling_level("wa", 45.0, cores=4) == 3
-    assert topf.vmstat_ceiling_level("wa", 25.0, cores=4) == 2
-    assert topf.vmstat_ceiling_level("b", 5, cores=4) == 3
-    assert topf.vmstat_ceiling_level("b", 0, cores=4) == 0
+def test_header_line_includes_mem_summary():
+    h = topf.header_line(1.0, topf.SysInfo(100, 4096, 100, 8),
+                         nprocs=100, hidden=50, interval=1.0,
+                         mem_total=64 * 1024**3, mem_used=10 * 1024**3)
+    assert "Mem: 10.0G/64.0G" in h
 
 
-def test_vmstat_ceiling_runqueue_scales_with_cores():
-    assert topf.vmstat_ceiling_level("r", 8, cores=4) == 3      # >= 2*cores
-    assert topf.vmstat_ceiling_level("r", 4, cores=4) == 2      # >= 1*cores
-    assert topf.vmstat_ceiling_level("r", 1, cores=4) == 0
+def test_header_line_shows_swap_when_present():
+    h = topf.header_line(1.0, topf.SysInfo(100, 4096, 100, 8),
+                         nprocs=100, hidden=50, interval=1.0,
+                         swap_total=8 * 1024**3, swap_free=6 * 1024**3)
+    assert "Swap: 2.0G/8.0G" in h
 
 
-def test_vmstat_ceiling_unlisted_and_none():
-    assert topf.vmstat_ceiling_level("free", 10 ** 12, cores=4) == 0
-    assert topf.vmstat_ceiling_level("id", None, cores=4) == 0
+def test_header_line_omits_swap_when_zero():
+    h = topf.header_line(1.0, topf.SysInfo(100, 4096, 100, 8),
+                         nprocs=100, hidden=50, interval=1.0,
+                         swap_total=0, swap_free=0)
+    assert "Swap" not in h
 
 
-def test_vmstat_cell_level_is_max_of_ceiling_and_relative():
-    # relative says 0 (cold), ceiling says 3 -> final 3
-    cold = {"hist": [0.0] * topf.VMSTAT_NBUCKETS, "count": 0}
-    assert topf.vmstat_cell_level("id", "pct", 2.0, cold, cores=4) == 3
-    # neither fires -> 0
-    assert topf.vmstat_cell_level("us", "pct", 1.0, cold, cores=4) == 0
-
-
-def test_vmstat_ceiling_exact_boundaries():
-    # inclusive at both thresholds; t3 wins over t2
-    assert topf.vmstat_ceiling_level("id", 10.0, cores=4) == 2   # == t2 (low)
-    assert topf.vmstat_ceiling_level("id", 3.0, cores=4) == 3    # == t3 (low)
-    assert topf.vmstat_ceiling_level("wa", 20.0, cores=4) == 2   # == t2 (high)
-    assert topf.vmstat_ceiling_level("wa", 40.0, cores=4) == 3   # == t3 (high)
-    # high_cores just-below boundaries (cores=4 -> t2=4, t3=8)
-    assert topf.vmstat_ceiling_level("r", 7, cores=4) == 2       # below scaled t3
-    assert topf.vmstat_ceiling_level("r", 3, cores=4) == 0       # below scaled t2
-    # single-core: one runnable process == one full core -> level 2
-    assert topf.vmstat_ceiling_level("r", 1, cores=1) == 2
-
-
-def test_vmstat_cell_level_max_when_both_fire():
-    # warm "int" col with all mass low so cdf(5) lands at the top -> relative 3
-    col = {"hist": [0.0] * topf.VMSTAT_NBUCKETS, "count": topf.VMSTAT_WARMUP}
-    col["hist"][topf.vmstat_bucket(2, "int")] = 1.0
-    assert topf.vmstat_relative_level(col, 5, "int") == 3
-    assert topf.vmstat_ceiling_level("r", 5, cores=4) == 2       # 5 >= 1*4, < 2*4
-    # both fire (relative 3, ceiling 2) -> max picks the larger
-    assert topf.vmstat_cell_level("r", "int", 5, col, cores=4) == 3
-
-
-def test_vmstat_hist_json_roundtrip():
-    state = topf.vmstat_hist_new()
-    topf.vmstat_hist_fold(state["us"], 50.0, "pct", 0.99)
-    state["us"]["count"] = 7
-    back = topf.vmstat_hist_from_json(topf.vmstat_hist_to_json(state))
-    assert back["us"]["count"] == 7
-    assert back["us"]["hist"] == state["us"]["hist"]
-
-
-def test_vmstat_hist_from_json_bad_input_is_fresh():
-    assert topf.vmstat_hist_from_json("not json")["us"]["count"] == 0
-    assert topf.vmstat_hist_from_json('{"version": 99}')["us"]["count"] == 0
-    # right version, wrong bucket count -> fresh
-    bad = '{"version": 1, "nbuckets": 3, "columns": {}}'
-    assert topf.vmstat_hist_from_json(bad)["us"]["count"] == 0
-    # non-dict JSON roots must not raise -> fresh
-    assert topf.vmstat_hist_from_json("[1, 2, 3]")["us"]["count"] == 0
-    assert topf.vmstat_hist_from_json("5")["us"]["count"] == 0
-    assert topf.vmstat_hist_from_json("null")["us"]["count"] == 0
-    # "columns" present but not an object -> fresh
-    bad_cols = '{"version": 1, "nbuckets": %d, "columns": [1, 2]}' % topf.VMSTAT_NBUCKETS
-    assert topf.vmstat_hist_from_json(bad_cols)["us"]["count"] == 0
-
-
-def test_vmstat_hist_path_explicit_and_xdg(monkeypatch):
-    args = _types.SimpleNamespace(history_file="/tmp/explicit.json")
-    assert topf.vmstat_hist_path(args) == "/tmp/explicit.json"
-    args = _types.SimpleNamespace(history_file=None)
-    monkeypatch.setenv("XDG_STATE_HOME", "/xdg/state")
-    assert topf.vmstat_hist_path(args) == "/xdg/state/topf/vmstat-hist.json"
-
-
-def test_vmstat_hist_save_then_load_roundtrip(tmp_path):
-    path = str(tmp_path / "sub" / "hist.json")     # parent dir created on save
-    state = topf.vmstat_hist_new()
-    state["cs"]["count"] = 42
-    topf.vmstat_hist_save(path, state)
-    assert topf.vmstat_hist_load(path)["cs"]["count"] == 42
-
-
-def test_vmstat_hist_load_missing_file_is_fresh(tmp_path):
-    path = str(tmp_path / "nope.json")
-    assert topf.vmstat_hist_load(path)["cs"]["count"] == 0
-
-
-def test_vmstat_hist_path_default_when_no_xdg(monkeypatch):
-    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
-    args = _types.SimpleNamespace(history_file=None)
-    expected = os.path.join(os.path.expanduser("~/.local/state"),
-                            "topf", "vmstat-hist.json")
-    assert topf.vmstat_hist_path(args) == expected
-
-
-def test_vmstat_hist_save_overwrites_existing(tmp_path):
-    path = str(tmp_path / "hist.json")
-    s1 = topf.vmstat_hist_new()
-    s1["cs"]["count"] = 1
-    topf.vmstat_hist_save(path, s1)
-    s2 = topf.vmstat_hist_new()
-    s2["cs"]["count"] = 99
-    topf.vmstat_hist_save(path, s2)               # atomic overwrite of existing
-    assert topf.vmstat_hist_load(path)["cs"]["count"] == 99
-
-
-def test_vmstat_colored_row_freezes_levels_and_folds():
-    # two adjacent samples 1s apart; use the file's _vs helper.
-    # prev_s: baseline counters at t=0
-    prev_s = _vs(0.0, procs_running=1, cpu_user=0, cpu_total=100,
-                 cpu_idle=100, intr=0, ctxt=0)
-    # cur_s: t=1; run-queue r=9 (> 2*cores=8 for cores=4 -> ceiling level 3);
-    # some cpu activity to get a non-trivial us/id split.
-    cur_s = _vs(1.0, procs_running=9, cpu_user=50, cpu_total=200,
-                cpu_idle=150, intr=100, ctxt=200)
-    hist = topf.vmstat_hist_new()
-    row, levels = topf.vmstat_colored_row(prev_s, cur_s, 1.0, hist, d=0.99,
-                                          cores=4)
-    # returns a (rate_row dict, levels dict) pair
-    assert set(levels) == {k for k, _h, _ki in topf.VMSTAT_COLS}
-    assert isinstance(row, dict)
-    # history was folded exactly once per column (warmup counter bumped for
-    # columns whose value is not None)
-    assert all(hist[k]["count"] == 1 for k, _h, _ki in topf.VMSTAT_COLS
-               if row.get(k) is not None)
-    # level-before-fold + cold histogram: relative coloring can't fire yet
-    # (count < WARMUP), so any nonzero level must come from the absolute ceiling.
-    for k, _h, ki in topf.VMSTAT_COLS:
-        if levels[k]:
-            assert levels[k] == topf.vmstat_ceiling_level(k, row.get(k), 4)
+def test_header_line_includes_task_breakdown():
+    h = topf.header_line(1.0, topf.SysInfo(100, 4096, 100, 8),
+                         nprocs=100, hidden=50, interval=1.0,
+                         n_running=3, n_sleeping=90, n_zombie=2)
+    assert "3 run" in h
+    assert "90 sleep" in h
+    assert "2 zombie" in h

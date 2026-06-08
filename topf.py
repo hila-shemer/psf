@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 # --- config -----------------------------------------------------------------
 
 CMD_WIDTH = 50            # chars of cmdline shown per process
-COLLAPSE_THRESHOLD = 30   # kept-descendant count above which a subtree collapses
+COLLAPSE_THRESHOLD = 90   # kept-descendant count above which a subtree collapses
 CACHE_TTL = 30            # seconds before a cached socket entry is re-probed
 REPR_COMMS = 4            # distinct comms named in a collapse summary
 SAMPLE_INTERVAL = 0.2     # seconds slept to measure current CPU (0 disables)
@@ -88,6 +88,7 @@ VMSTAT_CEILING = {
 DEFAULT_WINDOWS = (2.0, 10.0, 60.0)   # CPU window seconds (shortest..longest)
 PROMOTE_LEVEL = 2         # tint-anchor level required to promote (>= 1.0 core / >= 1G)
 RSS_GATE_LEVEL = 1        # longest-window CPU floor for RSS-only promotion (~10%)
+BREAKOUT_MAX = 5          # max hot procs that poke through a collapsed subtree
 REFRESH_INTERVAL = 1.0    # default sample == redraw cadence (seconds)
 
 # vmstat pane: columns (key, header, kind), kind in {int, bytes, bps, count, pct}.
@@ -110,6 +111,14 @@ MIN_TREE_ROWS = 5             # tree region never shrinks below this for the pan
 MIN_VMSTAT_SAMPLE_ROWS = 3    # fewer pane sample rows than this -> hide the pane
 VMSTAT_ROWS_DEFAULT = 12      # default cap on pane sample rows
 
+# disk pane: mount-point usage, similar layout to vmstat.
+DISK_PANE_GUTTER = "diskfs"
+MIN_ROWS_FOR_DISK = 18       # terminal rows below which the disk pane hides
+MIN_COLS_FOR_DISK = 60       # terminal cols below which the disk pane hides
+DISK_ROWS_DEFAULT = 10       # default cap on mount rows
+DISK_USAGE_WARN_PCT = 80     # pct above which a mount gets warm tint
+DISK_USAGE_CRIT_PCT = 95     # pct above which a mount gets red tint
+
 # System constants, read once. CLK_TCK converts stat jiffies -> seconds;
 # PAGE_SIZE converts stat rss (in pages) -> bytes.
 CLK_TCK = os.sysconf("SC_CLK_TCK")
@@ -130,7 +139,11 @@ Group = namedtuple("Group", "members")
 VmstatSample = namedtuple("VmstatSample",
     "t procs_running procs_blocked cpu_user cpu_nice cpu_system cpu_idle "
     "cpu_iowait cpu_total intr ctxt pgpgin pgpgout pswpin pswpout rx tx "
-    "free buff cache swap_total")
+    "free buff cache swap_total swap_free mem_total")
+
+# One mount-point disk usage row.
+MountInfo = namedtuple("MountInfo",
+    "mount_point device fstype total used avail pct")
 
 # One rendered tree line + its selection metadata. Head rows (Proc/Group) are
 # selectable; detail/collapse-note rows are non-selectable continuation lines.
@@ -380,6 +393,42 @@ def collapse(procs, threshold=COLLAPSE_THRESHOLD, expanded=frozenset()):
     return suppressed, collapsible
 
 
+def find_breakouts(procs, suppressed, collapsible, page_size, promote_level,
+                   rss_needs_cpu):
+    """For each collapsible node, identify suppressed descendants that are
+    promoted (heavy CPU/RSS) and should break out as heads-up rows even when
+    the ancestor is collapsed. Returns (breakout_pids, breakout_map) where
+    breakout_map is {proc_id(ancestor): [Proc]} capped at BREAKOUT_MAX."""
+    kthreadd = procs.get(2)
+    kthread_pids = set()
+    if kthreadd is not None:
+        kthread_pids = {2} | {d.pid for d in _descendants(kthreadd)}
+    # Build lookup: proc_id -> Proc for collapsible ancestors
+    cid_to_proc = {}
+    for p in procs.values():
+        pid = proc_id(p)
+        if pid in collapsible:
+            cid_to_proc[pid] = p
+    breakout_map = {}
+    breakout_pids = set()
+    for cid, ancestor in cid_to_proc.items():
+        for d in _descendants(ancestor):
+            if d.pid not in suppressed or d.interesting:
+                continue
+            is_kthread = d.pid in kthread_pids
+            if is_promoted(d, page_size, promote_level, rss_needs_cpu, is_kthread):
+                breakout_map.setdefault(cid, []).append(d)
+                breakout_pids.add(d.pid)
+    # Cap per ancestor, sorted by total CPU ticks descending
+    for cid, bps in breakout_map.items():
+        bps.sort(key=lambda p: -(p.utime + p.stime))
+        if len(bps) > BREAKOUT_MAX:
+            for p in bps[BREAKOUT_MAX:]:
+                breakout_pids.discard(p.pid)
+            breakout_map[cid] = bps[:BREAKOUT_MAX]
+    return breakout_pids, breakout_map
+
+
 # --- pure core: socket parsing ----------------------------------------------
 
 
@@ -495,9 +544,9 @@ def parse_proc_stat_counters(content):
 
 
 def parse_meminfo(content):
-    """Parse /proc/meminfo. Return {free, buff, cache, swap_total} in BYTES
-    (meminfo is kB). Missing keys -> None (swap_total -> 0 so swap-off is the
-    safe default)."""
+    """Parse /proc/meminfo. Return {free, buff, cache, mem_total, swap_total,
+    swap_free} in BYTES (meminfo is kB). Missing keys -> None (swap_total -> 0
+    so swap-off is the safe default)."""
     raw = {}
     for line in content.splitlines():
         f = line.split()
@@ -507,7 +556,9 @@ def parse_meminfo(content):
             except ValueError:
                 pass
     return {"free": raw.get("MemFree"), "buff": raw.get("Buffers"),
-            "cache": raw.get("Cached"), "swap_total": raw.get("SwapTotal", 0)}
+            "cache": raw.get("Cached"), "mem_total": raw.get("MemTotal"),
+            "swap_total": raw.get("SwapTotal", 0),
+            "swap_free": raw.get("SwapFree")}
 
 
 def parse_vmstat_counters(content):
@@ -633,7 +684,8 @@ def read_vmstat_sample(t):
     stat = safe(lambda: parse_proc_stat_counters(_read("/proc/stat")),
                 parse_proc_stat_counters(""))
     mem = safe(lambda: parse_meminfo(_read("/proc/meminfo")),
-               {"free": None, "buff": None, "cache": None, "swap_total": 0})
+               {"free": None, "buff": None, "cache": None, "mem_total": None,
+                "swap_total": 0, "swap_free": None})
     vm = safe(lambda: parse_vmstat_counters(_read("/proc/vmstat")),
               {"pgpgin": None, "pgpgout": None, "pswpin": None, "pswpout": None})
     rx, tx = safe(lambda: parse_net_dev(_read("/proc/net/dev")), (None, None))
@@ -645,7 +697,8 @@ def read_vmstat_sample(t):
         intr=stat["intr"], ctxt=stat["ctxt"], pgpgin=vm["pgpgin"],
         pgpgout=vm["pgpgout"], pswpin=vm["pswpin"], pswpout=vm["pswpout"],
         rx=rx, tx=tx, free=mem["free"], buff=mem["buff"], cache=mem["cache"],
-        swap_total=mem["swap_total"])
+        swap_total=mem["swap_total"], swap_free=mem["swap_free"],
+        mem_total=mem["mem_total"])
 
 
 def fmt_count(n):
@@ -872,6 +925,104 @@ def format_lifecycle(born, died, parents, sysinfo, dt, color=False):
     return lines
 
 
+# --- disk pane ---------------------------------------------------------------
+
+
+_VIRTUAL_FS = frozenset({
+    "proc", "sysfs", "devtmpfs", "tmpfs", "cgroup", "cgroup2", "debugfs",
+    "tracefs", "securityfs", "binfmt_misc", "fusectl", "pstore", "bpf",
+    "mqueue", "configfs", "efivarfs", "hugetlbfs", "rpc_pipefs",
+    "fuse.gvfsd-fuse", "fuse.portal",
+    "squashfs", "overlay", "nsfs", "devpts", "autofs",
+})
+
+
+def read_mounts():
+    """Read /proc/mounts and return [(mount_point, device, fstype)] for real
+    filesystems (virtual/pseudo-fs filtered out)."""
+    try:
+        content = _read("/proc/mounts")
+    except OSError:
+        return []
+    out = []
+    for line in content.splitlines():
+        f = line.split()
+        if len(f) < 4:
+            continue
+        device, mount, fstype = f[0], f[1], f[2]
+        if fstype in _VIRTUAL_FS:
+            continue
+        if mount.startswith("/proc") or mount.startswith("/sys"):
+            continue
+        out.append((mount, device, fstype))
+    return out
+
+
+def statvfs_mount(mount_point):
+    """Return MountInfo for a mount point via os.statvfs, or None on failure."""
+    try:
+        s = os.statvfs(mount_point)
+    except OSError:
+        return None
+    total = s.f_blocks * s.f_frsize
+    free = s.f_bfree * s.f_frsize
+    avail = s.f_bavail * s.f_frsize
+    used = total - free
+    pct = (used / total * 100.0) if total > 0 else 0.0
+    return MountInfo(mount_point=mount_point, device="", fstype="",
+                     total=total, used=used, avail=avail, pct=pct)
+
+
+def read_disk_sample():
+    """Read mount points and statvfs each. Returns [MountInfo], sorted by
+    pct descending (most full first)."""
+    raw = read_mounts()
+    mounts = []
+    for mount_point, device, fstype in raw:
+        mi = statvfs_mount(mount_point)
+        if mi is not None:
+            mounts.append(MountInfo(
+                mount_point=mount_point, device=device, fstype=fstype,
+                total=mi.total, used=mi.used, avail=mi.avail, pct=mi.pct))
+    mounts.sort(key=lambda m: -m.pct)
+    return mounts
+
+
+def _disk_pct_tint(pct, color):
+    """Return tinted string for a disk usage percentage."""
+    s = "%d%%" % round(pct)
+    if not color:
+        return s
+    if pct >= DISK_USAGE_CRIT_PCT:
+        return "\x1b[1;31m%s\x1b[0m" % s
+    if pct >= DISK_USAGE_WARN_PCT:
+        return "\x1b[33m%s\x1b[0m" % s
+    return s
+
+
+def format_disk_pane(mounts, width, height, color):
+    """Render the disk space pane: header row + up to height-1 mount rows.
+    Each row: mount  used/total  pct  avail. Sorted by pct desc."""
+    gutter = DISK_PANE_GUTTER
+    pad = " " * len(gutter)
+    if not mounts or height <= 1:
+        return [gutter + "  MOUNT  USED/TOTAL  %USED  AVAIL"]
+    sorted_mounts = sorted(mounts, key=lambda m: -m.pct)
+    shown = sorted_mounts[:height - 1]
+    # Compute column widths
+    mount_w = max(len(m.mount_point) for m in shown)
+    mount_w = min(mount_w, max(20, width // 3))
+    header = gutter + "  " + "MOUNT".ljust(mount_w) + "  USED/TOTAL  %USED  AVAIL"
+    lines = [header]
+    for m in shown:
+        mp = m.mount_point[:mount_w].ljust(mount_w)
+        used_total = "%s/%s" % (fmt_bytes(m.used), fmt_bytes(m.total))
+        pct = _disk_pct_tint(m.pct, color)
+        avail = fmt_bytes(m.avail)
+        lines.append(pad + "  %s  %s  %s  %s" % (mp, used_total, pct, avail))
+    return lines
+
+
 # --- cache ------------------------------------------------------------------
 
 
@@ -1023,6 +1174,27 @@ def cores_count():
     """Number of online CPUs (for the header and for context, not for math —
     CPU figures are already in cores). Falls back to 1."""
     return os.cpu_count() or 1
+
+
+def read_loadavg():
+    """Return (load_1m, load_5m, load_15m, running, total) from /proc/loadavg.
+    Any unreadable field degrades to None. Format: '0.43 0.41 0.76 1/1101 662997'"""
+    try:
+        parts = _read("/proc/loadavg").split()
+        r_total = parts[3].split("/")
+        return (float(parts[0]), float(parts[1]), float(parts[2]),
+                int(r_total[0]), int(r_total[1]))
+    except (OSError, ValueError, IndexError):
+        return (None, None, None, None, None)
+
+
+def count_states(procs):
+    """Return (running, sleeping, zombie) task counts from a {pid: Proc} snapshot.
+    Pure function; no I/O."""
+    running = sum(1 for p in procs.values() if p.state == "R")
+    sleeping = sum(1 for p in procs.values() if p.state in ("S", "D", "I"))
+    zombie = sum(1 for p in procs.values() if p.state == "Z")
+    return running, sleeping, zombie
 
 
 def _parents_map(*snaps):
@@ -1531,7 +1703,8 @@ def subtree_window_cpu(node, widx):
 
 def build_rows(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
                dedup_min=None, never_merge=frozenset(), top_sort_key=None,
-               show_avg=False, expanded=frozenset(), collapsible=frozenset()):
+               show_avg=False, expanded=frozenset(), collapsible=frozenset(),
+               breakout_map=None):
     """Build the tree as Row records (text, item_id, expandable, selectable).
     Head rows (Proc/Group) are selectable; detail/collapse-note rows are
     continuation lines. A Group whose id is in `expanded` renders a header row
@@ -1581,6 +1754,18 @@ def build_rows(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
                            child_prefix, pid_id)
                 if item.collapsed and item.collapse_note:
                     emit(child_prefix + item.collapse_note)
+                # Breakout rows: hot procs that poke through the collapse
+                if (item.collapsed and breakout_map
+                        and proc_id(item) in breakout_map):
+                    for bp in breakout_map[proc_id(item)]:
+                        bp_line = "%s>> %d %s" % (
+                            child_prefix, bp.pid,
+                            compress_cmdline(bp.cmdline, width))
+                        emit(bp_line, item_id=proc_id(bp),
+                             expandable=False, selectable=True)
+                        bp_detail = _detail(bp, color, sysinfo, show_avg)
+                        if bp_detail is not None:
+                            emit(child_prefix + "   " + bp_detail)
 
     top_items = group_siblings(list(roots), dedup_min, never_merge)
     if top_sort_key is not None:
@@ -1593,13 +1778,15 @@ def build_rows(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
 
 def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
            dedup_min=None, never_merge=frozenset(), top_sort_key=None,
-           show_avg=False, expanded=frozenset(), collapsible=frozenset()):
+           show_avg=False, expanded=frozenset(), collapsible=frozenset(),
+           breakout_map=None):
     """Backward-compatible string view of build_rows (used by the once/piped
     path and by tests)."""
     return [r.text for r in build_rows(
         roots, suppressed, width=width, color=color, sysinfo=sysinfo,
         dedup_min=dedup_min, never_merge=never_merge, top_sort_key=top_sort_key,
-        show_avg=show_avg, expanded=expanded, collapsible=collapsible)]
+        show_avg=show_avg, expanded=expanded, collapsible=collapsible,
+        breakout_map=breakout_map)]
 
 
 # --- live UI state & viewport -----------------------------------------------
@@ -1613,6 +1800,7 @@ class UIState:
     frozen: bool = False
     sort_idx: int = 0
     vmstat_on: bool = True
+    disk_on: bool = True
 
 
 def selectable_ids(rows):
@@ -1691,23 +1879,42 @@ def present_viewport(rows, ui, height, color):
     return out, cursor, top
 
 
-def split_regions(rows, cols, vmstat_on, vmstat_rows_cap, sample_rows):
-    """Divide the screen height into (tree_region, vmstat_pane, show_pane).
-    One row is the pinned header. The pane (separator + header + k sample rows)
-    is shown only when the terminal clears the size thresholds, the user hasn't
-    toggled it off, and there is room to keep at least MIN_TREE_ROWS for the
-    tree and MIN_VMSTAT_SAMPLE_ROWS samples. sample_rows is how many rate rows
-    are actually available so a cold start doesn't reserve empty space."""
-    body = rows - 1
-    if (not vmstat_on or rows < MIN_ROWS_FOR_VMSTAT
-            or cols < MIN_COLS_FOR_VMSTAT):
-        return body, 0, False
-    k = min(vmstat_rows_cap, max(sample_rows, MIN_VMSTAT_SAMPLE_ROWS))
-    k = min(k, body - MIN_TREE_ROWS - 2)        # 2 = separator + pane header
-    if k < MIN_VMSTAT_SAMPLE_ROWS:
-        return body, 0, False
-    pane = 2 + k
-    return body - pane, pane, True
+def split_regions(rows, cols, vmstat_on, vmstat_rows_cap, sample_rows,
+                  disk_on=False, disk_rows_cap=0, disk_mounts_count=0):
+    """Divide the screen height into (tree_region, vmstat_pane_rows, disk_pane_rows,
+    show_vmstat, show_disk). One row is the pinned header. The vmstat pane
+    (separator + header + k sample rows) is shown only when the terminal clears
+    the size thresholds, the user hasn't toggled it off, and there is room.
+    The disk pane (separator + header + k mount rows) is shown below the vmstat
+    pane if toggled on and there is room. If terminal is too small, disk hides
+    first (lower priority than vmstat)."""
+    body = rows - 1  # header
+    vmstat_pane = 0
+    show_vmstat = False
+    disk_pane = 0
+    show_disk = False
+
+    # vmstat pane
+    if vmstat_on and rows >= MIN_ROWS_FOR_VMSTAT and cols >= MIN_COLS_FOR_VMSTAT:
+        k = min(vmstat_rows_cap, max(sample_rows, MIN_VMSTAT_SAMPLE_ROWS))
+        k = min(k, body - MIN_TREE_ROWS - 2)    # 2 = separator + pane header
+        if k >= MIN_VMSTAT_SAMPLE_ROWS:
+            vmstat_pane = 2 + k
+            show_vmstat = True
+
+    remaining = body - vmstat_pane
+
+    # disk pane (below vmstat, lower priority)
+    if (disk_on and rows >= MIN_ROWS_FOR_DISK and cols >= MIN_COLS_FOR_DISK
+            and disk_mounts_count > 0):
+        dk = min(disk_rows_cap, max(disk_mounts_count, 2))
+        dk = min(dk, remaining - MIN_TREE_ROWS - 2)
+        if dk >= 2:
+            disk_pane = 2 + dk
+            show_disk = True
+
+    tree_rows = body - vmstat_pane - disk_pane
+    return tree_rows, vmstat_pane, disk_pane, show_vmstat, show_disk
 
 
 def lifecycle_section(prev, cur, sysinfo, frame_dt, color):
@@ -1820,10 +2027,10 @@ def _read_key(fd):
 
 def run_live(args):
     """Full-screen live loop with a pinned header, a scrolling/cursored process
-    tree, and a pinned vmstat pane. Keys: q/Ctrl-C quit, f freeze, w sort window,
-    v toggle vmstat, ↑/k ↓/j move cursor, PgUp/PgDn page, g/G top/bottom,
-    Space/Enter expand-collapse the selected group/subtree. Terminal state is
-    always restored."""
+    tree, and pinned vmstat + disk panes. Keys: q/Ctrl-C quit, f freeze, w sort
+    window, v toggle vmstat, d toggle disk, E expand all groups, ↑/k ↓/j move
+    cursor, PgUp/PgDn page, g/G top/bottom, Space/Enter expand-collapse the
+    selected group/subtree. Terminal state is always restored."""
     fd = sys.stdin.fileno()
     out = sys.stdout
     old_attr = termios.tcgetattr(fd)
@@ -1831,7 +2038,7 @@ def run_live(args):
     longest = max(windows)
     history = {}
     vmring = []
-    ui = UIState(vmstat_on=not args.no_vmstat)
+    ui = UIState(vmstat_on=not args.no_vmstat, disk_on=not args.no_disk)
     sysinfo_cores = cores_count()
     vmhist = (vmstat_hist_new() if args.no_history
               else vmstat_hist_load(vmstat_hist_path(args)))
@@ -1840,31 +2047,52 @@ def run_live(args):
     vm_write_ctr = 0
     prev, t_prev = None, None
     cur, rows, sysinfo = {}, [], None
+    _last_live_keys = set()
+    disk_sample = None
 
     def repaint():
         """Re-present the current `rows` + vmstat ring without resampling (used
         after navigation/expand/freeze so input feels instant)."""
         cols, term_rows = os.get_terminal_size()
-        region_h, pane_h, show = split_regions(
-            term_rows, cols, ui.vmstat_on, args.vmstat_rows, len(vmcolored))
+        disk_mounts = disk_sample if disk_sample is not None else []
+        region_h, vmstat_h, disk_h, show_vmstat, show_disk = split_regions(
+            term_rows, cols, ui.vmstat_on, args.vmstat_rows, len(vmcolored),
+            disk_on=ui.disk_on, disk_rows_cap=args.disk_rows,
+            disk_mounts_count=len(disk_mounts))
         body, ui.cursor, ui.scroll_top = present_viewport(
             rows, ui, region_h, color=not args.no_color)
-        if show:
-            body += [""] * (region_h - len(body))   # pad so the pane pins to bottom
+        if show_vmstat or show_disk:
+            body += [""] * (region_h - len(body))   # pad so panes pin to bottom
+        n_run, n_sleep, n_zombie = count_states(cur)
+        hidden = sum(1 for p in cur.values() if not p.kept)
+        latest = vmring[-1] if vmring else None
+        mem_total = latest.mem_total if latest else None
+        mem_used = (mem_total - (latest.free or 0) - (latest.buff or 0)
+                    - (latest.cache or 0)) if mem_total and latest else None
+        swap_total = latest.swap_total if latest else None
+        swap_free = latest.swap_free if latest else None
         frame = [header_line((t_prev and (time.monotonic() - t_prev)) or 0.0,
-                             sysinfo, len(cur),
-                             sum(1 for p in cur.values() if not p.kept),
-                             args.sample_interval, ui.frozen)]
+                             sysinfo, len(cur), hidden, args.sample_interval,
+                             ui.frozen,
+                             loadavg=read_loadavg(),
+                             mem_total=mem_total, mem_used=mem_used,
+                             swap_total=swap_total, swap_free=swap_free,
+                             n_running=n_run, n_sleeping=n_sleep,
+                             n_zombie=n_zombie)]
         frame += body
-        if show:
+        if show_vmstat:
             swap_on = any(s.swap_total for s in vmring if s.swap_total)
             frame.append("─" * cols)
-            frame += format_vmstat_pane(vmcolored, swap_on, cols, pane_h - 1,
+            frame += format_vmstat_pane(vmcolored, swap_on, cols, vmstat_h - 1,
                                         color=not args.no_color)
+        if show_disk:
+            frame.append("─" * cols)
+            frame += format_disk_pane(disk_mounts, cols, disk_h - 1,
+                                      color=not args.no_color)
         _draw_frame(out, [visible_truncate(ln, cols) for ln in frame[:term_rows]])
 
     def sample_and_build():
-        nonlocal prev, t_prev, cur, rows, sysinfo, vm_write_ctr
+        nonlocal prev, t_prev, cur, rows, sysinfo, vm_write_ctr, _last_live_keys, disk_sample
         cur = scan()
         t_now = time.monotonic()
         update_history(history, cur, t_now, longest)
@@ -1884,9 +2112,10 @@ def run_live(args):
                 if not args.no_history and \
                         vm_write_ctr % VMSTAT_WRITE_EVERY == 0:
                     vmstat_hist_save(vmstat_hist_path(args), vmhist)
+        disk_sample = read_disk_sample()
         sysinfo = SysInfo(clk_tck=CLK_TCK, page_size=PAGE_SIZE,
                           uptime=read_uptime(), cores=sysinfo_cores)
-        visible_roots, suppressed, collapsible = prepare_frame(
+        visible_roots, suppressed, collapsible, breakout_map = prepare_frame(
             cur, args, sysinfo, expanded=ui.expanded)
         dedup_min = None if args.no_dedup else args.dedup_min
         key = lambda item: subtree_window_cpu(
@@ -1895,7 +2124,8 @@ def run_live(args):
                           color=not args.no_color, sysinfo=sysinfo,
                           dedup_min=dedup_min, never_merge=NEVER_MERGE,
                           top_sort_key=key, expanded=ui.expanded,
-                          collapsible=collapsible)
+                          collapsible=collapsible, breakout_map=breakout_map)
+        _last_live_keys = {(p.pid, p.starttime) for p in cur.values()}
         prev, t_prev = cur, t_now
 
     try:
@@ -1917,6 +2147,14 @@ def run_live(args):
                     ui.sort_idx = (ui.sort_idx + 1) % len(windows)
                 elif key == "v":
                     ui.vmstat_on = not ui.vmstat_on
+                elif key == "E":
+                    # Expand all group rows in the current view
+                    for r in rows:
+                        if r.expandable and r.item_id[0] == "g":
+                            ui.expanded.add(r.item_id)
+                    sample_and_build()
+                elif key == "d":
+                    ui.disk_on = not ui.disk_on
                 elif key in ("up", "k"):
                     ui.cursor = move_cursor(ids, ui.cursor, -1)
                 elif key in ("down", "j"):
@@ -1947,15 +2185,37 @@ def run_live(args):
             vmstat_hist_save(vmstat_hist_path(args), vmhist)
         if not args.no_cache:
             Cache(cache_path(), boot_id=read_boot_id(),
-                  now=time.time()).save(live_keys=set())
+                  now=time.time()).save(live_keys=_last_live_keys)
 
 
-def header_line(frame_dt, sysinfo, nprocs, hidden, interval, frozen=False):
-    """Top-style status line."""
+def header_line(frame_dt, sysinfo, nprocs, hidden, interval, frozen=False,
+                loadavg=None, mem_total=None, mem_used=None,
+                swap_total=None, swap_free=None,
+                n_running=0, n_sleeping=0, n_zombie=0):
+    """Top-style status line (two lines): system summary + procs/key hint."""
     state = "  FROZEN" if frozen else ""
-    return ("topf — %.2gs, %d cores, %d procs (%d hidden)   every %.2gs   "
-            "[q]uit [f]reeze [w]in [v]mstat [↑↓]nav [␣]expand%s"
-            % (frame_dt, sysinfo.cores, nprocs, hidden, interval, state))
+    parts = ["topf — %.2gs, %d cores" % (frame_dt, sysinfo.cores)]
+    if loadavg and loadavg[0] is not None:
+        parts.append("load %.2f/%.2f/%.2f" % (loadavg[0], loadavg[1], loadavg[2]))
+    if mem_total is not None:
+        mem_t = fmt_bytes(mem_total)
+        mem_u = fmt_bytes(mem_used) if mem_used is not None else "?"
+        parts.append("Mem: %s/%s" % (mem_u, mem_t))
+    if swap_total and swap_total > 0:
+        sw_used = swap_total - (swap_free or 0)
+        parts.append("Swap: %s/%s" % (fmt_bytes(sw_used), fmt_bytes(swap_total)))
+    line1 = "  ".join(parts)
+    task_parts = ["%d procs" % nprocs]
+    if n_running:
+        task_parts.append("%d run" % n_running)
+    if n_sleeping:
+        task_parts.append("%d sleep" % n_sleeping)
+    if n_zombie:
+        task_parts.append("%d zombie" % n_zombie)
+    task_parts.append("%d hidden" % hidden)
+    line2 = "(%s)  every %.2gs  [q]uit [f]reeze [w]in [v]mstat [d]isk [E]groups [↑↓]nav [␣]expand%s" \
+            % (", ".join(task_parts), interval, state)
+    return line1 + "\n" + line2
 
 
 def prepare_frame(cur, args, sysinfo, expanded=frozenset()):
@@ -1967,6 +2227,10 @@ def prepare_frame(cur, args, sysinfo, expanded=frozenset()):
            args.rss_needs_cpu)
     suppressed, collapsible = collapse(cur, threshold=args.threshold,
                                        expanded=expanded)
+    breakout_pids, breakout_map = find_breakouts(
+        cur, suppressed, collapsible, sysinfo.page_size,
+        args.promote_level, args.rss_needs_cpu)
+    suppressed -= breakout_pids
     visible_roots = [r for r in roots if r.kept]
     printed = [n for n in collect_printed(visible_roots, suppressed) if n.kept]
     if args.no_cache:
@@ -1976,30 +2240,49 @@ def prepare_frame(cur, args, sysinfo, expanded=frozenset()):
     probe(printed, cache)
     if not args.no_cache:
         cache.save(live_keys={(p.pid, p.starttime) for p in cur.values()})
-    return visible_roots, suppressed, collapsible
+    return visible_roots, suppressed, collapsible, breakout_map
 
 
 def build_frame(prev, cur, history, t_prev, t_now, args, color, sysinfo,
-                sort_idx, show_avg, frozen=False):
+                sort_idx, show_avg, frozen=False, expanded=frozenset(),
+                vmring=None):
     """Pure-ish assembly of one frame's lines (no clipping, no terminal I/O):
     tree (ordered) + optional lifecycle, with a header on top. `prev` may be
     None (first frame / once-mode primes). `history` already updated & windows
-    already computed for `cur`. Returns a list of lines."""
-    visible_roots, suppressed, collapsible = prepare_frame(cur, args, sysinfo)
+    already computed for `cur`. Returns a list of lines. `vmring` supplies the
+    latest meminfo for the header (read fresh if None)."""
+    visible_roots, suppressed, collapsible, breakout_map = prepare_frame(
+        cur, args, sysinfo, expanded=expanded)
     dedup_min = None if args.no_dedup else args.dedup_min
     key = lambda item: subtree_window_cpu(
         item.members[0] if isinstance(item, Group) else item, sort_idx)
 
     frame_dt = (t_now - t_prev) if prev is not None else 0.0
     hidden = sum(1 for p in cur.values() if not p.kept)
+    n_run, n_sleep, n_zombie = count_states(cur)
+    # meminfo for header: prefer latest vmstat sample, else read fresh
+    if vmring:
+        latest = vmring[-1]
+    else:
+        latest = read_vmstat_sample(time.monotonic())
+    mem_total = latest.mem_total
+    mem_used = (mem_total - (latest.free or 0) - (latest.buff or 0)
+                - (latest.cache or 0)) if mem_total else None
     out = [header_line(frame_dt, sysinfo, len(cur), hidden,
-                       args.sample_interval, frozen)]
+                       args.sample_interval, frozen,
+                       loadavg=read_loadavg(),
+                       mem_total=mem_total, mem_used=mem_used,
+                       swap_total=latest.swap_total,
+                       swap_free=latest.swap_free,
+                       n_running=n_run, n_sleeping=n_sleep,
+                       n_zombie=n_zombie)]
     if not args.no_glossary:
         out += [""] + glossary(color)
     out += [""]
     out += render(visible_roots, suppressed, width=args.width, color=color,
                   sysinfo=sysinfo, dedup_min=dedup_min, never_merge=NEVER_MERGE,
-                  top_sort_key=key, show_avg=show_avg, collapsible=collapsible)
+                  top_sort_key=key, show_avg=show_avg, collapsible=collapsible,
+                  breakout_map=breakout_map)
     if prev is not None and not args.no_lifecycle:
         born, died = diff_snapshots(prev, cur)
         section = format_lifecycle(born, died, _parents_map(prev, cur),
@@ -2032,16 +2315,12 @@ def render_once(interval, args):
 
 
 def _once_defaults():
-    """A defaults namespace for render_once in tests."""
-    import types
-    return types.SimpleNamespace(
-        width=CMD_WIDTH, threshold=COLLAPSE_THRESHOLD, no_cache=True,
-        no_color=True, no_glossary=False, sample_interval=REFRESH_INTERVAL,
-        no_dedup=False, dedup_min=DEDUP_MIN, no_lifecycle=False,
-        windows=DEFAULT_WINDOWS, promote_level=PROMOTE_LEVEL,
-        rss_needs_cpu=True, no_vmstat=False, vmstat_rows=VMSTAT_ROWS_DEFAULT,
-        history_file=None, no_history=True,
-        vmstat_halflife=VMSTAT_HALFLIFE_DEFAULT)
+    """A defaults namespace for render_once in tests. Derived from _parse_args
+    so new flags appear automatically; only overrides test-oriented defaults."""
+    ns = _parse_args([])
+    ns.no_cache = True
+    ns.no_color = True
+    return ns
 
 
 def parse_windows(text):
@@ -2106,6 +2385,11 @@ def _parse_args(argv):
                     default=VMSTAT_HALFLIFE_DEFAULT,
                     help="samples for a vmstat coloring weight to halve "
                          "(default %d)" % VMSTAT_HALFLIFE_DEFAULT)
+    ap.add_argument("--no-disk", action="store_true",
+                    help="start with the disk space pane hidden (toggle: d)")
+    ap.add_argument("--disk-rows", type=int, default=DISK_ROWS_DEFAULT,
+                    help="max mount rows in the disk pane (default %d)"
+                         % DISK_ROWS_DEFAULT)
     args = ap.parse_args(argv)
     if args.vmstat_halflife < 1:
         ap.error("--vmstat-halflife must be a positive integer")
