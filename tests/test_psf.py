@@ -154,3 +154,15 @@ def test_find_new_clusters_ignores_small_spawns():
     clusters = psf.find_new_clusters(cur, prev, categories)
     # Only 3 procs, below CLUSTER_MIN=5
     assert clusters == []
+
+
+# --- smoke test --------------------------------------------------------------
+
+
+def test_render_once_psf_smoke():
+    """Linux-only: run against real /proc, verify non-empty output."""
+    args = psf._parse_args([])
+    lines = psf.render_once_psf(args)
+    assert isinstance(lines, list) and lines
+    # Header should contain 'psf'
+    assert any("psf" in ln for ln in lines)

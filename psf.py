@@ -259,3 +259,255 @@ def find_new_clusters(cur, prev, categories):
             cat = categories.get(members[0].pid, CAT_BY_NAME["misc"])
             lines.append("+%d new: %s [%s]" % (len(members), comm, cat.badge))
     return lines
+
+
+# --- render -----------------------------------------------------------------
+
+
+def psf_header(sysinfo, procs, categories):
+    """Two-line header: system summary + task breakdown."""
+    loadavg = read_loadavg()
+    n_run, n_sleep, n_zombie = count_states(procs)
+    # meminfo
+    try:
+        mem = parse_meminfo(_read_text("/proc/meminfo"))
+    except Exception:
+        mem = {}
+    mem_total = mem.get("mem_total")
+    mem_used = None
+    if mem_total is not None:
+        mem_used = mem_total - (mem.get("free") or 0) - (mem.get("buff") or 0) \
+                   - (mem.get("cache") or 0)
+    swap_total = mem.get("swap_total", 0)
+    swap_free = mem.get("swap_free")
+
+    parts = ["psf — %d cores" % sysinfo.cores]
+    if loadavg and loadavg[0] is not None:
+        parts.append("load %.2f/%.2f/%.2f" % (loadavg[0], loadavg[1], loadavg[2]))
+    if mem_total is not None:
+        parts.append("Mem: %s/%s" % (fmt_bytes(mem_used), fmt_bytes(mem_total)))
+    if swap_total and swap_total > 0:
+        sw_used = swap_total - (swap_free or 0)
+        parts.append("Swap: %s/%s" % (fmt_bytes(sw_used), fmt_bytes(swap_total)))
+    line1 = "  ".join(parts)
+    task_parts = ["%d procs" % len(procs)]
+    if n_run:
+        task_parts.append("%d run" % n_run)
+    if n_sleep:
+        task_parts.append("%d sleep" % n_sleep)
+    if n_zombie:
+        task_parts.append("%d zombie" % n_zombie)
+    line2 = "(%s)" % ", ".join(task_parts)
+    return line1 + "\n" + line2
+
+
+def _proc_detail(proc, sysinfo, venv=None, show_venv=False):
+    """One-line detail for a process: cpu rss up [venv]."""
+    bits = []
+    life = lifetime_secs(proc.starttime, sysinfo.uptime, sysinfo.clk_tck)
+    avg = cpu_fraction(proc.utime + proc.stime, life, sysinfo.clk_tck)
+    bits.append("cpu %s" % (fmt_pct(avg) or "—"))
+    rss = proc.rss_pages * sysinfo.page_size
+    if rss > 0:
+        bits.append("rss %s" % fmt_bytes(rss))
+    bits.append("up %s" % fmt_duration(life))
+    if proc.num_threads > 1:
+        bits.append("%d threads" % proc.num_threads)
+    if (show_venv or venv) and venv:
+        bits.append("venv:%s" % compress_path(venv))
+    return "  ".join(bits)
+
+
+def _group_detail(members, sysinfo, cat):
+    """Aggregated detail for a category group of children."""
+    bits = ["×%d" % len(members)]
+    # CPU range
+    avgs = []
+    for m in members:
+        life = lifetime_secs(m.starttime, sysinfo.uptime, sysinfo.clk_tck)
+        a = cpu_fraction(m.utime + m.stime, life, sysinfo.clk_tck)
+        if a is not None:
+            avgs.append(a)
+    if avgs:
+        lo, hi = min(avgs), max(avgs)
+        cpu = fmt_pct(lo) if lo == hi else "%s–%s" % (fmt_pct(lo), fmt_pct(hi))
+        bits.append("cpu %s" % cpu)
+    # RSS range
+    rss_vals = [m.rss_pages * sysinfo.page_size for m in members if m.rss_pages > 0]
+    if rss_vals:
+        if min(rss_vals) == max(rss_vals):
+            bits.append("rss %s" % fmt_bytes(min(rss_vals)))
+        else:
+            bits.append("rss %s–%s" % (fmt_bytes(min(rss_vals)),
+                                         fmt_bytes(max(rss_vals))))
+    # Pids
+    pids = sorted(m.pid for m in members)
+    if len(pids) <= 4:
+        bits.append("pids " + " ".join(str(x) for x in pids))
+    else:
+        bits.append("pids %s +%d" % (" ".join(str(x) for x in pids[:4]),
+                                       len(pids) - 4))
+    return "  ".join(bits)
+
+
+def _children_by_category(children, categories):
+    """Group children by category, return [(Category, [Proc])] sorted by
+    priority desc."""
+    buckets = {}
+    for c in children:
+        cat = categories.get(c.pid, CAT_BY_NAME["misc"])
+        buckets.setdefault(cat, []).append(c)
+    return sorted(buckets.items(), key=lambda kv: (-kv[0].priority, kv[0].name))
+
+
+def render_session(session, sysinfo, args, categories, venv_map):
+    """Render one session as lines: leader + categorized children."""
+    leader = session.leader
+    cat = session.category
+    venv = session.venv or (venv_map.get(leader.pid) if venv_map else None)
+    lines = []
+    # Leader line: [badge] pid comm  detail
+    leader_line = "[%s] %d %s" % (
+        cat.badge, leader.pid,
+        compress_cmdline(leader.cmdline, args.width))
+    detail = _proc_detail(leader, sysinfo, venv=venv, show_venv=args.venv)
+    if detail:
+        leader_line += "  " + detail
+    lines.append(leader_line)
+    # Children, grouped by category
+    by_cat = _children_by_category(session.children, categories)
+    for child_cat, members in by_cat:
+        if child_cat.name in ("infrastructure", "system-service") and not args.show_all:
+            # Summarize glue within a session as a count
+            lines.append("  ├─ [%s] %s×%d (summarized)" % (
+                child_cat.badge,
+                Counter(m.comm for m in members).most_common(1)[0][0],
+                len(members)))
+            continue
+        # Group by comm within the category
+        comm_groups = {}
+        for m in members:
+            comm_groups.setdefault(m.comm, []).append(m)
+        for comm, comm_members in sorted(comm_groups.items()):
+            if len(comm_members) >= 3 and not args.show_all:
+                # Collapsed group
+                detail = _group_detail(comm_members, sysinfo, child_cat)
+                lines.append("  ├─ [%s] %s %s" % (
+                    child_cat.badge, comm, detail))
+            else:
+                for m in comm_members:
+                    m_venv = venv_map.get(m.pid) if venv_map else None
+                    m_line = "  ├─ [%s] %d %s" % (
+                        child_cat.badge, m.pid,
+                        compress_cmdline(m.cmdline, args.width))
+                    m_detail = _proc_detail(m, sysinfo, venv=m_venv,
+                                            show_venv=args.venv)
+                    if m_detail:
+                        m_line += "  " + m_detail
+                    lines.append(m_line)
+    return lines
+
+
+def render_psf(procs, sysinfo, args, prev=None):
+    """Build the output lines for psf: header + sessions + glue + clusters."""
+    # Deep-probe exe for all processes (psf needs exe for venv detection
+    # and classification, not just for printed ones like topf)
+    venv_map = {}
+    for p in procs.values():
+        p.cwd, p.exe = read_links(p.pid)
+        if p.comm.startswith("python"):
+            venv_map[p.pid] = detect_venv(p)
+
+    # Classify all processes
+    venv_resolver = detect_venv if not args.show_all else detect_venv
+    categories = {}
+    for p in procs.values():
+        categories[p.pid] = classify(p, venv_resolver=venv_resolver)
+
+    # Find sessions
+    sessions = find_sessions(procs, categories, venv_map)
+    session_pids = set()
+    for s in sessions:
+        session_pids.add(s.leader.pid)
+        session_pids.update(d.pid for d in s.children)
+
+    # Build header
+    lines = [psf_header(sysinfo, procs, categories), ""]
+
+    # Render each session
+    for session in sessions:
+        lines += render_session(session, sysinfo, args, categories, venv_map)
+        lines.append("")
+
+    # Glue summaries
+    glue = summarize_glue(procs, categories, session_pids)
+    if glue:
+        lines += glue
+        lines.append("")
+
+    # New-process clusters
+    clusters = find_new_clusters(procs, prev, categories)
+    if clusters:
+        lines += clusters
+        lines.append("")
+
+    # Strip trailing blank lines
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+# --- CLI --------------------------------------------------------------------
+
+
+def _parse_args(argv):
+    ap = argparse.ArgumentParser(prog="psf",
+                                 description="Process session finder.")
+    ap.add_argument("-w", "--width", type=int, default=CMD_WIDTH,
+                    help="cmdline chars per process (default %d)" % CMD_WIDTH)
+    ap.add_argument("--once", action="store_true",
+                    help="single snapshot and exit (default when piped)")
+    ap.add_argument("--watch", action="store_true",
+                    help="continuous refresh mode (simple reprint)")
+    ap.add_argument("--interval", type=float, default=2.0,
+                    help="refresh interval in seconds (default 2.0)")
+    ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--show-all", action="store_true",
+                    help="show every process, not just sessions + glue")
+    ap.add_argument("--venv", action="store_true",
+                    help="always show venv for python processes")
+    return ap.parse_args(argv)
+
+
+def render_once_psf(args):
+    """Take a single snapshot and return lines."""
+    procs = scan()
+    sysinfo = SysInfo(clk_tck=CLK_TCK, page_size=PAGE_SIZE,
+                      uptime=read_uptime(), cores=cores_count())
+    return render_psf(procs, sysinfo, args)
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    use_once = args.once or not sys.stdout.isatty()
+    if use_once:
+        lines = render_once_psf(args)
+        print("\n".join(lines))
+        return
+    # --watch mode: simple reprint loop
+    color = not args.no_color
+    prev = None
+    try:
+        while True:
+            lines = render_once_psf(args)
+            if color and sys.stdout.isatty():
+                sys.stdout.write("\x1b[H\x1b[J")
+            print("\n".join(lines))
+            sys.stdout.flush()
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
