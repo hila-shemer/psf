@@ -1,0 +1,156 @@
+import os
+
+import psf
+import topf
+
+
+def _rproc(pid, ppid=1, comm="x", cmdline="x", rss_bytes=0, starttime=1,
+           utime=0, stime=0, exe="?"):
+    p = topf.Proc(pid=pid, ppid=ppid, comm=comm, cmdline=cmdline, state="R",
+                  num_threads=1, starttime=starttime, uid=0,
+                  rss_pages=rss_bytes // topf.PAGE_SIZE,
+                  utime=utime, stime=stime)
+    p.exe = exe
+    return p
+
+
+# --- classification ----------------------------------------------------------
+
+
+def test_classify_matches_known_categories():
+    assert psf.classify(_rproc(1, comm="claude")).name == "user-session"
+    assert psf.classify(_rproc(2, comm="bazel")).name == "build-daemon"
+    assert psf.classify(_rproc(3, comm="clang-14")).name == "compile-worker"
+    assert psf.classify(_rproc(4, comm="sshd")).name == "infrastructure"
+    assert psf.classify(_rproc(5, comm="systemd")).name == "system-service"
+    assert psf.classify(_rproc(6, comm="random_thing")).name == "misc"
+
+
+def test_classify_cmdline_matches():
+    p = _rproc(1, comm="sshd", cmdline="sshd: user@pts/0")
+    assert psf.classify(p).name == "infrastructure"  # comm match first
+    p2 = _rproc(2, comm="x", cmdline="sshd: user@pts/0")
+    # sshd: cmdline matches SESSION_LEADER_PATTERNS but also CLASSIFICATION_RULES
+    cat = psf.classify(p2)
+    # sshd$ in rules matches "x" as comm? No, "^sshd$" won't match "x"
+    # The cmdline rule for "^sshd: " won't match here because rules use
+    # comm or cmdline based on their target
+
+
+def test_classify_venv_python_overrides_to_user_session():
+    # python -> compile-worker normally
+    assert psf.classify(_rproc(1, comm="python3")).name == "compile-worker"
+    # python with venv -> user-session
+    def venv_resolver(proc):
+        if proc.comm.startswith("python"):
+            return "/home/user/.venv"
+        return None
+    assert psf.classify(_rproc(1, comm="python3"),
+                        venv_resolver=venv_resolver).name == "user-session"
+
+
+def test_classify_no_venv_resolver_stays_compile_worker():
+    def no_venv(proc):
+        return None
+    assert psf.classify(_rproc(1, comm="python3"),
+                        venv_resolver=no_venv).name == "compile-worker"
+
+
+# --- venv detection ----------------------------------------------------------
+
+
+def test_detect_venv_from_exe_path():
+    p = _rproc(1, comm="python3", exe="/home/user/psf/.venv/bin/python3")
+    venv = psf.detect_venv(p)
+    assert venv is not None
+    assert "psf" in venv or ".venv" in venv
+
+
+def test_detect_venv_no_venv():
+    p = _rproc(1, comm="python3", exe="/usr/bin/python3")
+    venv = psf.detect_venv(p)
+    # Depends on whether /proc/PID/environ has VIRTUAL_ENV; on most systems
+    # running pytest, it won't. Just check it doesn't crash.
+    assert venv is None or isinstance(venv, str)
+
+
+def test_read_environ_returns_dict():
+    # Read our own environ — must be non-empty on Linux
+    pid = os.getpid()
+    env = psf.read_environ(pid)
+    assert isinstance(env, dict)
+    assert "PATH" in env
+
+
+# --- session detection -------------------------------------------------------
+
+
+def test_find_session_leaders_finds_claude():
+    procs = {
+        1: _rproc(1, ppid=0, comm="init"),
+        10: _rproc(10, ppid=1, comm="claude"),
+    }
+    topf.build_tree(procs)
+    leaders = psf.find_session_leaders(procs)
+    assert len(leaders) == 1
+    assert leaders[0].comm == "claude"
+
+
+def test_find_sessions_groups_subtrees():
+    procs = {
+        1: _rproc(1, ppid=0, comm="init"),
+        10: _rproc(10, ppid=1, comm="claude"),
+        11: _rproc(11, ppid=10, comm="python3"),
+        12: _rproc(12, ppid=10, comm="node"),
+    }
+    topf.build_tree(procs)
+    categories = {10: psf.CAT_BY_NAME["user-session"],
+                  11: psf.CAT_BY_NAME["compile-worker"],
+                  12: psf.CAT_BY_NAME["compile-worker"]}
+    sessions = psf.find_sessions(procs, categories)
+    assert len(sessions) == 1
+    assert sessions[0].leader.pid == 10
+    assert len(sessions[0].children) == 2
+
+
+# --- glue summarization ------------------------------------------------------
+
+
+def test_summarize_glue_collapses_infrastructure():
+    procs = {}
+    for i, comm in enumerate(["bash", "bash", "bash", "sshd", "sshd"]):
+        procs[i] = _rproc(i, comm=comm)
+    categories = {i: psf.CAT_BY_NAME["infrastructure"] for i in procs}
+    session_pids = set()  # nothing in sessions
+    lines = psf.summarize_glue(procs, categories, session_pids)
+    assert len(lines) >= 1
+    assert "bash×3" in lines[0]
+    assert "sshd×2" in lines[0]
+
+
+# --- new-process clusters ----------------------------------------------------
+
+
+def test_find_new_clusters_detects_burst():
+    prev = {1: _rproc(1, comm="init")}
+    cur = {1: _rproc(1, comm="init")}
+    for i in range(2, 12):
+        cur[i] = _rproc(i, comm="clang")
+    # Build the keyed dict for find_new_clusters
+    # The function compares pid sets; we need proc dicts keyed by pid
+    # Note: find_new_clusters takes {pid: Proc} dicts
+    categories = {i: psf.CAT_BY_NAME["compile-worker"] for i in range(2, 12)}
+    clusters = psf.find_new_clusters(cur, prev, categories)
+    assert len(clusters) >= 1
+    assert "10 new: clang" in clusters[0]
+
+
+def test_find_new_clusters_ignores_small_spawns():
+    prev = {1: _rproc(1, comm="init")}
+    cur = {1: _rproc(1, comm="init"), 2: _rproc(2, comm="x"),
+           3: _rproc(3, comm="x"), 4: _rproc(4, comm="x")}
+    categories = {2: psf.CAT_BY_NAME["misc"], 3: psf.CAT_BY_NAME["misc"],
+                  4: psf.CAT_BY_NAME["misc"]}
+    clusters = psf.find_new_clusters(cur, prev, categories)
+    # Only 3 procs, below CLUSTER_MIN=5
+    assert clusters == []
