@@ -1,4 +1,5 @@
 import os
+import types as _types
 
 import topf
 
@@ -284,3 +285,150 @@ def test_cache_get_expires_with_advancing_now(tmp_path):
     # a stale fd count also misses
     c4 = topf.Cache(path=path, boot_id="b", now=105.0, ttl=30)
     assert c4.get(5, 1, 99) is None
+
+
+# --- vmstat parsing ---------------------------------------------------------
+
+
+def test_parse_proc_stat_counters_basic():
+    txt = ("cpu  100 5 30 1000 20 1 2 0 0 0\n"
+           "cpu0 50 2 15 500 10 0 1 0 0 0\n"
+           "intr 12345 0 0\n"
+           "ctxt 67890\n"
+           "procs_running 3\n"
+           "procs_blocked 1\n")
+    c = topf.parse_proc_stat_counters(txt)
+    assert c["cpu_user"] == 100 and c["cpu_nice"] == 5
+    assert c["cpu_system"] == 30 and c["cpu_idle"] == 1000 and c["cpu_iowait"] == 20
+    assert c["cpu_total"] == 100 + 5 + 30 + 1000 + 20 + 1 + 2  # all fields on the cpu line
+    assert c["intr"] == 12345 and c["ctxt"] == 67890
+    assert c["procs_running"] == 3 and c["procs_blocked"] == 1
+
+
+def test_parse_proc_stat_counters_missing_fields_are_none():
+    c = topf.parse_proc_stat_counters("cpu 1 1 1 1 1\n")
+    assert c["intr"] is None and c["procs_blocked"] is None
+
+
+def test_parse_meminfo_to_bytes():
+    txt = "MemFree:  1024 kB\nBuffers: 2048 kB\nCached: 4096 kB\nSwapTotal: 0 kB\n"
+    m = topf.parse_meminfo(txt)
+    assert m["free"] == 1024 * 1024 and m["buff"] == 2048 * 1024
+    assert m["cache"] == 4096 * 1024 and m["swap_total"] == 0
+
+
+def test_parse_vmstat_counters_basic():
+    txt = "pgpgin 10\npgpgout 20\npswpin 3\npswpout 4\nnr_free_pages 999\n"
+    v = topf.parse_vmstat_counters(txt)
+    assert v["pgpgin"] == 10 and v["pgpgout"] == 20
+    assert v["pswpin"] == 3 and v["pswpout"] == 4
+
+
+def test_parse_net_dev_sums_excluding_lo():
+    txt = ("Inter-|   Receive                    |  Transmit\n"
+           " face |bytes    packets ... |bytes    packets ...\n"
+           "    lo: 500 1 0 0 0 0 0 0 600 1 0 0 0 0 0 0\n"
+           "  eth0: 1000 5 0 0 0 0 0 0 2000 7 0 0 0 0 0 0\n"
+           "  eth1: 30 1 0 0 0 0 0 0 40 1 0 0 0 0 0 0\n")
+    rx, tx = topf.parse_net_dev(txt)
+    assert rx == 1000 + 30 and tx == 2000 + 40   # lo excluded
+
+
+# --- vmstat sample model ----------------------------------------------------
+
+
+def _vs(t, **kw):
+    base = dict(procs_running=0, procs_blocked=0, cpu_user=0, cpu_nice=0,
+                cpu_system=0, cpu_idle=0, cpu_iowait=0, cpu_total=0, intr=0,
+                ctxt=0, pgpgin=0, pgpgout=0, pswpin=0, pswpout=0, rx=0, tx=0,
+                free=0, buff=0, cache=0, swap_total=0, swap_free=None,
+                mem_total=None)
+    base.update(kw)
+    return topf.VmstatSample(t=t, **base)
+
+
+def test_vmstat_rate_rows_deltas_per_second():
+    a = _vs(0.0, pgpgin=0, pgpgout=0, rx=0, tx=0, intr=0, ctxt=0,
+            cpu_user=0, cpu_total=0, procs_running=2)
+    b = _vs(2.0, pgpgin=2048, pgpgout=0, rx=4000, tx=8000, intr=200, ctxt=400,
+            cpu_user=50, cpu_total=100, procs_running=3)
+    rows = topf.vmstat_rate_rows([a, b])
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["r"] == 3                       # instantaneous (from newest)
+    assert row["bi"] == 2048 * 1024 / 2.0      # pgpgin kB -> bytes/s
+    assert row["ni"] == 4000 / 2.0 and row["no"] == 8000 / 2.0
+    assert row["in"] == 200 / 2.0 and row["cs"] == 400 / 2.0
+    assert row["us"] == 50.0                    # 50 of 100 total jiffies -> 50%
+
+
+def test_vmstat_rate_rows_needs_two_samples():
+    assert topf.vmstat_rate_rows([_vs(0.0)]) == []
+
+
+def test_vmstat_rate_rows_none_counter_gives_none_cell():
+    a = _vs(0.0, intr=None)
+    b = _vs(1.0, intr=None)
+    assert topf.vmstat_rate_rows([a, b])[0]["in"] is None
+
+
+def test_fmt_count():
+    assert topf.fmt_count(0) == "0"
+    assert topf.fmt_count(950) == "950"
+    assert topf.fmt_count(9100) == "9.1k"
+    assert topf.fmt_count(44000) == "44k"
+    assert topf.fmt_count(None) == "—"
+
+
+# --- vmstat pane rendering --------------------------------------------------
+
+
+def _rate_row(**kw):
+    row = {k: 0 for k, _h, _ki in topf.VMSTAT_COLS}
+    row.update(kw)
+    return row
+
+
+# --- row identities & collapse/expand ---------------------------------------
+
+
+def _kept(p):
+    p.kept = True
+    return p
+
+
+# --- breakout rows ----------------------------------------------------------
+
+
+# --- expand-all-groups key --------------------------------------------------
+
+
+# --- build_rows / render wrapper --------------------------------------------
+
+
+# --- viewport presenter -----------------------------------------------------
+
+
+def _rows(n_select):
+    # n_select selectable head rows, each with a non-selectable detail line
+    rows = []
+    for i in range(n_select):
+        rows.append(topf.Row("head%d" % i, ("p", i, 1),
+                             expandable=(i % 2 == 0), selectable=True))
+        rows.append(topf.Row("  detail%d" % i, ("p", i, 1), False, False))
+    return rows
+
+
+# --- region layout ----------------------------------------------------------
+
+
+# --- disk pane --------------------------------------------------------------
+
+
+# --- key decoder ------------------------------------------------------------
+
+
+# --- CLI flags --------------------------------------------------------------
+
+
+# --- header enrichment ------------------------------------------------------

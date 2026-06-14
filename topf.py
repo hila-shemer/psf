@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 # --- config -----------------------------------------------------------------
 
 CMD_WIDTH = 50            # chars of cmdline shown per process
-COLLAPSE_THRESHOLD = 30   # kept-descendant count above which a subtree collapses
+COLLAPSE_THRESHOLD = 90   # kept-descendant count above which a subtree collapses
 CACHE_TTL = 30            # seconds before a cached socket entry is re-probed
 REPR_COMMS = 4            # distinct comms named in a collapse summary
 SAMPLE_INTERVAL = 0.2     # seconds slept to measure current CPU (0 disables)
@@ -50,10 +50,40 @@ LIFECYCLE_MAX = 40        # max born (and max died) comm-groups listed
 TINT_SGR = ("2", "2;33", "33", "1;31")          # dim, dim-yellow, yellow, bold-red
 RSS_TINT_ANCHORS = (100 * 1024**2, 1024**3, 5 * 1024**3)   # 100M, 1G, 5G
 CPU_TINT_ANCHORS = (0.10, 1.0, 4.0)                        # 10%, 100%, 400%
+
 DEFAULT_WINDOWS = (2.0, 10.0, 60.0)   # CPU window seconds (shortest..longest)
 PROMOTE_LEVEL = 2         # tint-anchor level required to promote (>= 1.0 core / >= 1G)
 RSS_GATE_LEVEL = 1        # longest-window CPU floor for RSS-only promotion (~10%)
+BREAKOUT_MAX = 5          # max hot procs that poke through a collapsed subtree
 REFRESH_INTERVAL = 1.0    # default sample == redraw cadence (seconds)
+
+# vmstat pane: columns (key, header, kind), kind in {int, bytes, bps, count, pct}.
+# si/so are dropped when swap is off; the four cpu cols are us/sy/id/wa (the
+# "rest" — nice already folded into us, plus irq/steal/guest — is not shown).
+VMSTAT_COLS = [
+    ("r", "r", "int"), ("b", "b", "int"),
+    ("free", "free", "bytes"), ("buff", "buff", "bytes"), ("cache", "cache", "bytes"),
+    ("si", "si", "bps"), ("so", "so", "bps"),
+    ("bi", "bi", "bps"), ("bo", "bo", "bps"),
+    ("ni", "ni", "bps"), ("no", "no", "bps"),
+    ("in", "in", "count"), ("cs", "cs", "count"),
+    ("us", "us", "pct"), ("sy", "sy", "pct"), ("id", "id", "pct"), ("wa", "wa", "pct"),
+]
+SWAP_KEYS = frozenset({"si", "so"})
+VMSTAT_GUTTER = "vmstat"
+MIN_ROWS_FOR_VMSTAT = 18      # terminal rows below which the pane is hidden
+MIN_COLS_FOR_VMSTAT = 60      # terminal cols below which the pane is hidden
+MIN_TREE_ROWS = 5             # tree region never shrinks below this for the pane
+MIN_VMSTAT_SAMPLE_ROWS = 3    # fewer pane sample rows than this -> hide the pane
+VMSTAT_ROWS_DEFAULT = 12      # default cap on pane sample rows
+
+# disk pane: mount-point usage, similar layout to vmstat.
+DISK_PANE_GUTTER = "diskfs"
+MIN_ROWS_FOR_DISK = 18       # terminal rows below which the disk pane hides
+MIN_COLS_FOR_DISK = 60       # terminal cols below which the disk pane hides
+DISK_ROWS_DEFAULT = 10       # default cap on mount rows
+DISK_USAGE_WARN_PCT = 80     # pct above which a mount gets warm tint
+DISK_USAGE_CRIT_PCT = 95     # pct above which a mount gets red tint
 
 # System constants, read once. CLK_TCK converts stat jiffies -> seconds;
 # PAGE_SIZE converts stat rss (in pages) -> bytes.
@@ -69,6 +99,24 @@ Stat = namedtuple("Stat", "comm state ppid num_threads starttime "
 
 # A merged set of >= DEDUP_MIN near-identical sibling Procs.
 Group = namedtuple("Group", "members")
+
+# One vmstat sample: raw /proc counters at monotonic time t. Any field may be
+# None if /proc lacked it; rates are deltas between adjacent samples.
+VmstatSample = namedtuple("VmstatSample",
+    "t procs_running procs_blocked cpu_user cpu_nice cpu_system cpu_idle "
+    "cpu_iowait cpu_total intr ctxt pgpgin pgpgout pswpin pswpout rx tx "
+    "free buff cache swap_total swap_free mem_total")
+
+# One mount-point disk usage row.
+MountInfo = namedtuple("MountInfo",
+    "mount_point device fstype total used avail pct")
+
+# One rendered tree line + its selection metadata. Head rows (Proc/Group) are
+# selectable; detail/collapse-note rows are non-selectable continuation lines.
+Row = namedtuple("Row", "text item_id expandable selectable")
+
+# Sentinel parent id for the top-level sibling set (see group_id / build_rows).
+ROOT_ID = ("root",)
 
 # Each matcher: (label, target, regex) where target is "comm" or "cmdline".
 DEFAULT_MATCHERS = [
@@ -377,6 +425,195 @@ def format_sockets(inodes, netmap):
     return "  ".join(parts)
 
 
+# --- pure core: vmstat parsing ----------------------------------------------
+
+
+def parse_proc_stat_counters(content):
+    """Parse the bits of /proc/stat we need into a flat dict. cpu_total is the
+    sum of ALL fields on the aggregate 'cpu' line (so the dropped irq/steal/...
+    time still counts toward the denominator). Absent lines -> None values."""
+    out = {"cpu_user": None, "cpu_nice": None, "cpu_system": None,
+           "cpu_idle": None, "cpu_iowait": None, "cpu_total": None,
+           "intr": None, "ctxt": None,
+           "procs_running": None, "procs_blocked": None}
+    for line in content.splitlines():
+        f = line.split()
+        if not f:
+            continue
+        if f[0] == "cpu":
+            nums = [int(x) for x in f[1:]]
+            out["cpu_total"] = sum(nums)
+            names = ["cpu_user", "cpu_nice", "cpu_system", "cpu_idle", "cpu_iowait"]
+            for i, name in enumerate(names):
+                out[name] = nums[i] if i < len(nums) else None
+        elif f[0] == "intr":
+            out["intr"] = int(f[1])
+        elif f[0] == "ctxt":
+            out["ctxt"] = int(f[1])
+        elif f[0] == "procs_running":
+            out["procs_running"] = int(f[1])
+        elif f[0] == "procs_blocked":
+            out["procs_blocked"] = int(f[1])
+    return out
+
+
+def parse_meminfo(content):
+    """Parse /proc/meminfo. Return {free, buff, cache, mem_total, swap_total,
+    swap_free} in BYTES (meminfo is kB). Missing keys -> None (swap_total -> 0
+    so swap-off is the safe default)."""
+    raw = {}
+    for line in content.splitlines():
+        f = line.split()
+        if len(f) >= 2 and f[0].endswith(":"):
+            try:
+                raw[f[0][:-1]] = int(f[1]) * 1024     # kB -> bytes
+            except ValueError:
+                pass
+    return {"free": raw.get("MemFree"), "buff": raw.get("Buffers"),
+            "cache": raw.get("Cached"), "mem_total": raw.get("MemTotal"),
+            "swap_total": raw.get("SwapTotal", 0),
+            "swap_free": raw.get("SwapFree")}
+
+
+def parse_vmstat_counters(content):
+    """Parse /proc/vmstat 'name value' lines for the page/swap counters we use."""
+    want = ("pgpgin", "pgpgout", "pswpin", "pswpout")
+    out = {k: None for k in want}
+    for line in content.splitlines():
+        f = line.split()
+        if len(f) >= 2 and f[0] in out:
+            out[f[0]] = int(f[1])
+    return out
+
+
+def parse_net_dev(content):
+    """Sum rx/tx bytes across all interfaces except loopback. /proc/net/dev has
+    two header lines; each data line is 'iface: rxbytes ... txbytes ...' with rx
+    bytes in column 0 and tx bytes in column 8 after the colon. Returns
+    (rx_total, tx_total) bytes."""
+    rx = tx = 0
+    for line in content.splitlines()[2:]:
+        if ":" not in line:
+            continue
+        name, _, rest = line.partition(":")
+        if name.strip() == "lo":
+            continue
+        f = rest.split()
+        if len(f) < 9:
+            continue
+        rx += int(f[0])
+        tx += int(f[8])
+    return rx, tx
+
+
+# --- pure core: vmstat sampling ---------------------------------------------
+
+
+def _d(a, b):
+    """a-b, or None if either operand is None."""
+    return None if a is None or b is None else a - b
+
+
+def _delta_rate(cur, prev, dt, scale=1.0):
+    """(cur-prev)*scale/dt, or None if either counter is None."""
+    if cur is None or prev is None:
+        return None
+    return (cur - prev) * scale / dt
+
+
+def _vmstat_row(prev, cur, dt):
+    """One vmstat rate-row dict (column key -> number or None) from an adjacent
+    sample pair. Levels (r/b/free/buff/cache) come from the newer sample;
+    byte/count columns are per-second deltas; cpu columns are a share of the
+    total jiffie delta as a percentage. us folds nice into user (vmstat
+    convention). Any missing counter yields None for that cell."""
+    cpu_dtot = _d(cur.cpu_total, prev.cpu_total)
+
+    def pct(cur_a, prev_a, cur_b=None, prev_b=None):
+        if not cpu_dtot:                       # None or 0
+            return None
+        num = _d(cur_a, prev_a)
+        if num is None:
+            return None
+        if cur_b is not None or prev_b is not None:
+            extra = _d(cur_b, prev_b)
+            if extra is None:
+                return None
+            num += extra
+        return num / cpu_dtot * 100.0
+
+    return {
+        "r": cur.procs_running, "b": cur.procs_blocked,
+        "free": cur.free, "buff": cur.buff, "cache": cur.cache,
+        "si": _delta_rate(cur.pswpin, prev.pswpin, dt, PAGE_SIZE),
+        "so": _delta_rate(cur.pswpout, prev.pswpout, dt, PAGE_SIZE),
+        "bi": _delta_rate(cur.pgpgin, prev.pgpgin, dt, 1024),
+        "bo": _delta_rate(cur.pgpgout, prev.pgpgout, dt, 1024),
+        "ni": _delta_rate(cur.rx, prev.rx, dt),
+        "no": _delta_rate(cur.tx, prev.tx, dt),
+        "in": _delta_rate(cur.intr, prev.intr, dt),
+        "cs": _delta_rate(cur.ctxt, prev.ctxt, dt),
+        "us": pct(cur.cpu_user, prev.cpu_user, cur.cpu_nice, prev.cpu_nice),
+        "sy": pct(cur.cpu_system, prev.cpu_system),
+        "id": pct(cur.cpu_idle, prev.cpu_idle),
+        "wa": pct(cur.cpu_iowait, prev.cpu_iowait),
+    }
+
+
+def vmstat_rate_rows(ring):
+    """Turn a ring of VmstatSamples (ascending t) into one rate-row dict per
+    adjacent pair. Pairs with non-positive dt are skipped. < 2 samples -> []."""
+    rows = []
+    for prev, cur in zip(ring, ring[1:]):
+        dt = cur.t - prev.t
+        if dt <= 0:
+            continue
+        rows.append(_vmstat_row(prev, cur, dt))
+    return rows
+
+
+def read_vmstat_sample(t):
+    """I/O: read the four /proc files once and assemble a VmstatSample at
+    monotonic time t. Any unreadable file degrades to None fields, never raises."""
+    def safe(fn, default):
+        try:
+            return fn()
+        except (OSError, ValueError, IndexError):
+            return default
+    stat = safe(lambda: parse_proc_stat_counters(_read("/proc/stat")),
+                parse_proc_stat_counters(""))
+    mem = safe(lambda: parse_meminfo(_read("/proc/meminfo")),
+               {"free": None, "buff": None, "cache": None, "mem_total": None,
+                "swap_total": 0, "swap_free": None})
+    vm = safe(lambda: parse_vmstat_counters(_read("/proc/vmstat")),
+              {"pgpgin": None, "pgpgout": None, "pswpin": None, "pswpout": None})
+    rx, tx = safe(lambda: parse_net_dev(_read("/proc/net/dev")), (None, None))
+    return VmstatSample(
+        t=t, procs_running=stat["procs_running"], procs_blocked=stat["procs_blocked"],
+        cpu_user=stat["cpu_user"], cpu_nice=stat["cpu_nice"],
+        cpu_system=stat["cpu_system"], cpu_idle=stat["cpu_idle"],
+        cpu_iowait=stat["cpu_iowait"], cpu_total=stat["cpu_total"],
+        intr=stat["intr"], ctxt=stat["ctxt"], pgpgin=vm["pgpgin"],
+        pgpgout=vm["pgpgout"], pswpin=vm["pswpin"], pswpout=vm["pswpout"],
+        rx=rx, tx=tx, free=mem["free"], buff=mem["buff"], cache=mem["cache"],
+        swap_total=mem["swap_total"], swap_free=mem["swap_free"],
+        mem_total=mem["mem_total"])
+
+
+def fmt_count(n):
+    """Compact decimal-SI count: 950 -> '950', 9100 -> '9.1k', 44000 -> '44k'.
+    None -> em dash."""
+    if n is None:
+        return "—"
+    if n < 1000:
+        return "%d" % n
+    val = float(n)
+    for unit in ("k", "M", "G", "T"):
+        val /= 1000.0
+        if val < 1000 or unit == "T":
+            return "%.1f%s" % (val, unit) if val < 10 else "%d%s" % (round(val), unit)
+
+
 # --- pure core: resource stats ----------------------------------------------
 
 
@@ -585,6 +822,18 @@ def format_lifecycle(born, died, parents, sysinfo, dt, color=False):
     if color:
         lines = ["\x1b[2m%s\x1b[0m" % ln for ln in lines]
     return lines
+
+
+# --- disk pane ---------------------------------------------------------------
+
+
+_VIRTUAL_FS = frozenset({
+    "proc", "sysfs", "devtmpfs", "tmpfs", "cgroup", "cgroup2", "debugfs",
+    "tracefs", "securityfs", "binfmt_misc", "fusectl", "pstore", "bpf",
+    "mqueue", "configfs", "efivarfs", "hugetlbfs", "rpc_pipefs",
+    "fuse.gvfsd-fuse", "fuse.portal",
+    "squashfs", "overlay", "nsfs", "devpts", "autofs",
+})
 
 
 # --- cache ------------------------------------------------------------------
@@ -868,6 +1117,7 @@ def _tint_level(value, anchors):
     return sum(1 for a in anchors if value >= a)
 
 
+
 def _cpu_bit(windows_fracs, avg_frac=None):
     """Format a per-window CPU headline: 'cpu 400% 200% 50%' (one figure per
     window; None -> '—'). Tint level = max _tint_level across the non-None
@@ -1090,6 +1340,9 @@ def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
         top_items.sort(key=top_sort_key, reverse=True)
     walk_items(top_items, "")
     return lines
+
+
+# --- live UI state & viewport -----------------------------------------------
 
 
 def glossary(color):
