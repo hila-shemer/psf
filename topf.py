@@ -646,6 +646,21 @@ def _vmstat_row(prev, cur, dt):
     }
 
 
+def vmstat_colored_row(prev_s, cur_s, dt, hist, d, cores):
+    """Build one (rate_row, levels) pair from an adjacent sample pair and fold
+    the row into `hist`. Each cell's level is computed against the histogram as
+    it stands (absolute ceiling + high-tail percentile), THEN the value is folded
+    in — a value is judged against history, then becomes part of it. levels[k] is
+    0..3 (frozen). Mutates `hist`."""
+    row = _vmstat_row(prev_s, cur_s, dt)
+    levels = {}
+    for k, _h, ki in VMSTAT_COLS:
+        val = row.get(k)
+        levels[k] = vmstat_cell_level(k, ki, val, hist[k], cores)
+        vmstat_hist_fold(hist[k], val, ki, d)        # fold AFTER reading level
+    return row, levels
+
+
 def vmstat_rate_rows(ring):
     """Turn a ring of VmstatSamples (ascending t) into one rate-row dict per
     adjacent pair. Pairs with non-positive dt are skipped. < 2 samples -> []."""
@@ -1377,6 +1392,33 @@ def vmstat_relative_level(col, value, kind):
         return 0
     c = vmstat_cdf(col, value, kind)
     return sum(1 for a in VMSTAT_PCT_ANCHORS if c >= a)
+
+
+def vmstat_ceiling_level(key, value, cores):
+    """Objective-extreme minimum tint for the machine-independent columns
+    (VMSTAT_CEILING); 0 for any other column or a None value. 'low' columns tint
+    as the value drops; 'high'/'high_cores' as it rises ('high_cores' scales the
+    thresholds by the core count)."""
+    spec = VMSTAT_CEILING.get(key)
+    if spec is None or value is None:
+        return 0
+    mode, t2, t3 = spec
+    if mode == "low":
+        if value <= t3:
+            return 3
+        return 2 if value <= t2 else 0
+    if mode == "high_cores":
+        t2, t3 = t2 * cores, t3 * cores
+    if value >= t3:
+        return 3
+    return 2 if value >= t2 else 0
+
+
+def vmstat_cell_level(key, kind, value, col, cores):
+    """Final tint 0..3 for a cell: the stronger of the absolute ceiling and the
+    history-relative percentile level."""
+    return max(vmstat_ceiling_level(key, value, cores),
+               vmstat_relative_level(col, value, kind))
 
 
 def format_vmstat_pane(colored_rows, swap_on, width, height, color):
