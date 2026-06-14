@@ -2140,9 +2140,6 @@ def lifecycle_section(prev, cur, sysinfo, frame_dt, color):
                             frame_dt, color=color)
 
 
-# --- live UI state & viewport -----------------------------------------------
-
-
 def glossary(color):
     """A short legend printed at the head of the output explaining the
     annotations (notably what '+N est' means). Returns a list of lines."""
