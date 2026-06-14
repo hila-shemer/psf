@@ -824,6 +824,37 @@ def test_main_parses_vmstat_flags():
     assert ns2.no_vmstat is False and ns2.vmstat_rows == topf.VMSTAT_ROWS_DEFAULT
 
 
+# --- vmstat history-grounded coloring ---------------------------------------
+
+
+def test_vmstat_bucket_zero_and_negative():
+    assert topf.vmstat_bucket(0, "bps") == 0
+    assert topf.vmstat_bucket(-5, "count") == 0
+    assert topf.vmstat_bucket(None, "pct") == 0
+
+
+def test_vmstat_bucket_monotonic_and_clamped():
+    # within range, larger value -> same-or-higher bucket, never out of [1, N-1]
+    last = 0
+    for v in (1, 5, 50, 100):
+        b = topf.vmstat_bucket(v, "pct")
+        assert 1 <= b <= topf.VMSTAT_NBUCKETS - 1
+        assert b >= last
+        last = b
+    # above hi clamps to the top bucket
+    assert topf.vmstat_bucket(10 ** 12, "bps") == topf.VMSTAT_NBUCKETS - 1
+    # at/below lo lands in bucket 1
+    assert topf.vmstat_bucket(1, "bps") == 1
+    assert topf.vmstat_bucket(0.5, "bps") == 1   # positive but below lo -> clamped to 1
+
+
+def test_vmstat_hist_new_shape():
+    state = topf.vmstat_hist_new()
+    assert set(state) == {k for k, _h, _ki in topf.VMSTAT_COLS}
+    assert state["us"]["count"] == 0
+    assert state["us"]["hist"] == [0.0] * topf.VMSTAT_NBUCKETS
+
+
 def test_once_defaults_have_vmstat_fields():
     d = topf._once_defaults()
     assert hasattr(d, "no_vmstat") and hasattr(d, "vmstat_rows")
