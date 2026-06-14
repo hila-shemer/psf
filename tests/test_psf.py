@@ -156,6 +156,89 @@ def test_find_new_clusters_ignores_small_spawns():
     assert clusters == []
 
 
+# --- path snapshot -----------------------------------------------------------
+
+
+def test_path_is_in_subtree_matches_root_and_children(tmp_path):
+    root = tmp_path / "foo"
+    child = root / "bar"
+    peer = tmp_path / "foobar"
+    child.mkdir(parents=True)
+    peer.mkdir()
+    norm = psf.normalize_path_target(str(root))
+    assert psf._path_is_in_subtree(str(root), norm)
+    assert psf._path_is_in_subtree(str(child), norm)
+    assert not psf._path_is_in_subtree(str(peer), norm)
+    assert not psf._path_is_in_subtree("socket:[123]", norm)
+
+
+def test_proc_path_hits_finds_cwd_exe_fd_and_maps(tmp_path):
+    root = tmp_path / "foo"
+    root.mkdir()
+    p = _rproc(10, comm="python3", cmdline="python script.py",
+               exe=str(root / "bin" / "python"))
+    p.cwd = str(root)
+    fd_path = str(root / "data.txt")
+    maps_path = str(root / "lib.so")
+    root_norm = psf.normalize_path_target(str(root))
+
+    def fake_listdir(path):
+        assert path.endswith("/10/fd")
+        return ["3"]
+
+    def fake_readlink(path):
+        assert path.endswith("/10/fd/3")
+        return fd_path
+
+    def fake_maps(pid):
+        assert pid == 10
+        return "7f r--p 0000 00:00 0 %s\n" % maps_path
+
+    hits = psf.proc_path_hits(p, root_norm, readlink=fake_readlink,
+                              listdir=fake_listdir, read_maps=fake_maps,
+                              fd_kind=lambda pid, fd: "fd:%s file" % fd)
+    rendered = [(h.kind, h.path) for h in hits]
+    assert ("cwd", str(root)) in rendered
+    assert ("exe", str(root / "bin" / "python")) in rendered
+    assert ("fd:3 file", fd_path) in rendered
+    assert ("mmap", maps_path) in rendered
+
+
+def test_render_psf_path_filters_to_touching_processes(monkeypatch, tmp_path):
+    root = tmp_path / "foo"
+    root.mkdir()
+    procs = {
+        1: _rproc(1, ppid=0, comm="init", cmdline="init"),
+        10: _rproc(10, ppid=1, comm="claude", cmdline="claude"),
+        11: _rproc(11, ppid=10, comm="python3", cmdline="python worker.py"),
+        20: _rproc(20, ppid=1, comm="bash", cmdline="bash"),
+    }
+    topf.build_tree(procs)
+    procs[10].cwd = "/tmp"
+    procs[10].exe = "/usr/bin/claude"
+    procs[11].cwd = str(root)
+    procs[11].exe = "/usr/bin/python3"
+    procs[20].cwd = "/tmp"
+    procs[20].exe = "/usr/bin/bash"
+
+    monkeypatch.setattr(psf, "read_links",
+                        lambda pid: (procs[pid].cwd, procs[pid].exe))
+    monkeypatch.setattr(psf, "read_environ", lambda pid: {})
+    monkeypatch.setattr(psf, "proc_path_hits",
+                        lambda p, norm: [psf.PathHit("cwd", "", p.cwd)]
+                        if p.pid == 11 else [])
+
+    args = psf._parse_args(["--path", str(root)])
+    sysinfo = topf.SysInfo(clk_tck=topf.CLK_TCK, page_size=topf.PAGE_SIZE,
+                           uptime=100.0, cores=1)
+    text = "\n".join(psf.render_psf(procs, sysinfo, args))
+    assert "touching" in text
+    assert "claude" in text
+    assert "python worker.py" in text
+    assert "cwd:" in text
+    assert "bash" not in text
+
+
 # --- smoke test --------------------------------------------------------------
 
 
