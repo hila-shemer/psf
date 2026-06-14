@@ -50,10 +50,6 @@ def _read_bin(path):
 # --- config -----------------------------------------------------------------
 
 CMD_WIDTH = 60           # chars of cmdline shown per process
-GLUE_COMMS = frozenset({
-    "sshd", "bash", "zsh", "sh", "dash", "tmux", "login", "systemd",
-    "systemd-user", "dbus-daemon", "cron", "agetty",
-})
 SESSION_LEADER_PATTERNS = [
     ("comm", re.compile(r"claude")),
     ("cmdline", re.compile(r"^sshd: ")),
@@ -414,7 +410,7 @@ def _format_path_hits(hits):
     return "  ".join(bits)
 
 
-def _proc_detail(proc, sysinfo, venv=None, show_venv=False, path_hits=None):
+def _proc_detail(proc, sysinfo, venv=None, path_hits=None):
     """One-line detail for a process: cpu rss up [venv] [path hits]."""
     bits = []
     life = lifetime_secs(proc.starttime, sysinfo.uptime, sysinfo.clk_tck)
@@ -426,14 +422,14 @@ def _proc_detail(proc, sysinfo, venv=None, show_venv=False, path_hits=None):
     bits.append("up %s" % fmt_duration(life))
     if proc.num_threads > 1:
         bits.append("%d threads" % proc.num_threads)
-    if (show_venv or venv) and venv:
+    if venv:
         bits.append("venv:%s" % compress_path(venv))
     if path_hits:
         bits.append(_format_path_hits(path_hits))
     return "  ".join(bits)
 
 
-def _group_detail(members, sysinfo, cat):
+def _group_detail(members, sysinfo):
     """Aggregated detail for a category group of children."""
     bits = ["×%d" % len(members)]
     # CPU range
@@ -486,7 +482,7 @@ def render_session(session, sysinfo, args, categories, venv_map, path_hits=None)
     leader_line = "[%s] %d %s" % (
         cat.badge, leader.pid,
         compress_cmdline(leader.cmdline, args.width))
-    detail = _proc_detail(leader, sysinfo, venv=venv, show_venv=args.venv,
+    detail = _proc_detail(leader, sysinfo, venv=venv,
                           path_hits=path_hits.get(leader.pid))
     if detail:
         leader_line += "  " + detail
@@ -508,7 +504,7 @@ def render_session(session, sysinfo, args, categories, venv_map, path_hits=None)
         for comm, comm_members in sorted(comm_groups.items()):
             if len(comm_members) >= 3 and not args.show_all:
                 # Collapsed group
-                detail = _group_detail(comm_members, sysinfo, child_cat)
+                detail = _group_detail(comm_members, sysinfo)
                 lines.append("  ├─ [%s] %s %s" % (
                     child_cat.badge, comm, detail))
             else:
@@ -518,7 +514,6 @@ def render_session(session, sysinfo, args, categories, venv_map, path_hits=None)
                         child_cat.badge, m.pid,
                         compress_cmdline(m.cmdline, args.width))
                     m_detail = _proc_detail(m, sysinfo, venv=m_venv,
-                                            show_venv=args.venv,
                                             path_hits=path_hits.get(m.pid))
                     if m_detail:
                         m_line += "  " + m_detail
@@ -537,7 +532,6 @@ def render_path_process(proc, sysinfo, args, categories, venv_map, path_hits):
     line = "[%s] %d %s" % (cat.badge, proc.pid,
                             compress_cmdline(proc.cmdline, args.width))
     detail = _proc_detail(proc, sysinfo, venv=venv_map.get(proc.pid),
-                          show_venv=args.venv,
                           path_hits=path_hits.get(proc.pid))
     if detail:
         line += "  " + detail
@@ -555,7 +549,7 @@ def render_psf(procs, sysinfo, args, prev=None):
             venv_map[p.pid] = detect_venv(p)
 
     # Classify all processes
-    venv_resolver = detect_venv if not args.show_all else detect_venv
+    venv_resolver = detect_venv
     categories = {}
     for p in procs.values():
         categories[p.pid] = classify(p, venv_resolver=venv_resolver)
@@ -638,8 +632,6 @@ def _parse_args(argv):
     ap.add_argument("--no-color", action="store_true")
     ap.add_argument("--show-all", action="store_true",
                     help="show every process, not just sessions + glue")
-    ap.add_argument("--venv", action="store_true",
-                    help="always show venv for python processes")
     return ap.parse_args(argv)
 
 
