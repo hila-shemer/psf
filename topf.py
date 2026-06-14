@@ -836,6 +836,92 @@ _VIRTUAL_FS = frozenset({
 })
 
 
+def read_mounts():
+    """Read /proc/mounts and return [(mount_point, device, fstype)] for real
+    filesystems (virtual/pseudo-fs filtered out)."""
+    try:
+        content = _read("/proc/mounts")
+    except OSError:
+        return []
+    out = []
+    for line in content.splitlines():
+        f = line.split()
+        if len(f) < 4:
+            continue
+        device, mount, fstype = f[0], f[1], f[2]
+        if fstype in _VIRTUAL_FS:
+            continue
+        if mount.startswith("/proc") or mount.startswith("/sys"):
+            continue
+        out.append((mount, device, fstype))
+    return out
+
+
+def statvfs_mount(mount_point):
+    """Return MountInfo for a mount point via os.statvfs, or None on failure."""
+    try:
+        s = os.statvfs(mount_point)
+    except OSError:
+        return None
+    total = s.f_blocks * s.f_frsize
+    free = s.f_bfree * s.f_frsize
+    avail = s.f_bavail * s.f_frsize
+    used = total - free
+    pct = (used / total * 100.0) if total > 0 else 0.0
+    return MountInfo(mount_point=mount_point, device="", fstype="",
+                     total=total, used=used, avail=avail, pct=pct)
+
+
+def read_disk_sample():
+    """Read mount points and statvfs each. Returns [MountInfo], sorted by
+    pct descending (most full first)."""
+    raw = read_mounts()
+    mounts = []
+    for mount_point, device, fstype in raw:
+        mi = statvfs_mount(mount_point)
+        if mi is not None:
+            mounts.append(MountInfo(
+                mount_point=mount_point, device=device, fstype=fstype,
+                total=mi.total, used=mi.used, avail=mi.avail, pct=mi.pct))
+    mounts.sort(key=lambda m: -m.pct)
+    return mounts
+
+
+def _disk_pct_tint(pct, color):
+    """Return tinted string for a disk usage percentage."""
+    s = "%d%%" % round(pct)
+    if not color:
+        return s
+    if pct >= DISK_USAGE_CRIT_PCT:
+        return "\x1b[1;31m%s\x1b[0m" % s
+    if pct >= DISK_USAGE_WARN_PCT:
+        return "\x1b[33m%s\x1b[0m" % s
+    return s
+
+
+def format_disk_pane(mounts, width, height, color):
+    """Render the disk space pane: header row + up to height-1 mount rows.
+    Each row: mount  used/total  pct  avail. Sorted by pct desc."""
+    gutter = DISK_PANE_GUTTER
+    pad = " " * len(gutter)
+    if not mounts or height <= 1:
+        return [gutter + "  MOUNT  USED/TOTAL  %USED  AVAIL"]
+    sorted_mounts = sorted(mounts, key=lambda m: -m.pct)
+    shown = sorted_mounts[:height - 1]
+    # Compute column widths
+    mount_w = max(len(m.mount_point) for m in shown)
+    mount_w = min(mount_w, max(20, width // 3))
+    header = gutter + "  " + "MOUNT".ljust(mount_w) + "  USED/TOTAL  %USED  AVAIL"
+    lines = [header]
+    for m in shown:
+        mp = m.mount_point[:mount_w].ljust(mount_w)
+        used_total = "%s/%s" % (fmt_bytes(m.used), fmt_bytes(m.total))
+        pct = _disk_pct_tint(m.pct, color)
+        avail = fmt_bytes(m.avail)
+        lines.append(pad + "  %s  %s  %s  %s" % (mp, used_total, pct, avail))
+    return lines
+
+
 # --- cache ------------------------------------------------------------------
 
 
@@ -1116,6 +1202,59 @@ def _tint_level(value, anchors):
         return 0
     return sum(1 for a in anchors if value >= a)
 
+
+
+def _fmt_vmstat_cell(value, kind):
+    if value is None:
+        return "—"
+    if kind == "int":
+        return "%d" % value
+    if kind in ("bytes", "bps"):
+        return fmt_bytes(value)
+    if kind == "count":
+        return fmt_count(value)
+    if kind == "pct":
+        return "%d" % round(value)
+    return str(value)
+
+
+def format_vmstat_pane(colored_rows, swap_on, width, height, color):
+    """Render the pinned vmstat pane: a header row of column names plus up to
+    height-1 data rows (oldest..newest, top..bottom), columns right-aligned to
+    their content, each data cell tinted by its *precomputed* level. colored_rows
+    is a list of (rate_row dict, levels dict) — levels[k] is 0..3 indexing
+    TINT_SGR and was frozen when the row was sampled, so scrolling never recolors.
+    swap_on=False drops si/so. No data rows -> header only (stable layout)."""
+    cols = [(k, h, ki) for (k, h, ki) in VMSTAT_COLS
+            if swap_on or k not in SWAP_KEYS]
+    shown = colored_rows[-(height - 1):] if height > 1 else []
+
+    formatted = {k: [_fmt_vmstat_cell(r.get(k), ki) for r, _lv in shown]
+                 for (k, _h, ki) in cols}
+    colw = {k: max(len(h), max((len(c) for c in formatted[k]), default=0))
+            for (k, h, _ki) in cols}
+
+    gutter = VMSTAT_GUTTER
+    pad = " " * len(gutter)
+
+    def join_cells(cell_strs):
+        return "  ".join(s.rjust(colw[k]) for (k, _h, _ki), s in
+                         zip(cols, cell_strs))
+
+    lines = [gutter + "  " + join_cells([h for (_k, h, _ki) in cols])]
+
+    for ri, (_r, lv) in enumerate(shown):
+        cells = []
+        for (k, _h, _ki) in cols:
+            cell = formatted[k][ri]
+            lpad = " " * (colw[k] - len(cell))       # right-align padding
+            if color:
+                level = lv.get(k, 0)
+                if level:
+                    cell = "\x1b[%sm%s\x1b[0m" % (TINT_SGR[level], cell)
+            cells.append(lpad + cell)                # pad OUTSIDE the SGR wrap
+        lines.append(pad + "  " + "  ".join(cells))
+    return lines
 
 
 def _cpu_bit(windows_fracs, avg_frac=None):

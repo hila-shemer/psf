@@ -389,6 +389,69 @@ def _rate_row(**kw):
     return row
 
 
+def test_format_vmstat_pane_header_and_swap_off():
+    row = _rate_row(free=3 * 1024**3, bi=0, ni=1024**2)
+    row["in"] = 9100
+    lines = topf.format_vmstat_pane([(row, {})], swap_on=False, width=200,
+                                    height=4, color=False)
+    header = lines[0]
+    assert header.startswith(topf.VMSTAT_GUTTER)
+    assert " si " not in header and " so " not in header
+    assert " ni " in header and " no " in header
+    assert " us " in header and " id " in header
+
+
+def test_format_vmstat_pane_swap_on_includes_si_so():
+    lines = topf.format_vmstat_pane([(_rate_row(), {})], swap_on=True, width=200,
+                                    height=3, color=False)
+    assert " si " in lines[0] and " so " in lines[0]
+
+
+def test_format_vmstat_pane_uses_human_units():
+    row = _rate_row(free=2 * 1024**3, ni=4 * 1024**2)
+    lines = topf.format_vmstat_pane([(row, {})], swap_on=False, width=200,
+                                    height=3, color=False)
+    body = lines[-1]
+    assert "2.0G" in body and "4.0M" in body
+
+
+def test_format_vmstat_pane_dashes_when_empty():
+    lines = topf.format_vmstat_pane([], swap_on=False, width=200, height=3,
+                                    color=False)
+    assert lines and lines[0].startswith(topf.VMSTAT_GUTTER)
+    assert len(lines) == 1
+
+
+def test_format_vmstat_pane_tints_from_supplied_levels():
+    row = _rate_row(us=99)
+    lines = topf.format_vmstat_pane([(row, {"us": 3})], swap_on=False,
+                                    width=200, height=3, color=True)
+    assert "\x1b[%sm" % topf.TINT_SGR[3] in lines[-1]   # bold-red wrap present
+
+
+def test_format_vmstat_pane_level0_cells_not_wrapped():
+    row = _rate_row(us=99, sy=10)
+    lines = topf.format_vmstat_pane([(row, {"us": 3})], swap_on=False,
+                                    width=200, height=3, color=True)
+    # only the single tinted cell carries SGR: one open + one reset escape
+    assert lines[-1].count("\x1b[") == 2
+
+
+def test_format_vmstat_pane_oldest_at_top():
+    older = _rate_row(cs=111)
+    newer = _rate_row(cs=222)
+    lines = topf.format_vmstat_pane([(older, {}), (newer, {})], swap_on=False,
+                                    width=200, height=4, color=False)
+    assert "111" in lines[1] and "222" in lines[2]   # oldest first, below header
+
+
+def test_format_vmstat_pane_height_one_is_header_only():
+    row = _rate_row(us=50)
+    lines = topf.format_vmstat_pane([(row, {})], swap_on=False, width=200,
+                                    height=1, color=False)
+    assert len(lines) == 1                            # height<=1 -> header only
+
+
 # --- row identities & collapse/expand ---------------------------------------
 
 
@@ -423,6 +486,25 @@ def _rows(n_select):
 
 
 # --- disk pane --------------------------------------------------------------
+
+
+def test_format_disk_pane_sorts_by_pct():
+    mounts = [
+        topf.MountInfo("/a", "", "", total=100, used=10, avail=90, pct=10.0),
+        topf.MountInfo("/b", "", "", total=100, used=90, avail=10, pct=90.0),
+        topf.MountInfo("/c", "", "", total=100, used=50, avail=50, pct=50.0),
+    ]
+    lines = topf.format_disk_pane(mounts, width=120, height=4, color=False)
+    # First data row should be /b (highest pct)
+    assert "/b" in lines[1]
+
+
+def test_format_disk_pane_tints_high_usage():
+    mounts = [
+        topf.MountInfo("/full", "", "", total=100, used=97, avail=3, pct=97.0),
+    ]
+    lines = topf.format_disk_pane(mounts, width=120, height=3, color=True)
+    assert "\x1b[1;31m" in lines[1]   # critical tint
 
 
 # --- key decoder ------------------------------------------------------------
