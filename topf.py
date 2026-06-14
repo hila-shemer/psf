@@ -48,6 +48,8 @@ LIFECYCLE_MAX = 40        # max born (and max died) comm-groups listed
 # tint, then full color, then bold red so heavy consumers pop. CPU anchors are
 # in cores (1.0 == one full core / 100%, independent of how many cores exist).
 TINT_SGR = ("2", "2;33", "33", "1;31")          # dim, dim-yellow, yellow, bold-red
+FOCUS_SPARK_SAMPLES = 40    # max recent subtree-CPU samples kept per row for the
+                            # cursor-row sparkline (~the visible history window)
 RSS_TINT_ANCHORS = (100 * 1024**2, 1024**3, 5 * 1024**3)   # 100M, 1G, 5G
 CPU_TINT_ANCHORS = (0.10, 1.0, 4.0)                        # 10%, 100%, 400%
 
@@ -129,7 +131,7 @@ SysInfo = namedtuple("SysInfo", "clk_tck page_size uptime cores")
 
 # One /proc/PID/stat row, only the fields we use.
 Stat = namedtuple("Stat", "comm state ppid num_threads starttime "
-                          "utime stime rss_pages")
+                          "utime stime cutime cstime rss_pages")
 
 # A merged set of >= DEDUP_MIN near-identical sibling Procs.
 Group = namedtuple("Group", "members")
@@ -147,7 +149,10 @@ MountInfo = namedtuple("MountInfo",
 
 # One rendered tree line + its selection metadata. Head rows (Proc/Group) are
 # selectable; detail/collapse-note rows are non-selectable continuation lines.
-Row = namedtuple("Row", "text item_id expandable selectable")
+# `focus` is an optional bright "zoomed-in" replacement string shown in place of
+# a detail row's text when the cursor sits on its head row (item_id matches).
+Row = namedtuple("Row", "text item_id expandable selectable focus",
+                 defaults=(None,))
 
 # Sentinel parent id for the top-level sibling set (see group_id / build_rows).
 ROOT_ID = ("root",)
@@ -181,6 +186,8 @@ class Proc:
     uid: int
     utime: int = 0                  # user jiffies (stat field 14)
     stime: int = 0                  # system jiffies (stat field 15)
+    cutime: int = 0                 # reaped children's user jiffies (field 16)
+    cstime: int = 0                 # reaped children's system jiffies (field 17)
     rss_pages: int = 0              # resident pages (stat field 24)
     cpu_windows: list = None        # per-window CPU rate (cores), aligned to windows
     children: list = field(default_factory=list)   # list[Proc]
@@ -204,7 +211,8 @@ def parse_stat(content):
     comm = content[open_paren + 1:close_paren]
     rest = content[close_paren + 2:].split()
     # rest[i] is stat field (i + 3): field3=state, field4=ppid, field14=utime,
-    # field15=stime, field20=num_threads, field22=starttime, field24=rss.
+    # field15=stime, field16=cutime, field17=cstime (cpu of reaped children),
+    # field20=num_threads, field22=starttime, field24=rss.
     return Stat(
         comm=comm,
         state=rest[0],
@@ -213,6 +221,8 @@ def parse_stat(content):
         starttime=int(rest[19]),
         utime=int(rest[11]),
         stime=int(rest[12]),
+        cutime=int(rest[13]),
+        cstime=int(rest[14]),
         rss_pages=int(rest[21]),
     )
 
@@ -1113,6 +1123,7 @@ def scan():
                           state=st.state, num_threads=st.num_threads,
                           starttime=st.starttime, uid=uid,
                           utime=st.utime, stime=st.stime,
+                          cutime=st.cutime, cstime=st.cstime,
                           rss_pages=st.rss_pages)
     return procs
 
@@ -1524,6 +1535,30 @@ def format_vmstat_pane(colored_rows, swap_on, width, height, color):
     return lines
 
 
+SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(values):
+    """Render a series of numbers as Unicode block-element bars (one char per
+    value). The series is scaled to its own [min, max] range, so the shape shows
+    relative busy/idle history regardless of absolute magnitude. None values
+    render at the floor. A flat (or single-value) series renders all-baseline.
+    Empty -> empty string. Pure."""
+    if not values:
+        return ""
+    nums = [0.0 if v is None else v for v in values]
+    lo, hi = min(nums), max(nums)
+    span = hi - lo
+    if span <= 0:                       # flat / single value: no shape to show
+        return SPARK_BLOCKS[0] * len(nums)
+    out = []
+    last = len(SPARK_BLOCKS) - 1
+    for v in nums:
+        idx = int((v - lo) / span * last + 0.5)
+        out.append(SPARK_BLOCKS[max(0, min(last, idx))])
+    return "".join(out)
+
+
 def _cpu_bit(windows_fracs, avg_frac=None):
     """Format a per-window CPU headline: 'cpu 400% 200% 50%' (one figure per
     window; None -> '—'). Tint level = max _tint_level across the non-None
@@ -1551,6 +1586,67 @@ def _compose_dim(bits, color):
     return "\x1b[2m  \x1b[0m".join(segs)
 
 
+def _descendants_bit(node, sysinfo):
+    """A '(text, tint level)' bit summarizing the subtree below `node`: live
+    descendant count plus the descendants' lifetime-average CPU (which folds in
+    children that already died). None when `node` has no descendants. The CPU
+    figure is tinted by load like the per-process cpu bit."""
+    count = subtree_descendant_count(node)
+    if not count:
+        return None
+    frac = subtree_descendant_cpu(node, sysinfo.uptime, sysinfo.clk_tck)
+    text = "desc:%d" % count
+    level = 0
+    cpu = fmt_pct(frac)
+    if cpu is not None:
+        text += " " + cpu
+        level = _tint_level(frac, CPU_TINT_ANCHORS)
+    return (text, level)
+
+
+def _trend_arrow(now, avg):
+    """A glyph comparing the latest value to the series' own average: ▲ when
+    notably busier than usual, ▼ when notably quieter, ≈ when steady. Returns
+    '' when there is nothing to compare against."""
+    if avg is None or avg <= 0:
+        return ""
+    if now >= avg * 1.3:
+        return "▲"
+    if now <= avg * 0.7:
+        return "▼"
+    return "≈"
+
+
+def _focus_line(count, samples, color):
+    """Core of the bright 'zoomed-in' line: descendant `count`, a sparkline of
+    recent subtree-CPU `samples` (cores, oldest..newest), the current total, and
+    a trend arrow vs the series' own average. None when count is 0 or there is
+    no history."""
+    if not count or not samples:
+        return None
+    nums = [s for s in samples if s is not None]
+    spark = sparkline(samples)
+    now = samples[-1] if samples[-1] is not None else 0.0
+    avg = (sum(nums) / len(nums)) if nums else None
+    bits = ["desc:%d" % count]
+    if spark:
+        bits.append(spark)
+    bits.append("now %s" % (fmt_pct(now) or "0%"))
+    arrow = _trend_arrow(now, avg)
+    if arrow:
+        bits.append(arrow)
+    text = "  ".join(bits)
+    if color:                           # normal intensity (brighter than dim)
+        return "\x1b[0m" + text + "\x1b[0m"
+    return text
+
+
+def _focus_detail(node, sysinfo, samples, color):
+    """The bright, 'zoomed-in' detail line shown in place of the dim detail on
+    the row the cursor sits on, for a single process `node`. See _focus_line."""
+    return _focus_line(subtree_descendant_count(node), samples, color)
+
+
 def _detail(node, color, sysinfo=None, show_avg=False):
     bits = []   # (text, tint level)
     if node.cwd and node.cwd not in ("?", ""):
@@ -1568,6 +1664,9 @@ def _detail(node, color, sysinfo=None, show_avg=False):
                 avg = cpu_fraction(node.utime + node.stime, life,
                                    sysinfo.clk_tck)
             bits.append(_cpu_bit(node.cpu_windows, avg))
+        desc = _descendants_bit(node, sysinfo)
+        if desc is not None:
+            bits.append(desc)
         rss = node.rss_pages * sysinfo.page_size
         if rss > 0:
             bits.append(("rss:" + fmt_bytes(rss),
@@ -1626,6 +1725,18 @@ def _group_detail(members, color, sysinfo, show_avg=False):
                 if avgs:
                     text += " (%s avg)" % range_str(avgs, fmt_pct)
             bits.append((text, level))
+        desc_count = sum(subtree_descendant_count(m) for m in members)
+        if desc_count:
+            fracs = [f for f in (
+                subtree_descendant_cpu(m, sysinfo.uptime, sysinfo.clk_tck)
+                for m in members) if f is not None]
+            text = "desc:%d" % desc_count
+            dlevel = 0
+            cpu = fmt_pct(sum(fracs)) if fracs else None
+            if cpu is not None:
+                text += " " + cpu
+                dlevel = _tint_level(sum(fracs), CPU_TINT_ANCHORS)
+            bits.append((text, dlevel))
         rss = [m.rss_pages * sysinfo.page_size for m in members
                if m.rss_pages > 0]
         if rss:
@@ -1701,22 +1812,117 @@ def subtree_window_cpu(node, widx):
     return total
 
 
+def subtree_descendant_count(node):
+    """Number of descendants under `node` (live, in this snapshot), excluding
+    `node` itself. Counts collapsed/suppressed descendants too."""
+    return len(_descendants(node))
+
+
+def _sum_rings(rings):
+    """Element-wise sum of several sample rings, aligned on their newest samples
+    (right-aligned); rings shorter than the longest contribute 0 to the older
+    slots. Used to derive a group's combined CPU series from its members'."""
+    rings = [r for r in rings if r]
+    if not rings:
+        return []
+    n = max(len(r) for r in rings)
+    out = [0.0] * n
+    for r in rings:
+        offset = n - len(r)
+        for i, v in enumerate(r):
+            out[offset + i] += v
+    return out
+
+
+def update_focus_history(focus_hist, roots, widx, cap):
+    """Append this frame's subtree CPU (window `widx`, cores) to a per-process
+    ring keyed by proc_id, for every node reachable from `roots` (kept or not).
+    Evict rings for pids absent this frame; cap each ring at `cap` samples.
+    Mutates `focus_hist`. Groups derive their series by summing member rings at
+    render time, so only individual processes are tracked here."""
+    seen = set()
+    stack = list(roots)
+    while stack:
+        node = stack.pop()
+        key = proc_id(node)
+        seen.add(key)
+        ring = focus_hist.setdefault(key, [])
+        ring.append(subtree_window_cpu(node, widx))
+        if len(ring) > cap:
+            del ring[:len(ring) - cap]
+        stack.extend(node.children)
+    for key in list(focus_hist):
+        if key not in seen:
+            del focus_hist[key]
+
+
+def subtree_descendant_cpu(node, uptime, clk_tck):
+    """Average CPU (cores) consumed over `node`'s lifetime by its DESCENDANTS,
+    INCLUDING descendants that have already died and been reaped. `node`'s own
+    utime/stime is excluded (that is the per-process 'cpu' bit); its
+    cutime/cstime IS included, since those are the cpu of children it reaped.
+
+    The kernel folds a reaped child's entire utime+stime+cutime+cstime into its
+    parent's cutime/cstime, so node.cutime+node.cstime plus the four counters of
+    every live descendant counts each dead descendant exactly once (no double
+    counting). Divided by `node`'s wall-clock lifetime. None when that lifetime
+    is non-positive."""
+    life = lifetime_secs(node.starttime, uptime, clk_tck)
+    if life <= 0:
+        return None
+    ticks = node.cutime + node.cstime
+    for n in _descendants(node):
+        ticks += n.utime + n.stime + n.cutime + n.cstime
+    return cpu_fraction(ticks, life, clk_tck)
+
+
 def build_rows(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
                dedup_min=None, never_merge=frozenset(), top_sort_key=None,
                show_avg=False, expanded=frozenset(), collapsible=frozenset(),
-               breakout_map=None):
+               breakout_map=None, focus_history=None):
     """Build the tree as Row records (text, item_id, expandable, selectable).
     Head rows (Proc/Group) are selectable; detail/collapse-note rows are
     continuation lines. A Group whose id is in `expanded` renders a header row
     followed by its members individually (so you can re-collapse it); otherwise
     it renders the merged ×N line and recurses over the union of children. A
-    Proc head is expandable iff its id is in `collapsible`."""
+    Proc head is expandable iff its id is in `collapsible`.
+
+    `focus_history` (optional) maps a head row's item_id to a list of recent
+    subtree-CPU samples (cores, oldest..newest). When given, each detail row is
+    tagged with its head's item_id and a baked `focus` string (the bright
+    zoomed-in line: descendant count + CPU sparkline + trend) that
+    present_viewport swaps in when the cursor lands on that head."""
     if color is None:
         color = False
     rows = []
 
-    def emit(text, item_id=None, expandable=False, selectable=False):
-        rows.append(Row(text, item_id, expandable, selectable))
+    def emit(text, item_id=None, expandable=False, selectable=False,
+             focus=None):
+        rows.append(Row(text, item_id, expandable, selectable, focus))
+
+    def focus_for(node, item_id, prefix):
+        """Baked focus string (with `prefix` indentation) for a detail row, or
+        None when there is no history or nothing to show."""
+        if focus_history is None or sysinfo is None:
+            return None
+        samples = focus_history.get(item_id)
+        if not samples:
+            return None
+        line = _focus_detail(node, sysinfo, samples, color)
+        return (prefix + line) if line is not None else None
+
+    def focus_for_group(members, gid, prefix):
+        """Baked focus string for a merged group's detail row: descendant count
+        summed across members, with a combined sparkline derived from the
+        members' own per-process histories."""
+        if focus_history is None or sysinfo is None:
+            return None
+        samples = _sum_rings([focus_history.get(proc_id(m)) for m in members])
+        if not samples:
+            return None
+        count = sum(subtree_descendant_count(m) for m in members)
+        line = _focus_line(count, samples, color)
+        return (prefix + line) if line is not None else None
 
     def walk_items(items, prefix, parent_id):
         for i, item in enumerate(items):
@@ -1732,7 +1938,8 @@ def build_rows(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
                 emit(head, item_id=gid, expandable=True, selectable=True)
                 detail = _group_detail(item.members, color, sysinfo, show_avg)
                 if detail is not None:
-                    emit(child_prefix + detail)
+                    emit(child_prefix + detail, item_id=gid,
+                         focus=focus_for_group(item.members, gid, child_prefix))
                 if gid in expanded:
                     walk_items(list(item.members), child_prefix, gid)
                 else:
@@ -1748,7 +1955,8 @@ def build_rows(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
                      selectable=True)
                 detail = _detail(item, color, sysinfo, show_avg)
                 if detail is not None:
-                    emit(child_prefix + detail)
+                    emit(child_prefix + detail, item_id=pid_id,
+                         focus=focus_for(item, pid_id, child_prefix))
                 kids = _visible_children(item, suppressed)
                 walk_items(group_siblings(kids, dedup_min, never_merge),
                            child_prefix, pid_id)
@@ -1867,7 +2075,12 @@ def present_viewport(rows, ui, height, color):
         idx = top + off
         gutter = ("▾ " if r.item_id in ui.expanded else "▸ ") if r.expandable \
             else "  "
-        text = gutter + r.text
+        body = r.text
+        # On the cursored head's detail row, swap in the bright "zoomed-in"
+        # focus line (descendant count + CPU sparkline + trend).
+        if (not r.selectable and r.focus is not None and r.item_id == cursor):
+            body = r.focus
+        text = gutter + body
         if idx == cur_idx and color:
             text = "\x1b[7m" + text + "\x1b[0m"
         out.append(text)
@@ -1888,7 +2101,7 @@ def split_regions(rows, cols, vmstat_on, vmstat_rows_cap, sample_rows,
     The disk pane (separator + header + k mount rows) is shown below the vmstat
     pane if toggled on and there is room. If terminal is too small, disk hides
     first (lower priority than vmstat)."""
-    body = rows - 1  # header
+    body = rows - 2  # header (2-line: system summary + task/key hint)
     vmstat_pane = 0
     show_vmstat = False
     disk_pane = 0
@@ -1937,6 +2150,8 @@ def glossary(color):
         "+N est = N established TCP connections   unix:PATH = named socket",
         "  stats:   cpu A% B% C% = CPU over the short/med/long windows "
         "(cores; 100% = 1 core)   rss = resident memory   up = time since start",
+        "  subtree: desc:N X% = N live descendants + the cpu their whole subtree "
+        "(incl. already-exited children) averaged over this node's lifetime",
         "  groups:  ×N = N near-identical siblings merged (pids/ranges on the "
         "detail line)   lifecycle = procs born/died during the sample window",
     ]
@@ -2037,6 +2252,7 @@ def run_live(args):
     windows = args.windows
     longest = max(windows)
     history = {}
+    focus_hist = {}     # proc_id -> ring of subtree-CPU samples for sparklines
     vmring = []
     ui = UIState(vmstat_on=not args.no_vmstat, disk_on=not args.no_disk)
     sysinfo_cores = cores_count()
@@ -2071,14 +2287,14 @@ def run_live(args):
                     - (latest.cache or 0)) if mem_total and latest else None
         swap_total = latest.swap_total if latest else None
         swap_free = latest.swap_free if latest else None
-        frame = [header_line((t_prev and (time.monotonic() - t_prev)) or 0.0,
-                             sysinfo, len(cur), hidden, args.sample_interval,
-                             ui.frozen,
-                             loadavg=read_loadavg(),
-                             mem_total=mem_total, mem_used=mem_used,
-                             swap_total=swap_total, swap_free=swap_free,
-                             n_running=n_run, n_sleeping=n_sleep,
-                             n_zombie=n_zombie)]
+        frame = header_line((t_prev and (time.monotonic() - t_prev)) or 0.0,
+                            sysinfo, len(cur), hidden, args.sample_interval,
+                            ui.frozen,
+                            loadavg=read_loadavg(),
+                            mem_total=mem_total, mem_used=mem_used,
+                            swap_total=swap_total, swap_free=swap_free,
+                            n_running=n_run, n_sleeping=n_sleep,
+                            n_zombie=n_zombie).split('\n')
         frame += body
         if show_vmstat:
             swap_on = any(s.swap_total for s in vmring if s.swap_total)
@@ -2118,13 +2334,16 @@ def run_live(args):
         visible_roots, suppressed, collapsible, breakout_map = prepare_frame(
             cur, args, sysinfo, expanded=ui.expanded)
         dedup_min = None if args.no_dedup else args.dedup_min
+        update_focus_history(focus_hist, visible_roots, ui.sort_idx,
+                             FOCUS_SPARK_SAMPLES)
         key = lambda item: subtree_window_cpu(
             item.members[0] if isinstance(item, Group) else item, ui.sort_idx)
         rows = build_rows(visible_roots, suppressed, width=args.width,
                           color=not args.no_color, sysinfo=sysinfo,
                           dedup_min=dedup_min, never_merge=NEVER_MERGE,
                           top_sort_key=key, expanded=ui.expanded,
-                          collapsible=collapsible, breakout_map=breakout_map)
+                          collapsible=collapsible, breakout_map=breakout_map,
+                          focus_history=focus_hist)
         _last_live_keys = {(p.pid, p.starttime) for p in cur.values()}
         prev, t_prev = cur, t_now
 
@@ -2134,8 +2353,10 @@ def run_live(args):
         out.flush()
         sample_and_build()
         repaint()
+        deadline = time.monotonic() + args.sample_interval
         while True:
-            r, _w, _e = _select.select([fd], [], [], args.sample_interval)
+            remaining = max(0.0, deadline - time.monotonic())
+            r, _w, _e = _select.select([fd], [], [], remaining)
             if r:
                 key = _read_key(fd)
                 ids = selectable_ids(rows)
@@ -2153,6 +2374,7 @@ def run_live(args):
                         if r.expandable and r.item_id[0] == "g":
                             ui.expanded.add(r.item_id)
                     sample_and_build()
+                    deadline = time.monotonic() + args.sample_interval
                 elif key == "d":
                     ui.disk_on = not ui.disk_on
                 elif key in ("up", "k"):
@@ -2171,9 +2393,11 @@ def run_live(args):
                     if ui.cursor is not None:
                         ui.expanded ^= {ui.cursor}      # toggle membership
                         sample_and_build()              # tree shape changed
+                        deadline = time.monotonic() + args.sample_interval
                 repaint()                               # instant feedback
             elif not ui.frozen:
                 sample_and_build()
+                deadline = time.monotonic() + args.sample_interval
                 repaint()
     except KeyboardInterrupt:
         pass
