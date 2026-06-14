@@ -139,6 +139,19 @@ def test_select_promotes_and_marks_interesting():
     assert root.kept is True   # ancestor kept to keep tree rooted
 
 
+def test_parse_stat_captures_reaped_children_cpu():
+    # fields 14,15 = utime,stime (own); 16,17 = cutime,cstime (reaped children).
+    # As stat-field numbers: field14 -> rest[11], field16 -> rest[13].
+    rest = ["R", "1"] + ["0"] * 20      # state, ppid, then zeros
+    rest[11] = "100"    # utime  (field 14)
+    rest[12] = "50"     # stime  (field 15)
+    rest[13] = "700"    # cutime (field 16)
+    rest[14] = "300"    # cstime (field 17)
+    st = topf.parse_stat("123 (proc) " + " ".join(rest))
+    assert st.utime == 100 and st.stime == 50
+    assert st.cutime == 700 and st.cstime == 300
+
+
 def test_subtree_window_cpu_sums_all_descendants():
     root = _rproc(1, ppid=0, windows=[1.0, 0, 0])
     a = _rproc(2, ppid=1, windows=[2.0, 0, 0])
@@ -152,6 +165,70 @@ def test_subtree_window_cpu_sums_all_descendants():
 def test_subtree_window_cpu_treats_none_as_zero():
     root = _rproc(1, ppid=0, windows=[None, None, None])
     assert topf.subtree_window_cpu(root, 0) == 0.0
+
+
+def test_subtree_descendant_count_excludes_self():
+    root = _rproc(1, ppid=0)
+    a = _rproc(2, ppid=1)
+    b = _rproc(3, ppid=2)
+    procs = {1: root, 2: a, 3: b}
+    topf.build_tree(procs)
+    assert topf.subtree_descendant_count(root) == 2   # a, b (not root)
+    assert topf.subtree_descendant_count(a) == 1       # b
+    assert topf.subtree_descendant_count(b) == 0
+
+
+def test_subtree_descendant_cpu_excludes_self_includes_reaped():
+    # descendants' cpu = root's reaped-children (cutime/cstime) + all live
+    # descendants' four counters; root's OWN utime/stime is the "self" line and
+    # is excluded. uptime=10s, clk_tck=100 -> 1000 ticks == 1.0 core avg.
+    root = _rproc(1, ppid=0, starttime=0)       # alive whole 10s
+    root.utime, root.stime = 999, 999           # OWN cpu -> excluded
+    root.cutime, root.cstime = 500, 300         # 800 ticks of reaped descendants
+    child = _rproc(2, ppid=1, starttime=0)
+    child.utime, child.stime = 100, 100         # 200 ticks live child
+    child.cutime, child.cstime = 0, 0
+    procs = {1: root, 2: child}
+    topf.build_tree(procs)
+    # descendant ticks = 800 (reaped) + 200 (live child) = 1000; /10s/100 = 1.0
+    frac = topf.subtree_descendant_cpu(root, uptime=10.0, clk_tck=100)
+    assert abs(frac - 1.0) < 1e-9
+
+
+def test_subtree_descendant_cpu_none_when_no_lifetime():
+    root = _rproc(1, ppid=0, starttime=1000)    # starts in the future-ish
+    procs = {1: root}
+    topf.build_tree(procs)
+    # uptime smaller than start offset -> non-positive wall -> None
+    assert topf.subtree_descendant_cpu(root, uptime=0.0, clk_tck=100) is None
+
+
+SPARK = "▁▂▃▄▅▆▇█"
+
+
+def test_sparkline_empty_is_blank():
+    assert topf.sparkline([]) == ""
+
+
+def test_sparkline_min_and_max_map_to_low_and_high_blocks():
+    s = topf.sparkline([0.0, 10.0])
+    assert s[0] == SPARK[0]      # min -> lowest block
+    assert s[-1] == SPARK[-1]    # max -> highest block
+
+
+def test_sparkline_flat_series_is_baseline():
+    # all-equal values have no range; render as the lowest block, not a crash
+    assert topf.sparkline([3.0, 3.0, 3.0]) == SPARK[0] * 3
+
+
+def test_sparkline_skips_none_as_zero_floor():
+    # None samples (proc too young that frame) render at the floor
+    s = topf.sparkline([None, 10.0, None])
+    assert s[0] == SPARK[0] and s[1] == SPARK[-1] and s[2] == SPARK[0]
+
+
+def test_sparkline_one_value_is_single_block():
+    assert topf.sparkline([5.0]) == SPARK[0]   # single sample -> flat baseline
 
 
 def test_render_orders_top_level_by_window_desc_pid_tiebreak():
@@ -170,6 +247,72 @@ def test_render_orders_top_level_by_window_desc_pid_tiebreak():
     assert any(ln.endswith("cold") for ln in lines)
     assert lines.index(next(l for l in lines if l.endswith("hot"))) < \
            lines.index(next(l for l in lines if l.endswith("cold")))
+
+
+def test_detail_shows_descendant_count_and_cpu():
+    # uptime=10s, clk_tck=100. root has 1 live child (200 ticks) + 800 reaped
+    # ticks -> 1000 desc ticks / 10s / 100 = 1.0 core avg == "100%".
+    root = _rproc(1, ppid=0, starttime=0, windows=[0, 0, 0])
+    root.cutime, root.cstime = 500, 300
+    child = _rproc(2, ppid=1, starttime=0, windows=[0, 0, 0])
+    child.utime, child.stime = 100, 100
+    procs = {1: root, 2: child}
+    topf.build_tree(procs)
+    si = topf.SysInfo(clk_tck=100, page_size=topf.PAGE_SIZE, uptime=10.0, cores=4)
+    line = topf._detail(root, color=False, sysinfo=si)
+    assert "desc:1" in line       # one live descendant
+    assert "100%" in line         # descendants' lifetime-avg cpu
+
+
+def test_detail_no_descendant_bit_for_leaf():
+    leaf = _rproc(9, ppid=0, starttime=0, windows=[0, 0, 0])
+    procs = {9: leaf}
+    topf.build_tree(procs)
+    si = topf.SysInfo(clk_tck=100, page_size=topf.PAGE_SIZE, uptime=10.0, cores=4)
+    line = topf._detail(leaf, color=False, sysinfo=si)
+    assert line is None or "desc:" not in line
+
+
+def test_group_detail_aggregates_descendant_count_and_cpu():
+    # two group members, each with one live child (200 desc ticks each) over a
+    # 10s lifetime: count 2, cpu = 0.2 + 0.2 = 0.4 cores == "40%".
+    m1 = _rproc(10, ppid=1, comm="clang", starttime=0, windows=[0, 0, 0])
+    m2 = _rproc(11, ppid=1, comm="clang", starttime=0, windows=[0, 0, 0])
+    for m in (m1, m2):
+        m.exe = "/usr/bin/clang"
+    c1 = _rproc(20, ppid=10, starttime=0, windows=[0, 0, 0])
+    c1.utime, c1.stime = 100, 100
+    c2 = _rproc(21, ppid=11, starttime=0, windows=[0, 0, 0])
+    c2.utime, c2.stime = 100, 100
+    procs = {10: m1, 11: m2, 20: c1, 21: c2}
+    topf.build_tree(procs)
+    si = topf.SysInfo(clk_tck=100, page_size=topf.PAGE_SIZE, uptime=10.0, cores=4)
+    line = topf._group_detail([m1, m2], color=False, sysinfo=si)
+    assert "desc:2" in line       # both members' live descendants
+    assert "40%" in line
+
+
+def test_focus_detail_shows_sparkline_count_and_trend():
+    root = _rproc(1, ppid=0, starttime=0, windows=[0, 0, 0])
+    child = _rproc(2, ppid=1, starttime=0, windows=[0, 0, 0])
+    procs = {1: root, 2: child}
+    topf.build_tree(procs)
+    si = topf.SysInfo(clk_tck=100, page_size=topf.PAGE_SIZE, uptime=10.0, cores=4)
+    samples = [0.0, 0.0, 0.0, 2.0]     # idle then a 2-core burst
+    line = topf._focus_detail(root, si, samples, color=False)
+    assert "desc:1" in line
+    assert topf.SPARK_BLOCKS[-1] in line       # peak rendered as full block
+    assert "now 200%" in line                  # latest = 2.0 cores
+    assert "▲" in line                         # now well above its own average
+
+
+def test_focus_detail_none_without_samples():
+    root = _rproc(1, ppid=0, starttime=0, windows=[0, 0, 0])
+    child = _rproc(2, ppid=1, starttime=0, windows=[0, 0, 0])
+    procs = {1: root, 2: child}
+    topf.build_tree(procs)
+    si = topf.SysInfo(clk_tck=100, page_size=topf.PAGE_SIZE, uptime=10.0, cores=4)
+    assert topf._focus_detail(root, si, [], color=False) is None
 
 
 def test_visible_truncate_plain():
@@ -578,6 +721,71 @@ def test_expand_all_groups_adds_only_group_ids():
 # --- build_rows / render wrapper --------------------------------------------
 
 
+def test_build_rows_detail_row_carries_focus_for_cursor_swap():
+    root = _rproc(1, ppid=0, comm="root", starttime=0, windows=[0, 0, 0])
+    child = _rproc(2, ppid=1, comm="kid", starttime=0, windows=[0, 0, 0])
+    procs = {1: root, 2: child}
+    topf.build_tree(procs)
+    for p in procs.values():
+        p.kept = True
+    si = topf.SysInfo(clk_tck=100, page_size=topf.PAGE_SIZE, uptime=10.0, cores=4)
+    pid_id = topf.proc_id(root)
+    hist = {pid_id: [0.0, 0.0, 2.0]}
+    rows = topf.build_rows([root], set(), sysinfo=si, focus_history=hist)
+    # the detail row under root must carry root's id + a baked focus string
+    det = [r for r in rows if not r.selectable and r.item_id == pid_id
+           and r.focus is not None]
+    assert len(det) == 1
+    assert "desc:1" in det[0].focus and topf.SPARK_BLOCKS[-1] in det[0].focus
+
+
+def test_build_rows_no_focus_without_history():
+    root = _rproc(1, ppid=0, comm="root", starttime=0, windows=[0, 0, 0])
+    child = _rproc(2, ppid=1, comm="kid", starttime=0, windows=[0, 0, 0])
+    procs = {1: root, 2: child}
+    topf.build_tree(procs)
+    for p in procs.values():
+        p.kept = True
+    si = topf.SysInfo(clk_tck=100, page_size=topf.PAGE_SIZE, uptime=10.0, cores=4)
+    rows = topf.build_rows([root], set(), sysinfo=si)   # no focus_history
+    assert all(r.focus is None for r in rows)
+
+
+def test_update_focus_history_appends_and_caps():
+    root = _rproc(1, ppid=0, comm="root", windows=[1.5, 0, 0])
+    child = _rproc(2, ppid=1, comm="kid", windows=[0.5, 0, 0])
+    procs = {1: root, 2: child}
+    topf.build_tree(procs)
+    for p in procs.values():
+        p.kept = True
+    hist = {}
+    pid_id = topf.proc_id(root)
+    # window 0 subtree cpu = 1.5 + 0.5 = 2.0
+    topf.update_focus_history(hist, [root], widx=0, cap=3)
+    assert abs(hist[pid_id][-1] - 2.0) < 1e-9
+    for _ in range(5):
+        topf.update_focus_history(hist, [root], widx=0, cap=3)
+    assert len(hist[pid_id]) == 3          # capped
+
+
+def test_sum_rings_aligns_by_recent_tail():
+    # rings of differing length: align on the newest samples, pad missing with 0
+    assert topf._sum_rings([[1.0, 2.0, 3.0], [10.0]]) == [1.0, 2.0, 13.0]
+    assert topf._sum_rings([]) == []
+    assert topf._sum_rings([[1.0], [2.0]]) == [3.0]
+
+
+def test_update_focus_history_drops_absent_ids():
+    root = _rproc(1, ppid=0, comm="root", windows=[1.0, 0, 0])
+    procs = {1: root}
+    topf.build_tree(procs)
+    root.kept = True
+    hist = {("p", 99, 1): [0.1, 0.2]}      # stale id not in this frame
+    topf.update_focus_history(hist, [root], widx=0, cap=10)
+    assert ("p", 99, 1) not in hist
+    assert topf.proc_id(root) in hist
+
+
 def test_build_rows_proc_is_selectable_detail_is_not():
     p = _rproc(20, ppid=0, comm="hot", windows=[5.0, 0, 0])
     procs = {20: p}
@@ -663,6 +871,40 @@ def test_move_cursor_clamps():
     assert topf.move_cursor(ids, None, +1) == ("p", 0, 1)          # none -> first
 
 
+def test_present_viewport_swaps_focus_detail_on_cursor_row():
+    head = topf.Row("head0", ("p", 0, 1), False, True)
+    det = topf.Row("  dim-detail", ("p", 0, 1), False, False, focus="FOCUS-LINE")
+    head2 = topf.Row("head1", ("p", 1, 1), False, True)
+    det2 = topf.Row("  dim-detail2", ("p", 1, 1), False, False, focus="FOCUS-2")
+    rows = [head, det, head2, det2]
+    ui = topf.UIState(cursor=("p", 0, 1))
+    lines, _cur, _top = topf.present_viewport(rows, ui, height=10, color=False)
+    assert any("FOCUS-LINE" in ln for ln in lines)     # cursored row's detail swapped
+    assert not any("dim-detail" in ln and "detail2" not in ln for ln in lines)
+    assert any("dim-detail2" in ln for ln in lines)    # non-cursored stays dim
+    assert not any("FOCUS-2" in ln for ln in lines)
+
+
+def test_build_rows_plus_viewport_shows_sparkline_on_cursor():
+    # End-to-end: build_rows bakes a focus line from history, present_viewport
+    # swaps it in on the cursored row and leaves other rows' dim detail alone.
+    root = _rproc(1, ppid=0, comm="root", starttime=0, windows=[2.0, 0, 0])
+    child = _rproc(2, ppid=1, comm="kid", starttime=0, windows=[0.0, 0, 0])
+    procs = {1: root, 2: child}
+    topf.build_tree(procs)
+    for p in procs.values():
+        p.kept = True
+    si = topf.SysInfo(clk_tck=100, page_size=topf.PAGE_SIZE, uptime=10.0, cores=4)
+    fh = {}
+    for _ in range(5):
+        topf.update_focus_history(fh, [root], widx=0, cap=40)
+    rows = topf.build_rows([root], set(), sysinfo=si, focus_history=fh)
+    ui = topf.UIState(cursor=topf.proc_id(root))
+    lines, _cur, _top = topf.present_viewport(rows, ui, height=20, color=False)
+    assert any("now 200%" in ln for ln in lines)     # focus line visible
+    assert any(topf.SPARK_BLOCKS[0] in ln for ln in lines)
+
+
 def test_present_viewport_highlights_cursor_and_glyph():
     rows = _rows(2)
     ui = topf.UIState(cursor=("p", 0, 1))
@@ -703,7 +945,7 @@ def test_split_regions_hidden_when_small():
     # below MIN_ROWS_FOR_VMSTAT -> pane hidden, tree gets the whole body
     region, vp, dp, sv, sd = topf.split_regions(
         rows=12, cols=200, vmstat_on=True, vmstat_rows_cap=12, sample_rows=10)
-    assert sv is False and vp == 0 and region == 11   # rows-1 header
+    assert sv is False and vp == 0 and region == 10   # rows-2 header
 
 
 def test_split_regions_narrow_hides_pane():
@@ -713,12 +955,12 @@ def test_split_regions_narrow_hides_pane():
 
 
 def test_split_regions_shows_pane_when_room():
-    # 40 rows: header 1, tree gets the rest minus a pane of 2 + k sample rows
+    # 40 rows: header 2, tree gets the rest minus a pane of 2 + k sample rows
     region, vp, dp, sv, sd = topf.split_regions(
         rows=40, cols=200, vmstat_on=True, vmstat_rows_cap=12, sample_rows=10)
     assert sv is True
-    assert vp == 2 + 10                 # separator + header + 10 samples
-    assert region == (40 - 1) - vp
+    assert vp == 2 + 10                 # separator + pane header + 10 samples
+    assert region == (40 - 2) - vp
 
 
 def test_split_regions_caps_pane_to_keep_tree():
@@ -733,7 +975,7 @@ def test_split_regions_caps_pane_to_keep_tree():
 def test_split_regions_off_when_toggled():
     region, vp, dp, sv, sd = topf.split_regions(
         rows=40, cols=200, vmstat_on=False, vmstat_rows_cap=12, sample_rows=10)
-    assert sv is False and region == 39
+    assert sv is False and region == 38
 
 
 def test_split_regions_with_disk_pane():
@@ -743,7 +985,7 @@ def test_split_regions_with_disk_pane():
         disk_on=True, disk_rows_cap=6, disk_mounts_count=3)
     assert sv is True and sd is True
     assert vp > 0 and dp > 0
-    assert region == 49 - vp - dp
+    assert region == 48 - vp - dp
 
 
 def test_split_regions_disk_hides_when_no_mounts():
