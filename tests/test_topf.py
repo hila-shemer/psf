@@ -455,18 +455,186 @@ def test_format_vmstat_pane_height_one_is_header_only():
 # --- row identities & collapse/expand ---------------------------------------
 
 
+def test_proc_and_group_id():
+    p = _rproc(7, starttime=3, comm="clang")
+    p.exe = "/usr/bin/clang"
+    assert topf.proc_id(p) == ("p", 7, 3)
+    assert topf.group_id(topf.ROOT_ID, "clang", "/usr/bin/clang") == \
+        ("g", topf.ROOT_ID, "clang", "/usr/bin/clang")
+
+
 def _kept(p):
     p.kept = True
     return p
 
 
+def test_collapse_returns_collapsible_and_suppresses():
+    root = _kept(_rproc(1, ppid=0, comm="root"))
+    root.interesting = True
+    kids = {1: root}
+    for i in range(2, 8):                       # 6 noise children > threshold 3
+        c = _kept(_rproc(i, ppid=1, comm="noise"))
+        kids[i] = c
+    topf.build_tree(kids)
+    suppressed, collapsible = topf.collapse(kids, threshold=3)
+    assert topf.proc_id(root) in collapsible
+    assert len(suppressed) == 6
+
+
+def test_collapse_expanded_node_not_suppressed_but_still_collapsible():
+    root = _kept(_rproc(1, ppid=0, comm="root"))
+    root.interesting = True
+    kids = {1: root}
+    for i in range(2, 8):
+        kids[i] = _kept(_rproc(i, ppid=1, comm="noise"))
+    topf.build_tree(kids)
+    suppressed, collapsible = topf.collapse(
+        kids, threshold=3, expanded={topf.proc_id(root)})
+    assert topf.proc_id(root) in collapsible    # still a candidate
+    assert suppressed == set()                  # but nothing hidden
+
+
 # --- breakout rows ----------------------------------------------------------
+
+
+def test_find_breakouts_identifies_promoted_descendants():
+    root = _kept(_rproc(1, ppid=0, comm="root"))
+    root.interesting = True
+    kids = {1: root}
+    for i in range(2, 8):                       # 6 noise children
+        c = _kept(_rproc(i, ppid=1, comm="noise"))
+        kids[i] = c
+    # Make one descendant heavy (3 cores -> promoted at level 2)
+    kids[5].cpu_windows = [3.0, 3.0, 3.0]
+    topf.build_tree(kids)
+    suppressed, collapsible = topf.collapse(kids, threshold=3)
+    assert topf.proc_id(root) in collapsible
+    b_pids, b_map = topf.find_breakouts(
+        kids, suppressed, collapsible, topf.PAGE_SIZE, 2, True)
+    assert 5 in b_pids
+    assert topf.proc_id(root) in b_map
+    assert kids[5] in b_map[topf.proc_id(root)]
+
+
+def test_find_breakouts_respects_max():
+    root = _kept(_rproc(1, ppid=0, comm="root"))
+    root.interesting = True
+    kids = {1: root}
+    for i in range(2, 12):                     # 10 noise children
+        c = _kept(_rproc(i, ppid=1, comm="noise", windows=[3.0, 3.0, 3.0]))
+        kids[i] = c
+    topf.build_tree(kids)
+    suppressed, collapsible = topf.collapse(kids, threshold=3)
+    b_pids, b_map = topf.find_breakouts(
+        kids, suppressed, collapsible, topf.PAGE_SIZE, 2, True)
+    # All 10 are promoted, but only BREAKOUT_MAX make it through
+    assert len(b_map[topf.proc_id(root)]) <= topf.BREAKOUT_MAX
+
+
+def test_build_rows_includes_breakout_rows():
+    root = _kept(_rproc(1, ppid=0, comm="root"))
+    root.interesting = True
+    kids = {1: root}
+    heavy = _kept(_rproc(5, ppid=1, comm="heavy", windows=[3.0, 3.0, 3.0]))
+    kids[5] = heavy
+    for i in range(10, 16):
+        kids[i] = _kept(_rproc(i, ppid=1, comm="noise"))
+    topf.build_tree(kids)
+    suppressed, collapsible = topf.collapse(kids, threshold=3)
+    b_pids, b_map = topf.find_breakouts(
+        kids, suppressed, collapsible, topf.PAGE_SIZE, 2, True)
+    suppressed -= b_pids
+    rows = topf.build_rows([root], suppressed, collapsible=collapsible,
+                            breakout_map=b_map)
+    texts = [r.text for r in rows]
+    # The heavy proc should appear as a breakout row with >> marker
+    assert any(">> 5 heavy" in t for t in texts)
 
 
 # --- expand-all-groups key --------------------------------------------------
 
 
+def test_expand_all_groups_adds_only_group_ids():
+    """Simulating the E key: only group ids (item_id[0]=='g') are added."""
+    rows = [
+        topf.Row("proc1", ("p", 10, 1), expandable=True, selectable=True),
+        topf.Row("group1", ("g", topf.ROOT_ID, "x", "/x"), expandable=True,
+                 selectable=True),
+        topf.Row("proc2", ("p", 20, 1), expandable=True, selectable=True),
+        topf.Row("group2", ("g", topf.ROOT_ID, "y", "/y"), expandable=True,
+                 selectable=True),
+    ]
+    expanded = set()
+    for r in rows:
+        if r.expandable and r.item_id[0] == "g":
+            expanded.add(r.item_id)
+    assert len(expanded) == 2
+    assert all(id[0] == "g" for id in expanded)
+    # Proc ids were not added
+    assert ("p", 10, 1) not in expanded
+    assert ("p", 20, 1) not in expanded
+
+
 # --- build_rows / render wrapper --------------------------------------------
+
+
+def test_build_rows_proc_is_selectable_detail_is_not():
+    p = _rproc(20, ppid=0, comm="hot", windows=[5.0, 0, 0])
+    procs = {20: p}
+    topf.build_tree(procs)
+    p.kept = True
+    rows = topf.build_rows([p], set(), sysinfo=None)
+    heads = [r for r in rows if r.selectable]
+    assert len(heads) == 1
+    assert heads[0].item_id == topf.proc_id(p)
+    assert heads[0].selectable and not heads[0].expandable
+
+
+def test_build_rows_group_is_expandable_with_group_id():
+    members = {i: _rproc(i, ppid=1, comm="clang") for i in range(10, 14)}
+    for m in members.values():
+        m.kept = True
+        m.exe = "/usr/bin/clang"
+    root = _rproc(1, ppid=0, comm="root")
+    root.kept = True
+    procs = {1: root, **members}
+    topf.build_tree(procs)
+    rows = topf.build_rows([root], set(), dedup_min=3)
+    groups = [r for r in rows if r.expandable and r.item_id[0] == "g"]
+    assert len(groups) == 1
+    gid = topf.group_id(topf.proc_id(root), "clang", "/usr/bin/clang")
+    assert groups[0].item_id == gid
+
+
+def test_build_rows_expanded_group_shows_members():
+    members = {i: _rproc(i, ppid=1, comm="clang") for i in range(10, 14)}
+    for m in members.values():
+        m.kept = True
+        m.exe = "/usr/bin/clang"
+    root = _rproc(1, ppid=0, comm="root")
+    root.kept = True
+    procs = {1: root, **members}
+    topf.build_tree(procs)
+    gid = topf.group_id(topf.proc_id(root), "clang", "/usr/bin/clang")
+    rows = topf.build_rows([root], set(), dedup_min=3, expanded={gid})
+    member_ids = {topf.proc_id(m) for m in members.values()}
+    sel_ids = {r.item_id for r in rows if r.selectable}
+    assert member_ids <= sel_ids        # all 4 members now individual rows
+    assert gid in sel_ids               # group header still present (re-collapse target)
+
+
+def test_render_still_returns_strings():
+    cold = _rproc(10, ppid=0, comm="cold", windows=[0.1, 0, 0])
+    hot = _rproc(20, ppid=0, comm="hot", windows=[5.0, 0, 0])
+    procs = {10: cold, 20: hot}
+    topf.build_tree(procs)
+    for p in procs.values():
+        p.kept = True
+    key = lambda item: topf.subtree_window_cpu(
+        item.members[0] if isinstance(item, topf.Group) else item, 0)
+    lines = topf.render([cold, hot], set(), top_sort_key=key)
+    assert all(isinstance(ln, str) for ln in lines)
+    assert lines[0].endswith("hot")
 
 
 # --- viewport presenter -----------------------------------------------------
@@ -482,7 +650,107 @@ def _rows(n_select):
     return rows
 
 
+def test_selectable_ids_in_order():
+    rows = _rows(3)
+    assert topf.selectable_ids(rows) == [("p", 0, 1), ("p", 1, 1), ("p", 2, 1)]
+
+
+def test_move_cursor_clamps():
+    ids = [("p", i, 1) for i in range(3)]
+    assert topf.move_cursor(ids, ("p", 0, 1), +1) == ("p", 1, 1)
+    assert topf.move_cursor(ids, ("p", 0, 1), -1) == ("p", 0, 1)   # clamp at top
+    assert topf.move_cursor(ids, ("p", 2, 1), +1) == ("p", 2, 1)   # clamp at bottom
+    assert topf.move_cursor(ids, None, +1) == ("p", 0, 1)          # none -> first
+
+
+def test_present_viewport_highlights_cursor_and_glyph():
+    rows = _rows(2)
+    ui = topf.UIState(cursor=("p", 0, 1))
+    lines, cursor, top = topf.present_viewport(rows, ui, height=10, color=True)
+    assert cursor == ("p", 0, 1) and top == 0
+    assert "\x1b[7m" in lines[0]            # cursor row reverse-video
+    assert "▸ " in lines[0]                 # expandable glyph
+
+
+def test_present_viewport_scrolls_to_keep_cursor_visible():
+    rows = _rows(20)                        # 40 rows total
+    ui = topf.UIState(cursor=("p", 19, 1))  # bottom selectable
+    lines, cursor, top = topf.present_viewport(rows, ui, height=6, color=False)
+    assert len(lines) == 6
+    assert cursor == ("p", 19, 1)
+    assert any("head19" in ln for ln in lines)        # cursor visible
+    assert lines[0].startswith("▲")                   # "more above" marker
+
+
+def test_present_viewport_bottom_marker_when_overflow_below():
+    rows = _rows(20)
+    ui = topf.UIState(cursor=("p", 0, 1))
+    lines, cursor, top = topf.present_viewport(rows, ui, height=6, color=False)
+    assert lines[-1].startswith("▼")                  # "more below" marker
+
+
+def test_present_viewport_snaps_when_cursor_gone():
+    rows = _rows(3)
+    ui = topf.UIState(cursor=("p", 99, 1))  # not present
+    lines, cursor, top = topf.present_viewport(rows, ui, height=10, color=False)
+    assert cursor == ("p", 0, 1)            # snapped to first selectable
+
+
 # --- region layout ----------------------------------------------------------
+
+
+def test_split_regions_hidden_when_small():
+    # below MIN_ROWS_FOR_VMSTAT -> pane hidden, tree gets the whole body
+    region, vp, dp, sv, sd = topf.split_regions(
+        rows=12, cols=200, vmstat_on=True, vmstat_rows_cap=12, sample_rows=10)
+    assert sv is False and vp == 0 and region == 11   # rows-1 header
+
+
+def test_split_regions_narrow_hides_pane():
+    region, vp, dp, sv, sd = topf.split_regions(
+        rows=40, cols=50, vmstat_on=True, vmstat_rows_cap=12, sample_rows=10)
+    assert sv is False
+
+
+def test_split_regions_shows_pane_when_room():
+    # 40 rows: header 1, tree gets the rest minus a pane of 2 + k sample rows
+    region, vp, dp, sv, sd = topf.split_regions(
+        rows=40, cols=200, vmstat_on=True, vmstat_rows_cap=12, sample_rows=10)
+    assert sv is True
+    assert vp == 2 + 10                 # separator + header + 10 samples
+    assert region == (40 - 1) - vp
+
+
+def test_split_regions_caps_pane_to_keep_tree():
+    # tiny body: ensure tree keeps >= MIN_TREE_ROWS and pane >= MIN samples or hides
+    region, vp, dp, sv, sd = topf.split_regions(
+        rows=18, cols=200, vmstat_on=True, vmstat_rows_cap=12, sample_rows=10)
+    assert region >= topf.MIN_TREE_ROWS
+    if sv:
+        assert vp >= 2 + topf.MIN_VMSTAT_SAMPLE_ROWS
+
+
+def test_split_regions_off_when_toggled():
+    region, vp, dp, sv, sd = topf.split_regions(
+        rows=40, cols=200, vmstat_on=False, vmstat_rows_cap=12, sample_rows=10)
+    assert sv is False and region == 39
+
+
+def test_split_regions_with_disk_pane():
+    # Both panes on: vmstat gets its rows, disk gets its rows, tree gets the rest
+    region, vp, dp, sv, sd = topf.split_regions(
+        rows=50, cols=200, vmstat_on=True, vmstat_rows_cap=8, sample_rows=6,
+        disk_on=True, disk_rows_cap=6, disk_mounts_count=3)
+    assert sv is True and sd is True
+    assert vp > 0 and dp > 0
+    assert region == 49 - vp - dp
+
+
+def test_split_regions_disk_hides_when_no_mounts():
+    region, vp, dp, sv, sd = topf.split_regions(
+        rows=50, cols=200, vmstat_on=True, vmstat_rows_cap=8, sample_rows=6,
+        disk_on=True, disk_rows_cap=6, disk_mounts_count=0)
+    assert sd is False and dp == 0
 
 
 # --- disk pane --------------------------------------------------------------
@@ -510,7 +778,99 @@ def test_format_disk_pane_tints_high_usage():
 # --- key decoder ------------------------------------------------------------
 
 
+def test_read_key_decodes_arrows_and_plain():
+    r, w = os.pipe()
+    os.write(w, b"q");  assert topf._read_key(r) == "q"
+    os.close(r); os.close(w)
+
+    r, w = os.pipe()
+    os.write(w, b"\x1b[A");  assert topf._read_key(r) == "up"
+    os.close(r); os.close(w)
+
+    r, w = os.pipe()
+    os.write(w, b"\x1b[B");  assert topf._read_key(r) == "down"
+    os.close(r); os.close(w)
+
+    r, w = os.pipe()
+    os.write(w, b"\x1b[5~");  assert topf._read_key(r) == "pgup"
+    os.close(r); os.close(w)
+
+    r, w = os.pipe()
+    os.write(w, b"\x1b[6~");  assert topf._read_key(r) == "pgdn"
+    os.close(r); os.close(w)
+
+    r, w = os.pipe()
+    os.write(w, b"\x1bOA");  assert topf._read_key(r) == "up"
+    os.close(r); os.close(w)
+
+    r, w = os.pipe()
+    os.write(w, b"\x1bOB");  assert topf._read_key(r) == "down"
+    os.close(r); os.close(w)
+
+    r, w = os.pipe()
+    os.write(w, b"\x1b")
+    os.close(w)
+    assert topf._read_key(r) == "esc"
+    os.close(r)
+
+
 # --- CLI flags --------------------------------------------------------------
 
 
 # --- header enrichment ------------------------------------------------------
+
+
+def test_parse_meminfo_includes_swap_free_and_mem_total():
+    txt = ("MemTotal:  64000 kB\nMemFree:  1024 kB\nBuffers: 2048 kB\n"
+           "Cached: 4096 kB\nSwapTotal: 8192 kB\nSwapFree: 2048 kB\n")
+    m = topf.parse_meminfo(txt)
+    assert m["mem_total"] == 64000 * 1024
+    assert m["swap_free"] == 2048 * 1024
+    assert m["swap_total"] == 8192 * 1024
+    assert m["free"] == 1024 * 1024
+
+
+def test_count_states_classifies_states():
+    procs = {}
+    for i, state in enumerate(["R", "S", "D", "I", "Z", "R", "S", "Z"]):
+        procs[i] = topf.Proc(pid=i, ppid=0, comm="x", cmdline="x", state=state,
+                             num_threads=1, starttime=1, uid=0)
+    r, s, z = topf.count_states(procs)
+    assert r == 2 and s == 4 and z == 2   # S, D, I all count as sleeping
+
+
+def test_header_line_includes_load_avg():
+    h = topf.header_line(1.0, topf.SysInfo(100, 4096, 100, 8),
+                         nprocs=100, hidden=50, interval=1.0,
+                         loadavg=(0.5, 0.6, 0.7))
+    assert "load 0.50/0.60/0.70" in h
+
+
+def test_header_line_includes_mem_summary():
+    h = topf.header_line(1.0, topf.SysInfo(100, 4096, 100, 8),
+                         nprocs=100, hidden=50, interval=1.0,
+                         mem_total=64 * 1024**3, mem_used=10 * 1024**3)
+    assert "Mem: 10.0G/64.0G" in h
+
+
+def test_header_line_shows_swap_when_present():
+    h = topf.header_line(1.0, topf.SysInfo(100, 4096, 100, 8),
+                         nprocs=100, hidden=50, interval=1.0,
+                         swap_total=8 * 1024**3, swap_free=6 * 1024**3)
+    assert "Swap: 2.0G/8.0G" in h
+
+
+def test_header_line_omits_swap_when_zero():
+    h = topf.header_line(1.0, topf.SysInfo(100, 4096, 100, 8),
+                         nprocs=100, hidden=50, interval=1.0,
+                         swap_total=0, swap_free=0)
+    assert "Swap" not in h
+
+
+def test_header_line_includes_task_breakdown():
+    h = topf.header_line(1.0, topf.SysInfo(100, 4096, 100, 8),
+                         nprocs=100, hidden=50, interval=1.0,
+                         n_running=3, n_sleeping=90, n_zombie=2)
+    assert "3 run" in h
+    assert "90 sleep" in h
+    assert "2 zombie" in h

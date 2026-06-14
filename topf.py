@@ -234,6 +234,18 @@ def _descendants(proc):
     return out
 
 
+def proc_id(proc):
+    """Stable identity for a process row: (pid, starttime) survives re-sorting;
+    starttime distinguishes a reused pid."""
+    return ("p", proc.pid, proc.starttime)
+
+
+def group_id(parent_id, comm, exe):
+    """Stable identity for a merged group row, qualified by its parent so the
+    same (comm, exe) under different parents are distinct."""
+    return ("g", parent_id, comm, exe)
+
+
 def is_promoted(proc, page_size, promote_level, rss_needs_cpu, is_kthread):
     """A process is promoted (interesting because heavy) when it clears
     tint-anchor level >= promote_level on any CPU window, or (non-kthreads only)
@@ -316,12 +328,13 @@ def group_siblings(procs, dedup_min, never_merge):
 # --- pure core: collapse ----------------------------------------------------
 
 
-def collapse(procs, threshold=COLLAPSE_THRESHOLD):
-    """For each kept node whose kept-descendant count exceeds threshold, set
-    .collapsed and a .collapse_note histogram, and add its *non-interesting*
-    kept descendants to the suppressed set (interesting descendants stay
-    visible). Returns the set of suppressed pids."""
+def collapse(procs, threshold=COLLAPSE_THRESHOLD, expanded=frozenset()):
+    """For each kept node whose non-interesting kept descendants exceed
+    threshold, record it as collapsible. Unless its id is in `expanded`, also
+    mark it .collapsed with a histogram note and suppress those descendants.
+    Returns (suppressed_pids, collapsible_ids)."""
     suppressed = set()
+    collapsible = set()
     for p in procs.values():
         if not p.kept:
             continue
@@ -331,6 +344,9 @@ def collapse(procs, threshold=COLLAPSE_THRESHOLD):
         hide = [d for d in kept_desc if not d.interesting and d.pid not in suppressed]
         if len(hide) <= threshold:
             continue
+        collapsible.add(proc_id(p))
+        if proc_id(p) in expanded:
+            continue                    # user forced open: reveal, don't suppress
         p.collapsed = True
         suppressed.update(d.pid for d in hide)
         hist = Counter(d.comm for d in hide)
@@ -340,7 +356,43 @@ def collapse(procs, threshold=COLLAPSE_THRESHOLD):
         if extra > 0:
             top += ", …"
         p.collapse_note = "… (+%d descendants: %s)" % (len(hide), top)
-    return suppressed
+    return suppressed, collapsible
+
+
+def find_breakouts(procs, suppressed, collapsible, page_size, promote_level,
+                   rss_needs_cpu):
+    """For each collapsible node, identify suppressed descendants that are
+    promoted (heavy CPU/RSS) and should break out as heads-up rows even when
+    the ancestor is collapsed. Returns (breakout_pids, breakout_map) where
+    breakout_map is {proc_id(ancestor): [Proc]} capped at BREAKOUT_MAX."""
+    kthreadd = procs.get(2)
+    kthread_pids = set()
+    if kthreadd is not None:
+        kthread_pids = {2} | {d.pid for d in _descendants(kthreadd)}
+    # Build lookup: proc_id -> Proc for collapsible ancestors
+    cid_to_proc = {}
+    for p in procs.values():
+        pid = proc_id(p)
+        if pid in collapsible:
+            cid_to_proc[pid] = p
+    breakout_map = {}
+    breakout_pids = set()
+    for cid, ancestor in cid_to_proc.items():
+        for d in _descendants(ancestor):
+            if d.pid not in suppressed or d.interesting:
+                continue
+            is_kthread = d.pid in kthread_pids
+            if is_promoted(d, page_size, promote_level, rss_needs_cpu, is_kthread):
+                breakout_map.setdefault(cid, []).append(d)
+                breakout_pids.add(d.pid)
+    # Cap per ancestor, sorted by total CPU ticks descending
+    for cid, bps in breakout_map.items():
+        bps.sort(key=lambda p: -(p.utime + p.stime))
+        if len(bps) > BREAKOUT_MAX:
+            for p in bps[BREAKOUT_MAX:]:
+                breakout_pids.discard(p.pid)
+            breakout_map[cid] = bps[:BREAKOUT_MAX]
+    return breakout_pids, breakout_map
 
 
 # --- pure core: socket parsing ----------------------------------------------
@@ -1075,6 +1127,27 @@ def cores_count():
     return os.cpu_count() or 1
 
 
+def read_loadavg():
+    """Return (load_1m, load_5m, load_15m, running, total) from /proc/loadavg.
+    Any unreadable field degrades to None. Format: '0.43 0.41 0.76 1/1101 662997'"""
+    try:
+        parts = _read("/proc/loadavg").split()
+        r_total = parts[3].split("/")
+        return (float(parts[0]), float(parts[1]), float(parts[2]),
+                int(r_total[0]), int(r_total[1]))
+    except (OSError, ValueError, IndexError):
+        return (None, None, None, None, None)
+
+
+def count_states(procs):
+    """Return (running, sleeping, zombie) task counts from a {pid: Proc} snapshot.
+    Pure function; no I/O."""
+    running = sum(1 for p in procs.values() if p.state == "R")
+    sleeping = sum(1 for p in procs.values() if p.state in ("S", "D", "I"))
+    zombie = sum(1 for p in procs.values() if p.state == "Z")
+    return running, sleeping, zombie
+
+
 def _parents_map(*snaps):
     """pid -> comm across one or more {pid: Proc} snapshots (for annotating the
     parent of a born/died process)."""
@@ -1434,54 +1507,230 @@ def subtree_window_cpu(node, widx):
     return total
 
 
-def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
-           dedup_min=None, never_merge=frozenset(), top_sort_key=None,
-           show_avg=False):
-    """Render kept Procs as an ascii tree. With sysinfo, detail lines carry
-    cpu/rss/elapsed. With dedup_min, near-identical sibling subtrees merge into
-    one ×N entry that recurses over the union of members' children. With
-    top_sort_key, top-level items are ordered by it (descending)."""
+def build_rows(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
+               dedup_min=None, never_merge=frozenset(), top_sort_key=None,
+               show_avg=False, expanded=frozenset(), collapsible=frozenset(),
+               breakout_map=None):
+    """Build the tree as Row records (text, item_id, expandable, selectable).
+    Head rows (Proc/Group) are selectable; detail/collapse-note rows are
+    continuation lines. A Group whose id is in `expanded` renders a header row
+    followed by its members individually (so you can re-collapse it); otherwise
+    it renders the merged ×N line and recurses over the union of children. A
+    Proc head is expandable iff its id is in `collapsible`."""
     if color is None:
         color = False
-    lines = []
+    rows = []
 
-    def walk_items(items, prefix):
+    def emit(text, item_id=None, expandable=False, selectable=False):
+        rows.append(Row(text, item_id, expandable, selectable))
+
+    def walk_items(items, prefix, parent_id):
         for i, item in enumerate(items):
             is_last = i == len(items) - 1
             connector = "" if prefix == "" and is_last else (
                 "└─ " if is_last else "├─ ")
             child_prefix = prefix + ("   " if is_last else "│  ")
             if isinstance(item, Group):
+                gid = group_id(parent_id, item.members[0].comm,
+                               item.members[0].exe)
                 head = "%s%s×%d %s" % (prefix, connector, len(item.members),
                                        _group_label(item.members, width))
-                lines.append(head)
+                emit(head, item_id=gid, expandable=True, selectable=True)
                 detail = _group_detail(item.members, color, sysinfo, show_avg)
                 if detail is not None:
-                    lines.append(child_prefix + detail)
-                kids = [c for m in item.members
-                        for c in _visible_children(m, suppressed)]
+                    emit(child_prefix + detail)
+                if gid in expanded:
+                    walk_items(list(item.members), child_prefix, gid)
+                else:
+                    kids = [c for m in item.members
+                            for c in _visible_children(m, suppressed)]
+                    walk_items(group_siblings(kids, dedup_min, never_merge),
+                               child_prefix, gid)
             else:
+                pid_id = proc_id(item)
                 head = "%s%s%d %s" % (prefix, connector, item.pid,
                                       compress_cmdline(item.cmdline, width))
-                lines.append(head)
+                emit(head, item_id=pid_id, expandable=pid_id in collapsible,
+                     selectable=True)
                 detail = _detail(item, color, sysinfo, show_avg)
                 if detail is not None:
-                    lines.append(child_prefix + detail)
+                    emit(child_prefix + detail)
                 kids = _visible_children(item, suppressed)
-            walk_items(group_siblings(kids, dedup_min, never_merge), child_prefix)
-            if isinstance(item, Proc) and item.collapsed and item.collapse_note:
-                lines.append(child_prefix + item.collapse_note)
+                walk_items(group_siblings(kids, dedup_min, never_merge),
+                           child_prefix, pid_id)
+                if item.collapsed and item.collapse_note:
+                    emit(child_prefix + item.collapse_note)
+                # Breakout rows: hot procs that poke through the collapse
+                if (item.collapsed and breakout_map
+                        and proc_id(item) in breakout_map):
+                    for bp in breakout_map[proc_id(item)]:
+                        bp_line = "%s>> %d %s" % (
+                            child_prefix, bp.pid,
+                            compress_cmdline(bp.cmdline, width))
+                        emit(bp_line, item_id=proc_id(bp),
+                             expandable=False, selectable=True)
+                        bp_detail = _detail(bp, color, sysinfo, show_avg)
+                        if bp_detail is not None:
+                            emit(child_prefix + "   " + bp_detail)
 
     top_items = group_siblings(list(roots), dedup_min, never_merge)
     if top_sort_key is not None:
         # group_siblings already orders by min-pid (stable); a stable sort by
         # descending key therefore gives "load desc, pid asc" tiebreak.
         top_items.sort(key=top_sort_key, reverse=True)
-    walk_items(top_items, "")
-    return lines
+    walk_items(top_items, "", ROOT_ID)
+    return rows
+
+
+def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
+           dedup_min=None, never_merge=frozenset(), top_sort_key=None,
+           show_avg=False, expanded=frozenset(), collapsible=frozenset(),
+           breakout_map=None):
+    """Backward-compatible string view of build_rows (used by the once/piped
+    path and by tests)."""
+    return [r.text for r in build_rows(
+        roots, suppressed, width=width, color=color, sysinfo=sysinfo,
+        dedup_min=dedup_min, never_merge=never_merge, top_sort_key=top_sort_key,
+        show_avg=show_avg, expanded=expanded, collapsible=collapsible,
+        breakout_map=breakout_map)]
 
 
 # --- live UI state & viewport -----------------------------------------------
+
+
+@dataclass
+class UIState:
+    expanded: set = field(default_factory=set)
+    cursor: tuple = None
+    scroll_top: int = 0
+    frozen: bool = False
+    sort_idx: int = 0
+    vmstat_on: bool = True
+    disk_on: bool = True
+
+
+def selectable_ids(rows):
+    """Ordered item ids of the selectable head rows."""
+    return [r.item_id for r in rows if r.selectable]
+
+
+def move_cursor(ids, cursor, delta):
+    """Move the cursor `delta` selectable rows, clamped to the ends. A cursor of
+    None (or one no longer present) starts from the first row."""
+    if not ids:
+        return None
+    try:
+        i = ids.index(cursor)
+    except ValueError:
+        return ids[0]
+    return ids[max(0, min(len(ids) - 1, i + delta))]
+
+
+def _row_index_of(rows, item_id):
+    for i, r in enumerate(rows):
+        if r.selectable and r.item_id == item_id:
+            return i
+    return None
+
+
+def present_viewport(rows, ui, height, color):
+    """Slice `rows` to a `height`-row viewport around the cursor and decorate it:
+    a 2-col gutter (▸ closed / ▾ open on expandable rows, else blank), reverse
+    video on the cursor's row, and dim ▲/▼ 'more' markers on the first/last line
+    when content extends past the viewport. The markers occupy whole lines, so
+    when the content overflows the cursor is held one row inside each edge (an
+    'inner band') — a marker never overwrites the cursor's row. Returns (lines,
+    resolved_cursor, scroll_top). Pure: no terminal I/O."""
+    sel = [i for i, r in enumerate(rows) if r.selectable]
+    if not sel:
+        return ([r.text for r in rows[:height]], None, 0)
+
+    cur_idx = _row_index_of(rows, ui.cursor)
+    if cur_idx is None:
+        cur_idx = sel[0]
+    cursor = rows[cur_idx].item_id
+    n = len(rows)
+
+    def dim(s):
+        return ("\x1b[2m%s\x1b[0m" % s) if color else s
+
+    if n <= height:                       # everything fits, no markers/scroll
+        top = 0
+    else:
+        # reserve one line at each edge for a potential marker; keep the cursor
+        # within [top+1, top+height-2] so a marker can never land on it.
+        band = max(1, height - 2)
+        top = max(0, min(ui.scroll_top, n - height))
+        if cur_idx - top < 1:
+            top = cur_idx - 1
+        elif cur_idx - top > band:
+            top = cur_idx - band
+        top = max(0, min(top, n - height))
+
+    window = rows[top:top + height]
+    out = []
+    for off, r in enumerate(window):
+        idx = top + off
+        gutter = ("▾ " if r.item_id in ui.expanded else "▸ ") if r.expandable \
+            else "  "
+        text = gutter + r.text
+        if idx == cur_idx and color:
+            text = "\x1b[7m" + text + "\x1b[0m"
+        out.append(text)
+
+    if top > 0:                           # content hidden above
+        out[0] = dim("▲ %d more above" % top)
+    if top + height < n:                  # content hidden below
+        out[-1] = dim("▼ %d more below" % (n - (top + height)))
+    return out, cursor, top
+
+
+def split_regions(rows, cols, vmstat_on, vmstat_rows_cap, sample_rows,
+                  disk_on=False, disk_rows_cap=0, disk_mounts_count=0):
+    """Divide the screen height into (tree_region, vmstat_pane_rows, disk_pane_rows,
+    show_vmstat, show_disk). One row is the pinned header. The vmstat pane
+    (separator + header + k sample rows) is shown only when the terminal clears
+    the size thresholds, the user hasn't toggled it off, and there is room.
+    The disk pane (separator + header + k mount rows) is shown below the vmstat
+    pane if toggled on and there is room. If terminal is too small, disk hides
+    first (lower priority than vmstat)."""
+    body = rows - 1  # header
+    vmstat_pane = 0
+    show_vmstat = False
+    disk_pane = 0
+    show_disk = False
+
+    # vmstat pane
+    if vmstat_on and rows >= MIN_ROWS_FOR_VMSTAT and cols >= MIN_COLS_FOR_VMSTAT:
+        k = min(vmstat_rows_cap, max(sample_rows, MIN_VMSTAT_SAMPLE_ROWS))
+        k = min(k, body - MIN_TREE_ROWS - 2)    # 2 = separator + pane header
+        if k >= MIN_VMSTAT_SAMPLE_ROWS:
+            vmstat_pane = 2 + k
+            show_vmstat = True
+
+    remaining = body - vmstat_pane
+
+    # disk pane (below vmstat, lower priority)
+    if (disk_on and rows >= MIN_ROWS_FOR_DISK and cols >= MIN_COLS_FOR_DISK
+            and disk_mounts_count > 0):
+        dk = min(disk_rows_cap, max(disk_mounts_count, 2))
+        dk = min(dk, remaining - MIN_TREE_ROWS - 2)
+        if dk >= 2:
+            disk_pane = 2 + dk
+            show_disk = True
+
+    tree_rows = body - vmstat_pane - disk_pane
+    return tree_rows, vmstat_pane, disk_pane, show_vmstat, show_disk
+
+
+def lifecycle_section(prev, cur, sysinfo, frame_dt, color):
+    """The born/died lines (empty list when nothing changed). Shared by the
+    once frame and the live loop."""
+    if prev is None:
+        return []
+    born, died = diff_snapshots(prev, cur)
+    return format_lifecycle(born, died, _parents_map(prev, cur), sysinfo,
+                            frame_dt, color=color)
 
 
 def glossary(color):
@@ -1537,100 +1786,259 @@ def collect_printed(roots, suppressed):
 
 def _draw_frame(out, lines):
     """Home the cursor, write each line with clear-to-EOL, then clear to end of
-    screen so a shorter frame doesn't leave stale rows behind."""
+    screen so a shorter frame doesn't leave stale rows behind. No trailing
+    newline on the last line — writing \\n on the bottom row would scroll the
+    terminal and push the top line off-screen."""
     buf = ["\x1b[H"]
-    for ln in lines:
+    for ln in lines[:-1]:
         buf.append(ln + "\x1b[K\r\n")
+    if lines:
+        buf.append(lines[-1] + "\x1b[K")
     buf.append("\x1b[J")
     out.write("".join(buf))
     out.flush()
 
 
+def _read_key(fd):
+    """Decode one logical key from `fd` (unbuffered). Returns a plain char, or
+    one of 'up'/'down'/'pgup'/'pgdn'/'home'/'end'/'esc'/'enter'.  Uses os.read
+    to avoid the stdio-buffering mismatch where select sees an empty fd but
+    sys.stdin still has buffered bytes."""
+    def _read1():
+        b = os.read(fd, 1)
+        return b.decode() if b else ""
+    ch = _read1()
+    if ch == "\r" or ch == "\n":
+        return "enter"
+    if ch != "\x1b":
+        return ch
+    if not _select.select([fd], [], [], 0.01)[0]:
+        return "esc"
+    nxt = _read1()
+    if nxt not in ("[", "O"):
+        return "esc"
+    seq = ""
+    while True:
+        c = _read1()
+        if not c:
+            break
+        seq += c
+        if c.isalpha() or c == "~":
+            break
+    if nxt == "O":
+        return {"A": "up", "B": "down", "H": "home", "F": "end"}.get(seq, "esc")
+    return {"A": "up", "B": "down", "H": "home", "F": "end",
+            "5~": "pgup", "6~": "pgdn", "1~": "home", "4~": "end"}.get(seq, "esc")
+
+
 def run_live(args):
-    """Full-screen live loop: raw ANSI alt-screen + termios cbreak + select
-    polling. Read-only keys: q/Ctrl-C quit, space freeze, w cycle sort window.
-    Terminal state is always restored (finally), even on exception/signal."""
+    """Full-screen live loop with a pinned header, a scrolling/cursored process
+    tree, and pinned vmstat + disk panes. Keys: q/Ctrl-C quit, f freeze, w sort
+    window, v toggle vmstat, d toggle disk, E expand all groups, ↑/k ↓/j move
+    cursor, PgUp/PgDn page, g/G top/bottom, Space/Enter expand-collapse the
+    selected group/subtree. Terminal state is always restored."""
     fd = sys.stdin.fileno()
     out = sys.stdout
     old_attr = termios.tcgetattr(fd)
     windows = args.windows
     longest = max(windows)
     history = {}
-    cache = (Cache(os.devnull, boot_id="", now=time.time()) if args.no_cache
-             else Cache(cache_path(), boot_id=read_boot_id(), now=time.time()))
-    sysinfo_base = (read_uptime(), cores_count())
-    sort_idx = 0
-    frozen = False
+    vmring = []
+    ui = UIState(vmstat_on=not args.no_vmstat, disk_on=not args.no_disk)
+    sysinfo_cores = cores_count()
+    vmhist = (vmstat_hist_new() if args.no_history
+              else vmstat_hist_load(vmstat_hist_path(args)))
+    vmd = 0.5 ** (1.0 / max(1, args.vmstat_halflife))
+    vmcolored = []          # ring of (rate_row, levels), frozen at sample
+    vm_write_ctr = 0
     prev, t_prev = None, None
+    cur, rows, sysinfo = {}, [], None
+    _last_live_keys = set()
+    disk_sample = None
+
+    def repaint():
+        """Re-present the current `rows` + vmstat ring without resampling (used
+        after navigation/expand/freeze so input feels instant)."""
+        cols, term_rows = os.get_terminal_size()
+        disk_mounts = disk_sample if disk_sample is not None else []
+        region_h, vmstat_h, disk_h, show_vmstat, show_disk = split_regions(
+            term_rows, cols, ui.vmstat_on, args.vmstat_rows, len(vmcolored),
+            disk_on=ui.disk_on, disk_rows_cap=args.disk_rows,
+            disk_mounts_count=len(disk_mounts))
+        body, ui.cursor, ui.scroll_top = present_viewport(
+            rows, ui, region_h, color=not args.no_color)
+        if show_vmstat or show_disk:
+            body += [""] * (region_h - len(body))   # pad so panes pin to bottom
+        n_run, n_sleep, n_zombie = count_states(cur)
+        hidden = sum(1 for p in cur.values() if not p.kept)
+        latest = vmring[-1] if vmring else None
+        mem_total = latest.mem_total if latest else None
+        mem_used = (mem_total - (latest.free or 0) - (latest.buff or 0)
+                    - (latest.cache or 0)) if mem_total and latest else None
+        swap_total = latest.swap_total if latest else None
+        swap_free = latest.swap_free if latest else None
+        frame = [header_line((t_prev and (time.monotonic() - t_prev)) or 0.0,
+                             sysinfo, len(cur), hidden, args.sample_interval,
+                             ui.frozen,
+                             loadavg=read_loadavg(),
+                             mem_total=mem_total, mem_used=mem_used,
+                             swap_total=swap_total, swap_free=swap_free,
+                             n_running=n_run, n_sleeping=n_sleep,
+                             n_zombie=n_zombie)]
+        frame += body
+        if show_vmstat:
+            swap_on = any(s.swap_total for s in vmring if s.swap_total)
+            frame.append("─" * cols)
+            frame += format_vmstat_pane(vmcolored, swap_on, cols, vmstat_h - 1,
+                                        color=not args.no_color)
+        if show_disk:
+            frame.append("─" * cols)
+            frame += format_disk_pane(disk_mounts, cols, disk_h - 1,
+                                      color=not args.no_color)
+        _draw_frame(out, [visible_truncate(ln, cols) for ln in frame[:term_rows]])
+
+    def sample_and_build():
+        nonlocal prev, t_prev, cur, rows, sysinfo, vm_write_ctr, _last_live_keys, disk_sample
+        cur = scan()
+        t_now = time.monotonic()
+        update_history(history, cur, t_now, longest)
+        compute_windows(cur, history, windows, CLK_TCK)
+        vmring.append(read_vmstat_sample(t_now))
+        if len(vmring) > args.vmstat_rows + 1:
+            del vmring[0]
+        if len(vmring) >= 2:
+            prev_s, cur_s = vmring[-2], vmring[-1]
+            dt = cur_s.t - prev_s.t
+            if dt > 0:
+                vmcolored.append(vmstat_colored_row(prev_s, cur_s, dt, vmhist,
+                                                    vmd, sysinfo_cores))
+                if len(vmcolored) > args.vmstat_rows * 2 + 2:
+                    del vmcolored[0]
+                vm_write_ctr += 1
+                if not args.no_history and \
+                        vm_write_ctr % VMSTAT_WRITE_EVERY == 0:
+                    vmstat_hist_save(vmstat_hist_path(args), vmhist)
+        disk_sample = read_disk_sample()
+        sysinfo = SysInfo(clk_tck=CLK_TCK, page_size=PAGE_SIZE,
+                          uptime=read_uptime(), cores=sysinfo_cores)
+        visible_roots, suppressed, collapsible, breakout_map = prepare_frame(
+            cur, args, sysinfo, expanded=ui.expanded)
+        dedup_min = None if args.no_dedup else args.dedup_min
+        key = lambda item: subtree_window_cpu(
+            item.members[0] if isinstance(item, Group) else item, ui.sort_idx)
+        rows = build_rows(visible_roots, suppressed, width=args.width,
+                          color=not args.no_color, sysinfo=sysinfo,
+                          dedup_min=dedup_min, never_merge=NEVER_MERGE,
+                          top_sort_key=key, expanded=ui.expanded,
+                          collapsible=collapsible, breakout_map=breakout_map)
+        _last_live_keys = {(p.pid, p.starttime) for p in cur.values()}
+        prev, t_prev = cur, t_now
 
     try:
         tty.setcbreak(fd)
         out.write("\x1b[?1049h")
         out.flush()
+        sample_and_build()
+        repaint()
         while True:
-            if not frozen:
-                cur = scan()
-                t_now = time.monotonic()
-                update_history(history, cur, t_now, longest)
-                compute_windows(cur, history, windows, CLK_TCK)
-                color = not args.no_color
-                sysinfo = SysInfo(clk_tck=CLK_TCK, page_size=PAGE_SIZE,
-                                  uptime=read_uptime(), cores=sysinfo_base[1])
-                lines = build_frame(prev, cur, history, t_prev or t_now, t_now,
-                                    args, color, sysinfo, sort_idx,
-                                    show_avg=False, frozen=frozen)
-                cols, rows = os.get_terminal_size()
-                _draw_frame(out, clip_frame(lines, rows, cols))
-                prev, t_prev = cur, t_now
-
             r, _w, _e = _select.select([fd], [], [], args.sample_interval)
             if r:
-                ch = sys.stdin.read(1)
-                if ch in ("q", "\x03"):     # q or Ctrl-C
+                key = _read_key(fd)
+                ids = selectable_ids(rows)
+                if key in ("q", "\x03"):
                     break
-                if ch == " ":
-                    frozen = not frozen
-                    if frozen:              # repaint once to show FROZEN marker
-                        cols, rows = os.get_terminal_size()
-                        lines[0] = header_line(
-                            (t_now - (t_prev or t_now)), sysinfo, len(cur),
-                            sum(1 for p in cur.values() if not p.kept),
-                            args.sample_interval, frozen=True)
-                        _draw_frame(out, clip_frame(lines, rows, cols))
-                elif ch == "w":
-                    sort_idx = (sort_idx + 1) % len(windows)
+                elif key == "f":
+                    ui.frozen = not ui.frozen
+                elif key == "w":
+                    ui.sort_idx = (ui.sort_idx + 1) % len(windows)
+                elif key == "v":
+                    ui.vmstat_on = not ui.vmstat_on
+                elif key == "E":
+                    # Expand all group rows in the current view
+                    for r in rows:
+                        if r.expandable and r.item_id[0] == "g":
+                            ui.expanded.add(r.item_id)
+                    sample_and_build()
+                elif key == "d":
+                    ui.disk_on = not ui.disk_on
+                elif key in ("up", "k"):
+                    ui.cursor = move_cursor(ids, ui.cursor, -1)
+                elif key in ("down", "j"):
+                    ui.cursor = move_cursor(ids, ui.cursor, +1)
+                elif key == "pgup":
+                    ui.cursor = move_cursor(ids, ui.cursor, -10)
+                elif key == "pgdn":
+                    ui.cursor = move_cursor(ids, ui.cursor, +10)
+                elif key in ("g", "home"):
+                    ui.cursor = ids[0] if ids else None
+                elif key in ("G", "end"):
+                    ui.cursor = ids[-1] if ids else None
+                elif key in (" ", "enter"):
+                    if ui.cursor is not None:
+                        ui.expanded ^= {ui.cursor}      # toggle membership
+                        sample_and_build()              # tree shape changed
+                repaint()                               # instant feedback
+            elif not ui.frozen:
+                sample_and_build()
+                repaint()
     except KeyboardInterrupt:
         pass
     finally:
         out.write("\x1b[?1049l")
         out.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
+        if not args.no_history:
+            vmstat_hist_save(vmstat_hist_path(args), vmhist)
         if not args.no_cache:
-            cache.now = time.time()
-            cache.save(live_keys=set())     # nothing forced live; entries already pruned
+            Cache(cache_path(), boot_id=read_boot_id(),
+                  now=time.time()).save(live_keys=_last_live_keys)
 
 
-def header_line(frame_dt, sysinfo, nprocs, hidden, interval, frozen=False):
-    """Top-style status line."""
+def header_line(frame_dt, sysinfo, nprocs, hidden, interval, frozen=False,
+                loadavg=None, mem_total=None, mem_used=None,
+                swap_total=None, swap_free=None,
+                n_running=0, n_sleeping=0, n_zombie=0):
+    """Top-style status line (two lines): system summary + procs/key hint."""
     state = "  FROZEN" if frozen else ""
-    return ("topf — %.2gs, %d cores, %d procs (%d hidden)   every %.2gs   "
-            "[q]uit  [space]freeze  [w]indow%s"
-            % (frame_dt, sysinfo.cores, nprocs, hidden, interval, state))
+    parts = ["topf — %.2gs, %d cores" % (frame_dt, sysinfo.cores)]
+    if loadavg and loadavg[0] is not None:
+        parts.append("load %.2f/%.2f/%.2f" % (loadavg[0], loadavg[1], loadavg[2]))
+    if mem_total is not None:
+        mem_t = fmt_bytes(mem_total)
+        mem_u = fmt_bytes(mem_used) if mem_used is not None else "?"
+        parts.append("Mem: %s/%s" % (mem_u, mem_t))
+    if swap_total and swap_total > 0:
+        sw_used = swap_total - (swap_free or 0)
+        parts.append("Swap: %s/%s" % (fmt_bytes(sw_used), fmt_bytes(swap_total)))
+    line1 = "  ".join(parts)
+    task_parts = ["%d procs" % nprocs]
+    if n_running:
+        task_parts.append("%d run" % n_running)
+    if n_sleeping:
+        task_parts.append("%d sleep" % n_sleeping)
+    if n_zombie:
+        task_parts.append("%d zombie" % n_zombie)
+    task_parts.append("%d hidden" % hidden)
+    line2 = "(%s)  every %.2gs  [q]uit [f]reeze [w]in [v]mstat [d]isk [E]groups [↑↓]nav [␣]expand%s" \
+            % (", ".join(task_parts), interval, state)
+    return line1 + "\n" + line2
 
 
-def build_frame(prev, cur, history, t_prev, t_now, args, color, sysinfo,
-                sort_idx, show_avg, frozen=False):
-    """Pure-ish assembly of one frame's lines (no clipping, no terminal I/O):
-    tree (ordered) + optional lifecycle, with a header on top. `prev` may be
-    None (first frame / once-mode primes). `history` already updated & windows
-    already computed for `cur`. Returns a list of lines."""
+def prepare_frame(cur, args, sysinfo, expanded=frozenset()):
+    """Shared pipeline: build the tree, select interesting/heavy nodes, collapse
+    (honoring expanded), probe the printed nodes. Returns
+    (visible_roots, suppressed, collapsible)."""
     roots = build_tree(cur)
     select(cur, DEFAULT_MATCHERS, sysinfo.page_size, args.promote_level,
            args.rss_needs_cpu)
-    suppressed = collapse(cur, threshold=args.threshold)
+    suppressed, collapsible = collapse(cur, threshold=args.threshold,
+                                       expanded=expanded)
+    breakout_pids, breakout_map = find_breakouts(
+        cur, suppressed, collapsible, sysinfo.page_size,
+        args.promote_level, args.rss_needs_cpu)
+    suppressed -= breakout_pids
     visible_roots = [r for r in roots if r.kept]
     printed = [n for n in collect_printed(visible_roots, suppressed) if n.kept]
-
     if args.no_cache:
         cache = Cache(os.devnull, boot_id="", now=time.time())
     else:
@@ -1638,21 +2046,49 @@ def build_frame(prev, cur, history, t_prev, t_now, args, color, sysinfo,
     probe(printed, cache)
     if not args.no_cache:
         cache.save(live_keys={(p.pid, p.starttime) for p in cur.values()})
+    return visible_roots, suppressed, collapsible, breakout_map
 
+
+def build_frame(prev, cur, history, t_prev, t_now, args, color, sysinfo,
+                sort_idx, show_avg, frozen=False, expanded=frozenset(),
+                vmring=None):
+    """Pure-ish assembly of one frame's lines (no clipping, no terminal I/O):
+    tree (ordered) + optional lifecycle, with a header on top. `prev` may be
+    None (first frame / once-mode primes). `history` already updated & windows
+    already computed for `cur`. Returns a list of lines. `vmring` supplies the
+    latest meminfo for the header (read fresh if None)."""
+    visible_roots, suppressed, collapsible, breakout_map = prepare_frame(
+        cur, args, sysinfo, expanded=expanded)
     dedup_min = None if args.no_dedup else args.dedup_min
     key = lambda item: subtree_window_cpu(
         item.members[0] if isinstance(item, Group) else item, sort_idx)
 
     frame_dt = (t_now - t_prev) if prev is not None else 0.0
     hidden = sum(1 for p in cur.values() if not p.kept)
+    n_run, n_sleep, n_zombie = count_states(cur)
+    # meminfo for header: prefer latest vmstat sample, else read fresh
+    if vmring:
+        latest = vmring[-1]
+    else:
+        latest = read_vmstat_sample(time.monotonic())
+    mem_total = latest.mem_total
+    mem_used = (mem_total - (latest.free or 0) - (latest.buff or 0)
+                - (latest.cache or 0)) if mem_total else None
     out = [header_line(frame_dt, sysinfo, len(cur), hidden,
-                       args.sample_interval, frozen)]
+                       args.sample_interval, frozen,
+                       loadavg=read_loadavg(),
+                       mem_total=mem_total, mem_used=mem_used,
+                       swap_total=latest.swap_total,
+                       swap_free=latest.swap_free,
+                       n_running=n_run, n_sleeping=n_sleep,
+                       n_zombie=n_zombie)]
     if not args.no_glossary:
         out += [""] + glossary(color)
     out += [""]
     out += render(visible_roots, suppressed, width=args.width, color=color,
                   sysinfo=sysinfo, dedup_min=dedup_min, never_merge=NEVER_MERGE,
-                  top_sort_key=key, show_avg=show_avg)
+                  top_sort_key=key, show_avg=show_avg, collapsible=collapsible,
+                  breakout_map=breakout_map)
     if prev is not None and not args.no_lifecycle:
         born, died = diff_snapshots(prev, cur)
         section = format_lifecycle(born, died, _parents_map(prev, cur),
