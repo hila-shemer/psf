@@ -8,6 +8,7 @@ default; --watch for continuous refresh.
 import argparse
 import os
 import re
+import stat
 import sys
 import time
 from collections import Counter, namedtuple
@@ -108,6 +109,7 @@ CLASSIFICATION_RULES = [
 ]
 
 CLUSTER_MIN = 5     # min same-comm procs to be called a "cluster"
+MAPS_MAX_PER_PROC = 3
 
 
 # --- classification ---------------------------------------------------------
@@ -261,6 +263,107 @@ def find_new_clusters(cur, prev, categories):
     return lines
 
 
+# --- path snapshot ----------------------------------------------------------
+
+PathHit = namedtuple("PathHit", "kind detail path")
+
+
+def normalize_path_target(path):
+    """Resolve a user path to an absolute subtree root for prefix matching."""
+    return os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+
+
+def _strip_deleted_marker(path):
+    marker = " (deleted)"
+    if path and path.endswith(marker):
+        return path[:-len(marker)]
+    return path
+
+
+def _path_is_in_subtree(path, root):
+    if not path or path == "?":
+        return False
+    if path.startswith(("socket:", "pipe:", "anon_inode:", "memfd:")):
+        return False
+    clean = _strip_deleted_marker(path)
+    try:
+        real = os.path.realpath(clean)
+    except OSError:
+        real = os.path.abspath(clean)
+    try:
+        return os.path.commonpath([root, real]) == root
+    except ValueError:
+        return False
+
+
+def _fd_kind(pid, fd):
+    try:
+        mode = os.stat("%s/%d/fd/%s" % (PROC, pid, fd)).st_mode
+    except OSError:
+        return "fd:%s" % fd
+    if stat.S_ISDIR(mode):
+        return "fd:%s dir" % fd
+    if stat.S_ISREG(mode):
+        return "fd:%s file" % fd
+    return "fd:%s" % fd
+
+
+def proc_path_hits(proc, root, readlink=os.readlink, listdir=os.listdir,
+                   read_maps=None, fd_kind=None):
+    """Return current cwd/exe/fd/maps hits for proc under root."""
+    hits = []
+    seen = set()
+
+    def add(kind, detail, path):
+        key = (kind, detail, path)
+        if key not in seen:
+            hits.append(PathHit(kind, detail, path))
+            seen.add(key)
+
+    for kind, path in (("cwd", proc.cwd), ("exe", proc.exe)):
+        if _path_is_in_subtree(path, root):
+            add(kind, "", path)
+
+    try:
+        fds = sorted(listdir("%s/%d/fd" % (PROC, proc.pid)), key=lambda x: int(x))
+    except (OSError, ValueError):
+        fds = []
+    for fd in fds:
+        try:
+            path = readlink("%s/%d/fd/%s" % (PROC, proc.pid, fd))
+        except OSError:
+            continue
+        if _path_is_in_subtree(path, root):
+            kind = fd_kind(proc.pid, fd) if fd_kind else _fd_kind(proc.pid, fd)
+            add(kind, "", path)
+
+    if read_maps is None:
+        read_maps = lambda pid: _read_text("%s/%d/maps" % (PROC, pid))
+    maps_seen = 0
+    for line in read_maps(proc.pid).splitlines():
+        if maps_seen >= MAPS_MAX_PER_PROC:
+            break
+        fields = line.split(None, 5)
+        if len(fields) < 6:
+            continue
+        path = fields[5]
+        if path.startswith("/") and _path_is_in_subtree(path, root):
+            add("mmap", "", path)
+            maps_seen += 1
+    return hits
+
+
+def collect_path_hits(procs, root):
+    """Return {pid: [PathHit]} for processes currently touching root."""
+    hits = {}
+    for p in procs.values():
+        p.cwd, p.exe = read_links(p.pid)
+        phits = proc_path_hits(p, root)
+        if phits:
+            hits[p.pid] = phits
+    return hits
+
+
 # --- render -----------------------------------------------------------------
 
 
@@ -301,8 +404,18 @@ def psf_header(sysinfo, procs, categories):
     return line1 + "\n" + line2
 
 
-def _proc_detail(proc, sysinfo, venv=None, show_venv=False):
-    """One-line detail for a process: cpu rss up [venv]."""
+def _format_path_hits(hits):
+    bits = []
+    for hit in hits:
+        label = hit.kind
+        if hit.detail:
+            label += ":" + hit.detail
+        bits.append("%s:%s" % (label, compress_path(hit.path)))
+    return "  ".join(bits)
+
+
+def _proc_detail(proc, sysinfo, venv=None, show_venv=False, path_hits=None):
+    """One-line detail for a process: cpu rss up [venv] [path hits]."""
     bits = []
     life = lifetime_secs(proc.starttime, sysinfo.uptime, sysinfo.clk_tck)
     avg = cpu_fraction(proc.utime + proc.stime, life, sysinfo.clk_tck)
@@ -315,6 +428,8 @@ def _proc_detail(proc, sysinfo, venv=None, show_venv=False):
         bits.append("%d threads" % proc.num_threads)
     if (show_venv or venv) and venv:
         bits.append("venv:%s" % compress_path(venv))
+    if path_hits:
+        bits.append(_format_path_hits(path_hits))
     return "  ".join(bits)
 
 
@@ -360,8 +475,9 @@ def _children_by_category(children, categories):
     return sorted(buckets.items(), key=lambda kv: (-kv[0].priority, kv[0].name))
 
 
-def render_session(session, sysinfo, args, categories, venv_map):
+def render_session(session, sysinfo, args, categories, venv_map, path_hits=None):
     """Render one session as lines: leader + categorized children."""
+    path_hits = path_hits or {}
     leader = session.leader
     cat = session.category
     venv = session.venv or (venv_map.get(leader.pid) if venv_map else None)
@@ -370,7 +486,8 @@ def render_session(session, sysinfo, args, categories, venv_map):
     leader_line = "[%s] %d %s" % (
         cat.badge, leader.pid,
         compress_cmdline(leader.cmdline, args.width))
-    detail = _proc_detail(leader, sysinfo, venv=venv, show_venv=args.venv)
+    detail = _proc_detail(leader, sysinfo, venv=venv, show_venv=args.venv,
+                          path_hits=path_hits.get(leader.pid))
     if detail:
         leader_line += "  " + detail
     lines.append(leader_line)
@@ -401,11 +518,30 @@ def render_session(session, sysinfo, args, categories, venv_map):
                         child_cat.badge, m.pid,
                         compress_cmdline(m.cmdline, args.width))
                     m_detail = _proc_detail(m, sysinfo, venv=m_venv,
-                                            show_venv=args.venv)
+                                            show_venv=args.venv,
+                                            path_hits=path_hits.get(m.pid))
                     if m_detail:
                         m_line += "  " + m_detail
                     lines.append(m_line)
     return lines
+
+
+def _session_has_path_hits(session, path_hits):
+    if session.leader.pid in path_hits:
+        return True
+    return any(c.pid in path_hits for c in session.children)
+
+
+def render_path_process(proc, sysinfo, args, categories, venv_map, path_hits):
+    cat = categories.get(proc.pid, CAT_BY_NAME["misc"])
+    line = "[%s] %d %s" % (cat.badge, proc.pid,
+                            compress_cmdline(proc.cmdline, args.width))
+    detail = _proc_detail(proc, sysinfo, venv=venv_map.get(proc.pid),
+                          show_venv=args.venv,
+                          path_hits=path_hits.get(proc.pid))
+    if detail:
+        line += "  " + detail
+    return line
 
 
 def render_psf(procs, sysinfo, args, prev=None):
@@ -424,6 +560,9 @@ def render_psf(procs, sysinfo, args, prev=None):
     for p in procs.values():
         categories[p.pid] = classify(p, venv_resolver=venv_resolver)
 
+    path_root = normalize_path_target(args.path) if args.path else None
+    path_hits = collect_path_hits(procs, path_root) if path_root else {}
+
     # Find sessions
     sessions = find_sessions(procs, categories, venv_map)
     session_pids = set()
@@ -433,23 +572,46 @@ def render_psf(procs, sysinfo, args, prev=None):
 
     # Build header
     lines = [psf_header(sysinfo, procs, categories), ""]
+    if path_root:
+        lines.append("touching %s — %d procs" %
+                     (compress_path(path_root), len(path_hits)))
+        lines.append("")
 
     # Render each session
+    rendered_pids = set()
     for session in sessions:
-        lines += render_session(session, sysinfo, args, categories, venv_map)
+        if path_root and not _session_has_path_hits(session, path_hits):
+            continue
+        lines += render_session(session, sysinfo, args, categories, venv_map,
+                                path_hits=path_hits)
         lines.append("")
+        rendered_pids.add(session.leader.pid)
+        rendered_pids.update(d.pid for d in session.children)
+
+    if path_root:
+        loose = [procs[pid] for pid in path_hits if pid not in rendered_pids]
+        if loose:
+            lines.append("Other touching processes")
+            for p in sorted(loose, key=lambda x: (categories[x.pid].priority * -1,
+                                                  x.pid)):
+                lines.append("  " + render_path_process(p, sysinfo, args,
+                                                         categories, venv_map,
+                                                         path_hits))
+            lines.append("")
 
     # Glue summaries
-    glue = summarize_glue(procs, categories, session_pids)
-    if glue:
-        lines += glue
-        lines.append("")
+    if not path_root:
+        glue = summarize_glue(procs, categories, session_pids)
+        if glue:
+            lines += glue
+            lines.append("")
 
     # New-process clusters
-    clusters = find_new_clusters(procs, prev, categories)
-    if clusters:
-        lines += clusters
-        lines.append("")
+    if not path_root:
+        clusters = find_new_clusters(procs, prev, categories)
+        if clusters:
+            lines += clusters
+            lines.append("")
 
     # Strip trailing blank lines
     while lines and lines[-1] == "":
@@ -469,6 +631,8 @@ def _parse_args(argv):
                     help="single snapshot and exit (default when piped)")
     ap.add_argument("--watch", action="store_true",
                     help="continuous refresh mode (simple reprint)")
+    ap.add_argument("--path", metavar="PATH",
+                    help="show processes currently touching PATH or its subtree")
     ap.add_argument("--interval", type=float, default=2.0,
                     help="refresh interval in seconds (default 2.0)")
     ap.add_argument("--no-color", action="store_true")
