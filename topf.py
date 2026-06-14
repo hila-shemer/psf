@@ -2121,14 +2121,12 @@ def render_once(interval, args):
 
 
 def _once_defaults():
-    """A defaults namespace for render_once in tests."""
-    import types
-    return types.SimpleNamespace(
-        width=CMD_WIDTH, threshold=COLLAPSE_THRESHOLD, no_cache=True,
-        no_color=True, no_glossary=False, sample_interval=REFRESH_INTERVAL,
-        no_dedup=False, dedup_min=DEDUP_MIN, no_lifecycle=False,
-        windows=DEFAULT_WINDOWS, promote_level=PROMOTE_LEVEL,
-        rss_needs_cpu=True)
+    """A defaults namespace for render_once in tests. Derived from _parse_args
+    so new flags appear automatically; only overrides test-oriented defaults."""
+    ns = _parse_args([])
+    ns.no_cache = True
+    ns.no_color = True
+    return ns
 
 
 def parse_windows(text):
@@ -2143,7 +2141,7 @@ def parse_windows(text):
     return vals
 
 
-def main(argv=None):
+def _parse_args(argv):
     ap = argparse.ArgumentParser(prog="topf",
                                  description="Focused live process viewer.")
     ap.add_argument("-w", "--width", type=int, default=CMD_WIDTH,
@@ -2180,14 +2178,28 @@ def main(argv=None):
     ap.add_argument("--no-rss-needs-cpu", dest="rss_needs_cpu",
                     action="store_false",
                     help="allow promotion by large RSS alone")
+    ap.add_argument("--no-vmstat", action="store_true",
+                    help="start with the bottom vmstat pane hidden (toggle: v)")
+    ap.add_argument("--vmstat-rows", type=int, default=VMSTAT_ROWS_DEFAULT,
+                    help="max vmstat sample rows in the pane (default %d)"
+                         % VMSTAT_ROWS_DEFAULT)
+    ap.add_argument("--no-disk", action="store_true",
+                    help="start with the disk space pane hidden (toggle: d)")
+    ap.add_argument("--disk-rows", type=int, default=DISK_ROWS_DEFAULT,
+                    help="max mount rows in the disk pane (default %d)"
+                         % DISK_ROWS_DEFAULT)
     args = ap.parse_args(argv)
+    return args
 
+
+def main(argv=None):
+    args = _parse_args(argv)
     use_once = args.once or not sys.stdout.isatty()
     if use_once:
         lines = render_once(args.sample_interval, args)
         print("\n".join(lines))
         return
-    run_live(args)   # implemented in Task 10
+    run_live(args)
 
 
 if __name__ == "__main__":

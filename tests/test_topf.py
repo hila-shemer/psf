@@ -817,6 +817,32 @@ def test_read_key_decodes_arrows_and_plain():
 # --- CLI flags --------------------------------------------------------------
 
 
+def test_main_parses_vmstat_flags():
+    ns = topf._parse_args(["--no-vmstat", "--vmstat-rows", "5"])
+    assert ns.no_vmstat is True and ns.vmstat_rows == 5
+    ns2 = topf._parse_args([])
+    assert ns2.no_vmstat is False and ns2.vmstat_rows == topf.VMSTAT_ROWS_DEFAULT
+
+
+def test_once_defaults_have_vmstat_fields():
+    d = topf._once_defaults()
+    assert hasattr(d, "no_vmstat") and hasattr(d, "vmstat_rows")
+
+
+def test_once_defaults_has_all_parse_args_attrs():
+    """_once_defaults (now derived from _parse_args) has every flag."""
+    defaults = topf._once_defaults()
+    parsed = topf._parse_args([])
+    # Every attribute from _parse_args([]) must also exist in _once_defaults
+    for attr in vars(parsed):
+        assert hasattr(defaults, attr), (
+            "_once_defaults missing attr %s (was it added to _parse_args "
+            "but not to _once_defaults?)" % attr)
+    # Test overrides
+    assert defaults.no_cache is True
+    assert defaults.no_color is True
+
+
 # --- header enrichment ------------------------------------------------------
 
 
