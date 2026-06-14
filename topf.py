@@ -1421,6 +1421,70 @@ def vmstat_cell_level(key, kind, value, col, cores):
                vmstat_relative_level(col, value, kind))
 
 
+def vmstat_hist_to_json(state):
+    """Serialize histogram state to a versioned JSON string."""
+    return json.dumps({
+        "version": 1,
+        "nbuckets": VMSTAT_NBUCKETS,
+        "columns": {k: {"hist": v["hist"], "count": v["count"]}
+                    for k, v in state.items()},
+    })
+
+
+def vmstat_hist_from_json(text):
+    """Parse a history file back to state. Any parse error, version mismatch, or
+    shape mismatch yields a fresh state — never raises. Unknown/old columns are
+    ignored; missing columns start empty."""
+    try:
+        d = json.loads(text)
+        if d.get("version") != 1 or d.get("nbuckets") != VMSTAT_NBUCKETS:
+            return vmstat_hist_new()
+        cols = d["columns"]
+        state = vmstat_hist_new()
+        for k in state:
+            c = cols.get(k)
+            if c and len(c["hist"]) == VMSTAT_NBUCKETS:
+                state[k]["hist"] = [float(x) for x in c["hist"]]
+                state[k]["count"] = int(c["count"])
+        return state
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return vmstat_hist_new()
+
+
+def vmstat_hist_path(args):
+    """Resolve the history-file path: --history-file if given, else
+    $XDG_STATE_HOME/topf/vmstat-hist.json (default ~/.local/state)."""
+    if args.history_file:
+        return args.history_file
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser(
+        "~/.local/state")
+    return os.path.join(base, "topf", "vmstat-hist.json")
+
+
+def vmstat_hist_load(path):
+    """Load histogram state from `path`; a missing/unreadable file -> fresh."""
+    try:
+        with open(path) as fh:
+            return vmstat_hist_from_json(fh.read())
+    except OSError:
+        return vmstat_hist_new()
+
+
+def vmstat_hist_save(path, state):
+    """Atomically write state to `path` (temp file + os.replace). Best-effort:
+    any OSError is swallowed so a read-only state dir never crashes topf."""
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write(vmstat_hist_to_json(state))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def format_vmstat_pane(colored_rows, swap_on, width, height, color):
     """Render the pinned vmstat pane: a header row of column names plus up to
     height-1 data rows (oldest..newest, top..bottom), columns right-aligned to
