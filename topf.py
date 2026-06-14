@@ -2377,12 +2377,22 @@ def _parse_args(argv):
     ap.add_argument("--vmstat-rows", type=int, default=VMSTAT_ROWS_DEFAULT,
                     help="max vmstat sample rows in the pane (default %d)"
                          % VMSTAT_ROWS_DEFAULT)
+    ap.add_argument("--history-file", default=None,
+                    help="vmstat coloring history file (default: XDG state dir)")
+    ap.add_argument("--no-history", action="store_true",
+                    help="do not load or save vmstat coloring history")
+    ap.add_argument("--vmstat-halflife", type=int,
+                    default=VMSTAT_HALFLIFE_DEFAULT,
+                    help="samples for a vmstat coloring weight to halve "
+                         "(default %d)" % VMSTAT_HALFLIFE_DEFAULT)
     ap.add_argument("--no-disk", action="store_true",
                     help="start with the disk space pane hidden (toggle: d)")
     ap.add_argument("--disk-rows", type=int, default=DISK_ROWS_DEFAULT,
                     help="max mount rows in the disk pane (default %d)"
                          % DISK_ROWS_DEFAULT)
     args = ap.parse_args(argv)
+    if args.vmstat_halflife < 1:
+        ap.error("--vmstat-halflife must be a positive integer")
     return args
 
 
