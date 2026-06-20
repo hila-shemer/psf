@@ -239,6 +239,50 @@ def test_render_psf_path_filters_to_touching_processes(monkeypatch, tmp_path):
     assert "bash" not in text
 
 
+def test_render_path_process_renders_hit_without_venv_arg():
+    # Guards the call site that kept passing show_venv=args.venv after the flag
+    # was removed - args has no .venv and _proc_detail has no such param, so it
+    # raised. render_path_process is the loose branch's renderer; no session
+    # plumbing needed to reproduce.
+    proc = _rproc(4321, comm="chrome", cmdline="chrome --type=renderer")
+    sysinfo = topf.SysInfo(clk_tck=topf.CLK_TCK, page_size=topf.PAGE_SIZE,
+                           uptime=100.0, cores=1)
+    args = psf._parse_args(["--path", "/usr"])
+    categories = {proc.pid: psf.CAT_BY_NAME["misc"]}
+    path_hits = {proc.pid: [psf.PathHit("mmap", "", "/usr/lib/libc.so.6")]}
+    line = psf.render_path_process(proc, sysinfo, args, categories,
+                                   venv_map={}, path_hits=path_hits)
+    assert "4321" in line and "chrome" in line
+    assert "mmap:" in line
+
+
+def test_render_psf_loose_process_reaches_render_path_process(monkeypatch,
+                                                              tmp_path):
+    # A path hit on a process outside every session lands under "Other touching
+    # processes" - the only caller of render_path_process. The session-child
+    # path test never reaches it, which is how the show_venv crash stayed green.
+    root = tmp_path / "foo"
+    root.mkdir()
+    procs = {
+        1: _rproc(1, ppid=0, comm="init", cmdline="init"),
+        99: _rproc(99, ppid=1, comm="grep", cmdline="grep -r needle"),
+    }
+    topf.build_tree(procs)
+    monkeypatch.setattr(psf, "read_links", lambda pid: ("/tmp", "/usr/bin/grep"))
+    monkeypatch.setattr(psf, "read_environ", lambda pid: {})
+    monkeypatch.setattr(psf, "proc_path_hits",
+                        lambda p, norm: [psf.PathHit("fd:3 file", "",
+                                                     str(root / "x"))]
+                        if p.pid == 99 else [])
+    args = psf._parse_args(["--path", str(root)])
+    sysinfo = topf.SysInfo(clk_tck=topf.CLK_TCK, page_size=topf.PAGE_SIZE,
+                           uptime=100.0, cores=1)
+    text = "\n".join(psf.render_psf(procs, sysinfo, args))
+    assert "Other touching processes" in text
+    assert "grep -r needle" in text
+    assert "fd:3 file:" in text
+
+
 # --- smoke test --------------------------------------------------------------
 
 
