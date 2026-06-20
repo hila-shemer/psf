@@ -35,6 +35,14 @@ DEDUP_MIN = 3             # min identical siblings to merge into one ×N group
 NEVER_MERGE = frozenset({"claude"})   # comms never grouped, even when identical
 GROUP_PIDS = 8            # member pids listed on a group's detail line
 LIFECYCLE_MAX = 40        # max born (and max died) comm-groups listed
+# Graduated tint for the cpu/rss detail bits. A value's level = how many of its
+# (exponential) anchors it clears; the level indexes TINT_SGR. Level 0 is the
+# dim baseline shared by the rest of the line; higher levels add a faint warm
+# tint, then full color, then bold red so heavy consumers pop. CPU anchors are
+# in cores (1.0 == one full core / 100%, independent of how many cores exist).
+TINT_SGR = ("2", "2;33", "33", "1;31")          # dim, dim-yellow, yellow, bold-red
+RSS_TINT_ANCHORS = (100 * 1024**2, 1024**3, 5 * 1024**3)   # 100M, 1G, 5G
+CPU_TINT_ANCHORS = (0.10, 1.0, 4.0)                        # 10%, 100%, 400%
 
 # System constants, read once. CLK_TCK converts stat jiffies -> seconds;
 # PAGE_SIZE converts stat rss (in pages) -> bytes.
@@ -726,42 +734,87 @@ def compress_path(path):
     return "/".join(parts) + suffix
 
 
+def compress_cmdline(cmdline, width):
+    """Fit a process cmdline into `width` while keeping the binary name and at
+    least the start of its arguments. argv[0] is often a long absolute path
+    (e.g. a bazelisk download dir), so blindly truncating shows only path and
+    drops the real command — instead compress argv[0]'s path the way exe/cwd
+    are compressed, and if that still leaves no room for an argument, fall back
+    to the bare (and, if huge, shortened) basename before truncating."""
+    if not cmdline or cmdline.startswith("["):
+        return cmdline[:width]
+    head, sep, rest = cmdline.partition(" ")
+    argv0 = compress_path(head)
+    if not sep:
+        return argv0[:width]
+    line = argv0 + " " + rest
+    if len(line) <= width:
+        return line
+    base = _compress_basename(head.rsplit("/", 1)[-1])
+    return (base + " " + rest)[:width]
+
+
+def _tint_level(value, anchors):
+    """Number of anchors `value` meets or exceeds -> a tint level (0..len).
+    0 is the dim baseline; higher anchors are exponential, so the tint only
+    strengthens by orders of magnitude. None/0 -> baseline."""
+    if not value:
+        return 0
+    return sum(1 for a in anchors if value >= a)
+
+
 def _cpu_bit(node, sysinfo):
-    """'cpu 3.4% (2.5% avg)' when a current sample exists, else 'cpu 2.5% avg'.
-    avg = lifetime CPU rate (total cpu-time / time alive)."""
+    """('cpu 3.4% (2.5% avg)', level) when a current sample exists, else
+    ('cpu 2.5% avg', …). avg = lifetime CPU rate (total cpu-time / time alive).
+    The tint level tracks live load (current sample, or avg when none) against
+    CPU_TINT_ANCHORS. Returns None when no rate is computable."""
     life = lifetime_secs(node.starttime, sysinfo.uptime, sysinfo.clk_tck)
-    avg = fmt_pct(cpu_fraction(node.utime + node.stime, life, sysinfo.clk_tck))
+    avg_frac = cpu_fraction(node.utime + node.stime, life, sysinfo.clk_tck)
+    avg = fmt_pct(avg_frac)
     cur = fmt_pct(node.cpu_current)
     if avg is None:
         return None
+    live = node.cpu_current if node.cpu_current is not None else avg_frac
+    level = _tint_level(live, CPU_TINT_ANCHORS)
     if cur is not None:
-        return "cpu %s (%s avg)" % (cur, avg)
-    return "cpu %s avg" % avg
+        return ("cpu %s (%s avg)" % (cur, avg), level)
+    return ("cpu %s avg" % avg, level)
+
+
+def _compose_dim(bits, color):
+    """Join (text, level) bits into one detail line. Without color, plain text.
+    With color, each bit is wrapped in its tint level's SGR code (TINT_SGR);
+    level 0 is dim, so all-baseline lines look exactly as before while heavy
+    cpu/rss bits gain a graduated warm tint."""
+    if not color:
+        return "  ".join(t for t, _ in bits)
+    segs = ["\x1b[%sm%s\x1b[0m" % (TINT_SGR[lvl], t) for t, lvl in bits]
+    return "\x1b[2m  \x1b[0m".join(segs)
 
 
 def _detail(node, color, sysinfo=None):
-    bits = []
+    bits = []   # (text, tint level)
     if node.cwd and node.cwd not in ("?", ""):
-        bits.append("cwd:" + compress_path(node.cwd))
+        bits.append(("cwd:" + compress_path(node.cwd), 0))
     if node.exe and node.exe not in ("?", ""):
-        bits.append("exe:" + compress_path(node.exe))
+        bits.append(("exe:" + compress_path(node.exe), 0))
     if node.sockets_str:
-        bits.append(node.sockets_str)
+        bits.append((node.sockets_str, 0))
     if sysinfo is not None:
         cpu = _cpu_bit(node, sysinfo)
         if cpu is not None:
             bits.append(cpu)
         rss = node.rss_pages * sysinfo.page_size
         if rss > 0:
-            bits.append("rss:" + fmt_bytes(rss))
-        bits.append("up:" + fmt_duration(
-            lifetime_secs(node.starttime, sysinfo.uptime, sysinfo.clk_tck)))
+            bits.append(("rss:" + fmt_bytes(rss),
+                         _tint_level(rss, RSS_TINT_ANCHORS)))
+        bits.append(("up:" + fmt_duration(
+            lifetime_secs(node.starttime, sysinfo.uptime, sysinfo.clk_tck)), 0))
     if node.num_threads > 1:
-        bits.append("%d threads" % node.num_threads)
+        bits.append(("%d threads" % node.num_threads, 0))
     if not bits:
         return None
-    line = "  ".join(bits)
-    return "\x1b[2m%s\x1b[0m" % line if color else line
+    return _compose_dim(bits, color)
 
 
 def _visible_children(node, suppressed):
@@ -775,15 +828,17 @@ def _group_label(members, width):
 def _group_detail(members, color, sysinfo):
     """Aggregated detail line for a merged group: shared/braced cwd & exe,
     member pids, and cpu/rss/up ranges (when sysinfo is given)."""
-    bits = []
+    bits = []   # (text, tint level)
     for attr, prefix in (("cwd", "cwd:"), ("exe", "exe:")):
         vals = [getattr(m, attr) for m in members
                 if getattr(m, attr) and getattr(m, attr) not in ("?", "")]
         if vals:
-            bits.append(prefix + brace_summary([compress_path(v) for v in vals]))
+            bits.append((prefix + brace_summary([compress_path(v)
+                                                 for v in vals]), 0))
     pids = sorted(m.pid for m in members)
     extra = " +%d" % (len(pids) - GROUP_PIDS) if len(pids) > GROUP_PIDS else ""
-    bits.append("pids:" + " ".join(str(x) for x in pids[:GROUP_PIDS]) + extra)
+    bits.append(("pids:" + " ".join(str(x) for x in pids[:GROUP_PIDS]) + extra,
+                 0))
     if sysinfo is not None:
         avgs = [a for a in (
             cpu_fraction(m.utime + m.stime,
@@ -792,23 +847,27 @@ def _group_detail(members, color, sysinfo):
             for m in members) if a is not None]
         if avgs:
             curs = [m.cpu_current for m in members if m.cpu_current is not None]
+            # Tint tracks the group's combined live load (the whole ×N entry).
+            live_total = sum(curs) if curs else sum(avgs)
+            level = _tint_level(live_total, CPU_TINT_ANCHORS)
             if curs:
-                bits.append("cpu %s (%s avg)" % (range_str(curs, fmt_pct),
-                                                 range_str(avgs, fmt_pct)))
+                bits.append(("cpu %s (%s avg)" % (range_str(curs, fmt_pct),
+                                                  range_str(avgs, fmt_pct)),
+                             level))
             else:
-                bits.append("cpu %s avg" % range_str(avgs, fmt_pct))
+                bits.append(("cpu %s avg" % range_str(avgs, fmt_pct), level))
         rss = [m.rss_pages * sysinfo.page_size for m in members
                if m.rss_pages > 0]
         if rss:
-            bits.append("rss:" + range_str(rss, fmt_bytes))
+            bits.append(("rss:" + range_str(rss, fmt_bytes),
+                         _tint_level(sum(rss), RSS_TINT_ANCHORS)))
         lifes = [lifetime_secs(m.starttime, sysinfo.uptime, sysinfo.clk_tck)
                  for m in members]
-        bits.append("up:" + range_str(lifes, fmt_duration))
+        bits.append(("up:" + range_str(lifes, fmt_duration), 0))
     threads = max(m.num_threads for m in members)
     if threads > 1:
-        bits.append("%d threads" % threads)
-    line = "  ".join(bits)
-    return "\x1b[2m%s\x1b[0m" % line if color else line
+        bits.append(("%d threads" % threads, 0))
+    return _compose_dim(bits, color)
 
 
 def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
@@ -837,7 +896,7 @@ def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
                         for c in _visible_children(m, suppressed)]
             else:
                 head = "%s%s%d %s" % (prefix, connector, item.pid,
-                                      item.cmdline[:width])
+                                      compress_cmdline(item.cmdline, width))
                 lines.append(head)
                 detail = _detail(item, color, sysinfo)
                 if detail is not None:
