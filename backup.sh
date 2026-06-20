@@ -28,6 +28,8 @@ ROOTS=(
     /home/shemer/.claude
     /home/shemer/clones
     /home/shemer/.local
+    /home/shemer/.bashrc
+    /home/shemer/.config
 )
 
 # Patterns to skip (repeatable, glob-style, matched against the stored path).
