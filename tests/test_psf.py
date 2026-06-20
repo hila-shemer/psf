@@ -483,6 +483,54 @@ class TestResourceDetail(unittest.TestCase):
         self.assertNotIn("rss:", text)               # rss 0 -> omitted
 
 
+class TestTintLevels(unittest.TestCase):
+    def test_tint_level_counts_anchors_cleared(self):
+        a = (100, 1000, 5000)
+        self.assertEqual(psf._tint_level(50, a), 0)     # baseline
+        self.assertEqual(psf._tint_level(100, a), 1)    # first anchor
+        self.assertEqual(psf._tint_level(2000, a), 2)
+        self.assertEqual(psf._tint_level(9000, a), 3)   # all anchors
+        self.assertEqual(psf._tint_level(0, a), 0)
+        self.assertEqual(psf._tint_level(None, a), 0)
+
+    def _info(self):
+        return psf.SysInfo(clk_tck=100, page_size=1, uptime=1100.0)
+
+    def _proc(self, cpu, rss_bytes):
+        # page_size 1 -> rss_pages is bytes; starttime gives ~100s alive.
+        p = _p(7, 1, comm="hog", cmdline="hog", starttime=99999,
+               utime=0, stime=0, rss_pages=rss_bytes)
+        p.kept = True
+        p.cpu_current = cpu
+        return p
+
+    def _render(self, p):
+        return "\n".join(psf.render([p], suppressed=set(), width=50,
+                                    color=True, sysinfo=self._info()))
+
+    def test_rss_tint_escalates_with_size(self):
+        # 50M -> baseline dim, 100M -> faint, 1G -> yellow, 5G -> bold-red.
+        MB, GB = 1024**2, 1024**3
+        self.assertIn("\x1b[2mrss:", self._render(self._proc(0, 50 * MB)))
+        self.assertIn("\x1b[2;33mrss:", self._render(self._proc(0, 100 * MB)))
+        self.assertIn("\x1b[33mrss:", self._render(self._proc(0, 1 * GB)))
+        self.assertIn("\x1b[1;31mrss:", self._render(self._proc(0, 5 * GB)))
+
+    def test_cpu_tint_is_absolute_not_share_of_total(self):
+        # 10% of ONE core tints even though a box may have many cores.
+        self.assertIn("\x1b[2mcpu", self._render(self._proc(0.05, 0)))   # 5% dim
+        self.assertIn("\x1b[2;33mcpu", self._render(self._proc(0.10, 0)))  # 10%
+        self.assertIn("\x1b[33mcpu", self._render(self._proc(1.0, 0)))     # 100%
+        self.assertIn("\x1b[1;31mcpu", self._render(self._proc(4.0, 0)))   # 400%
+
+    def test_cwd_and_up_stay_dim(self):
+        p = self._proc(4.0, 5 * 1024**3)
+        p.cwd = "/home/shemer/x"
+        text = self._render(p)
+        self.assertIn("\x1b[2mcwd:", text)        # cwd never tinted
+        self.assertIn("\x1b[2mup:", text)         # up never tinted
+
+
 class TestGlossary(unittest.TestCase):
     def test_glossary_explains_est_and_stats(self):
         text = "\n".join(psf.glossary(color=False))
@@ -516,6 +564,36 @@ class TestCompressPath(unittest.TestCase):
 
     def test_question_mark_passthrough(self):
         self.assertEqual(psf.compress_path("?"), "?")
+
+
+class TestCompressCmdline(unittest.TestCase):
+    def test_short_cmdline_unchanged(self):
+        self.assertEqual(psf.compress_cmdline("python3 psf.py", 50),
+                         "python3 psf.py")
+
+    def test_long_argv0_path_compressed_keeps_args(self):
+        # The reported case: a long absolute argv[0] hid 'bazel build //...'.
+        cmd = (psf.HOME + "/.cache/bazelisk/downloads/sha256/"
+               "c97f02133adce63f0c28678ac1f21d65fa8255c80429b588aeeba8a1f"
+               "ac6202b/bin/bazel build //...")
+        out = psf.compress_cmdline(cmd, 50)
+        self.assertEqual(out, "~/.cache/../bazel build //...")
+
+    def test_falls_back_to_basename_when_path_still_too_wide(self):
+        # argv[0] whose kept (first) component alone overflows width: drop the
+        # path so the binary name and an argument survive.
+        cmd = "/some-extremely-long-top-level-directory/bin/tool run --flag"
+        out = psf.compress_cmdline(cmd, 24)
+        self.assertTrue(out.startswith("tool run"), out)
+        self.assertLessEqual(len(out), 24)
+
+    def test_kernel_thread_passthrough(self):
+        self.assertEqual(psf.compress_cmdline("[kworker/0:1]", 50),
+                         "[kworker/0:1]")
+
+    def test_no_args_compresses_path(self):
+        self.assertEqual(psf.compress_cmdline("/usr/lib/a/b/c", 50),
+                         "/usr/../c")
 
 
 # --- group display helpers --------------------------------------------------
