@@ -1,4 +1,5 @@
 import os
+import sys
 
 import tempfile
 import unittest
@@ -782,6 +783,224 @@ class TestFormatLifecycle(unittest.TestCase):
                 for i in range(psf.LIFECYCLE_MAX + 5)]
         out = psf.format_lifecycle(born, [], {}, self.SYS, 0.2)
         self.assertIn("+5 more", "\n".join(out))
+
+
+# --- ported from session-finder: classification ----------------------------
+
+
+class TestClassify(unittest.TestCase):
+    def test_matches_known_categories(self):
+        self.assertEqual(psf.classify(_p(1, 0, comm="claude")).name,
+                         "user-session")
+        self.assertEqual(psf.classify(_p(2, 0, comm="bazel")).name,
+                         "build-daemon")
+        self.assertEqual(psf.classify(_p(3, 0, comm="clang-14")).name,
+                         "compile-worker")
+        self.assertEqual(psf.classify(_p(4, 0, comm="sshd")).name,
+                         "infrastructure")
+        self.assertEqual(psf.classify(_p(5, 0, comm="systemd")).name,
+                         "system-service")
+        self.assertEqual(psf.classify(_p(6, 0, comm="random_thing")).name,
+                         "misc")
+
+    def test_cmdline_rule_matches(self):
+        # 'code' as a word in the cmdline (comm doesn't match) -> user-session
+        p = _p(1, 0, comm="electron", cmdline="/usr/share/code/code --type=x")
+        self.assertEqual(psf.classify(p).name, "user-session")
+
+    def test_python_venv_overrides_to_user_session(self):
+        self.assertEqual(psf.classify(_p(1, 0, comm="python3")).name,
+                         "compile-worker")
+        resolver = (lambda proc: "/home/u/.venv"
+                    if proc.comm.startswith("python") else None)
+        self.assertEqual(
+            psf.classify(_p(1, 0, comm="python3"),
+                         venv_resolver=resolver).name, "user-session")
+
+    def test_python_no_venv_stays_compile_worker(self):
+        self.assertEqual(
+            psf.classify(_p(1, 0, comm="python3"),
+                         venv_resolver=lambda p: None).name, "compile-worker")
+
+
+# --- ported from session-finder: venv detection -----------------------------
+
+
+class TestVenv(unittest.TestCase):
+    def test_detect_from_exe_path_returns_venv_dir(self):
+        # exe-marker path returns the venv DIR itself (consistent with the
+        # VIRTUAL_ENV env var), not its parent.
+        p = _p(1, 0, comm="python3", exe="/home/u/proj/.venv/bin/python3")
+        self.assertEqual(psf.detect_venv(p), "/home/u/proj/.venv")
+
+    def test_no_venv_returns_none_or_str(self):
+        p = _p(1, 0, comm="python3", exe="/usr/bin/python3")
+        venv = psf.detect_venv(p)
+        self.assertTrue(venv is None or isinstance(venv, str))
+
+    def test_read_environ_has_path(self):
+        env = psf.read_environ(os.getpid())
+        self.assertIsInstance(env, dict)
+        self.assertIn("PATH", env)
+
+
+# --- ported from session-finder: system header ------------------------------
+
+
+class TestHeaderPieces(unittest.TestCase):
+    def test_count_states(self):
+        procs = {1: _p(1, 0, comm="a", state="R"),
+                 2: _p(2, 0, comm="b", state="S"),
+                 3: _p(3, 0, comm="c", state="Z"),
+                 4: _p(4, 0, comm="d", state="D")}
+        self.assertEqual(psf.count_states(procs), (1, 2, 1))
+
+    def test_parse_meminfo_returns_bytes(self):
+        content = ("MemTotal: 100 kB\nMemFree: 10 kB\nBuffers: 5 kB\n"
+                   "Cached: 20 kB\nSwapTotal: 50 kB\nSwapFree: 40 kB\n")
+        mem = psf.parse_meminfo(content)
+        self.assertEqual(mem["mem_total"], 100 * 1024)
+        self.assertEqual(mem["free"], 10 * 1024)
+        self.assertEqual(mem["swap_total"], 50 * 1024)
+
+    def test_psf_header_two_lines(self):
+        procs = {1: _p(1, 0, comm="a", state="R")}
+        lines = psf.psf_header(procs)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("psf", lines[0])
+        self.assertIn("cores", lines[0])
+        self.assertIn("1 procs", lines[1])
+
+
+# --- ported from session-finder: --path subtree matching --------------------
+
+
+class TestPathSubtree(unittest.TestCase):
+    def test_matches_root_and_children_not_peer(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "foo")
+            child = os.path.join(root, "bar")
+            peer = os.path.join(d, "foobar")
+            os.makedirs(child)
+            os.makedirs(peer)
+            norm = psf.normalize_path_target(root)
+            self.assertTrue(psf._path_is_in_subtree(root, norm))
+            self.assertTrue(psf._path_is_in_subtree(child, norm))
+            self.assertFalse(psf._path_is_in_subtree(peer, norm))
+            self.assertFalse(psf._path_is_in_subtree("socket:[123]", norm))
+            self.assertFalse(psf._path_is_in_subtree("?", norm))
+
+    def test_proc_path_hits_cwd_exe_fd_maps(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "foo")
+            os.makedirs(root)
+            norm = psf.normalize_path_target(root)
+            p = _p(10, 1, comm="python3", cmdline="python s.py",
+                   exe=os.path.join(root, "bin", "python"))
+            p.cwd = root
+            fd_path = os.path.join(root, "data.txt")
+            maps_path = os.path.join(root, "lib.so")
+            hits = psf.proc_path_hits(
+                p, norm,
+                readlink=lambda path: fd_path,
+                listdir=lambda path: ["3"],
+                read_maps=lambda pid: "7f r--p 0 00:00 0 %s\n" % maps_path,
+                fd_kind=lambda pid, fd: "fd:%s file" % fd)
+            rendered = {(h.kind, h.path) for h in hits}
+            self.assertIn(("cwd", p.cwd), rendered)
+            self.assertIn(("exe", p.exe), rendered)
+            self.assertIn(("fd:3 file", fd_path), rendered)
+            self.assertIn(("mmap", maps_path), rendered)
+
+    def test_proc_path_hits_empty_when_nothing_under_root(self):
+        with tempfile.TemporaryDirectory() as d:
+            norm = psf.normalize_path_target(os.path.join(d, "foo"))
+            p = _p(11, 1, comm="bash", cmdline="bash", exe="/usr/bin/bash")
+            p.cwd = "/tmp"
+            hits = psf.proc_path_hits(
+                p, norm, readlink=lambda path: "/etc/hosts",
+                listdir=lambda path: ["3"], read_maps=lambda pid: "",
+                fd_kind=lambda pid, fd: "fd:%s file" % fd)
+            self.assertEqual(hits, [])
+
+
+# --- integration: badges + venv in the tree, --path renderer, CLI -----------
+
+
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+class TestRenderBadgesVenv(unittest.TestCase):
+    def test_badge_prefix_and_venv_bit(self):
+        p = _p(1, 0, comm="claude", cmdline="claude")
+        p.kept = True
+        p.exe = "/home/u/proj/.venv/bin/python3"
+        cats = {1: psf.CAT_BY_NAME["user-session"]}
+        venvs = {1: "/home/u/proj/.venv"}
+        text = "\n".join(psf.render([p], suppressed=set(), width=60,
+                                    color=False, categories=cats,
+                                    venv_map=venvs))
+        self.assertIn("[usr] 1 claude", text)
+        self.assertIn("venv:", text)
+
+    def test_default_render_has_no_badge(self):
+        # Existing callers pass no categories -> output is byte-for-byte as before
+        # (no [badge] prefix).
+        p = _p(1, 0, comm="claude", cmdline="claude")
+        p.kept = True
+        text = "\n".join(psf.render([p], suppressed=set(), width=60,
+                                    color=False))
+        self.assertIn("1 claude", text)
+        self.assertNotIn("[usr]", text)
+
+
+class TestRenderPath(unittest.TestCase):
+    def test_renders_flat_toucher_line(self):
+        sysinfo = psf.SysInfo(clk_tck=100, page_size=4096, uptime=1100.0)
+        proc = _p(4321, 1, comm="chrome", cmdline="chrome --type=renderer",
+                  starttime=1000)
+        hits = [psf.PathHit("mmap", "", "/usr/lib/libc.so.6")]
+        line = psf.render_path(proc, False, sysinfo,
+                               psf.CAT_BY_NAME["misc"], None, hits, width=60)
+        self.assertIn("[mis] 4321 chrome", line)
+        self.assertIn("mmap:", line)
+
+    def test_cwd_hit_not_also_shown_as_generic_bit(self):
+        # When the cwd IS the path hit, it appears once (as the hit), not twice.
+        sysinfo = psf.SysInfo(clk_tck=100, page_size=4096, uptime=1100.0)
+        proc = _p(7, 1, comm="bash", cmdline="bash", starttime=1000)
+        proc.cwd = "/srv/work"
+        proc.exe = "/usr/bin/bash"
+        hits = [psf.PathHit("cwd", "", "/srv/work")]
+        line = psf.render_path(proc, False, sysinfo,
+                               psf.CAT_BY_NAME["infrastructure"],
+                               None, hits, width=60)
+        self.assertEqual(line.count("cwd:"), 1)
+
+
+class TestCliSmoke(unittest.TestCase):
+    def _run(self, *args):
+        import subprocess
+        return subprocess.run(
+            [sys.executable, os.path.join(_REPO, "psf.py"),
+             "-s", "0", "--no-cache", "--no-color", *args],
+            capture_output=True, text=True)
+
+    def test_header_present_by_default(self):
+        r = self._run("--no-glossary")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(r.stdout.startswith("psf —"), r.stdout[:80])
+        self.assertIn("cores", r.stdout.splitlines()[0])
+
+    def test_no_header_suppresses_header(self):
+        r = self._run("--no-glossary", "--no-header")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("psf —", r.stdout)
+
+    def test_path_mode_lists_touchers(self):
+        r = self._run("--path", "/usr")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("touching", r.stdout)
 
 
 if __name__ == "__main__":
