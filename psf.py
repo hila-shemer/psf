@@ -2,11 +2,16 @@
 """psf - focused process-snapshot tool.
 
 Prints a compact tree of only the *interesting* process subtrees (bazel,
-ssh sessions, tmux, claude), each annotated with the start of its command
-line, a summarized cwd, the executing binary, and open ports/sockets.
+ssh sessions, tmux, claude) under a system summary header, each process
+annotated with a category badge ([usr]/[bld]/[cmp]/[inf]/[sys]/[mis]), the
+start of its command line, a summarized cwd, the executing binary, the venv it
+belongs to (for python), and open ports/sockets.
 
 Deep-probes only the nodes it prints, and caches the expensive socket
 analysis across runs (keyed by (pid, starttime), validated by fd-count + TTL).
+
+`--path PATH` switches to a flat listing of every process whose cwd, exe, open
+fd, or mmap touches PATH or its subtree — for answering "what is touching this".
 
 Run under sudo/root to see other users' processes; degrades to '?' otherwise.
 """
@@ -15,6 +20,7 @@ import json
 import math
 import os
 import re
+import stat
 import sys
 import time
 from collections import Counter, namedtuple
@@ -68,6 +74,60 @@ DEFAULT_MATCHERS = [
     ("claude", "comm", re.compile(r"claude")),
     ("claude", "cmdline", re.compile(r"\bclaude\b")),
 ]
+
+# Process classification: a rule-based category (+ short badge) assigned to
+# every printed process, orthogonal to the "interesting subtree" selection above.
+# First matching rule wins; a python compile-worker inside a venv is promoted to
+# user-session (an interactive .venv python is a session, not a build worker —
+# see classify()).
+Category = namedtuple("Category", "name badge priority")
+CATEGORIES = [
+    Category("user-session",   "usr", 5),
+    Category("build-daemon",   "bld", 4),
+    Category("compile-worker", "cmp", 3),
+    Category("infrastructure", "inf", 2),
+    Category("system-service", "sys", 1),
+    Category("misc",           "mis", 0),
+]
+CAT_BY_NAME = {c.name: c for c in CATEGORIES}
+
+CLASSIFICATION_RULES = [
+    # (target, compiled_regex, category_name) — target is "comm" or "cmdline".
+    ("comm", re.compile(r"^claude"),      "user-session"),
+    ("comm", re.compile(r"^vim$"),        "user-session"),
+    ("comm", re.compile(r"^nvim$"),       "user-session"),
+    ("comm", re.compile(r"^emacs"),       "user-session"),
+    ("cmdline", re.compile(r"\bcode\b"),  "user-session"),
+    ("comm", re.compile(r"^bazel"),       "build-daemon"),
+    ("cmdline", re.compile(r"\bbazel\("), "build-daemon"),
+    ("comm", re.compile(r"^buck"),        "build-daemon"),
+    ("comm", re.compile(r"^gradle"),      "build-daemon"),
+    ("comm", re.compile(r"^ninja"),       "build-daemon"),
+    ("comm", re.compile(r"^java$"),       "build-daemon"),
+    ("comm", re.compile(r"^clang"),       "compile-worker"),
+    ("comm", re.compile(r"^cc1"),         "compile-worker"),
+    ("comm", re.compile(r"^gcc"),         "compile-worker"),
+    ("comm", re.compile(r"^g\+\+"),       "compile-worker"),
+    ("comm", re.compile(r"^javac"),       "compile-worker"),
+    ("comm", re.compile(r"^rustc"),       "compile-worker"),
+    ("comm", re.compile(r"^go$"),         "compile-worker"),
+    ("comm", re.compile(r"^python"),      "compile-worker"),
+    ("comm", re.compile(r"^node"),        "compile-worker"),
+    ("comm", re.compile(r"^systemd$"),    "system-service"),
+    ("comm", re.compile(r"^dbus"),        "system-service"),
+    ("comm", re.compile(r"^cron"),        "system-service"),
+    ("comm", re.compile(r"^sshd$"),       "infrastructure"),
+    ("comm", re.compile(r"^bash$"),       "infrastructure"),
+    ("comm", re.compile(r"^zsh$"),        "infrastructure"),
+    ("comm", re.compile(r"^tmux"),        "infrastructure"),
+    ("comm", re.compile(r"^login"),       "infrastructure"),
+]
+
+# venv detection: env-var names checked first, then these exe-path markers.
+VENV_PATH_MARKERS = (".venv/bin/", "env/bin/", "venv/bin/")
+
+# --path: max /proc/PID/maps lines scanned per process when matching a subtree.
+MAPS_MAX_PER_PROC = 3
 
 # ---------------------------------------------------------------------------
 
@@ -254,6 +314,54 @@ def collapse(procs, threshold=COLLAPSE_THRESHOLD):
     return suppressed
 
 
+# --- pure core: classification + venv ---------------------------------------
+
+
+def classify(proc, matchers=None, venv_resolver=None):
+    """Return the Category for a process. First matching rule in `matchers`
+    (CLASSIFICATION_RULES by default) wins. A python process that would be a
+    compile-worker is promoted to user-session when venv_resolver(proc) reports a
+    venv. venv_resolver is injectable so classify() itself stays pure."""
+    if matchers is None:
+        matchers = CLASSIFICATION_RULES
+    for target, rx, cat_name in matchers:
+        hay = proc.comm if target == "comm" else proc.cmdline
+        if rx.search(hay or ""):
+            if (cat_name == "compile-worker" and proc.comm.startswith("python")
+                    and venv_resolver is not None and venv_resolver(proc)):
+                return CAT_BY_NAME["user-session"]
+            return CAT_BY_NAME[cat_name]
+    return CAT_BY_NAME["misc"]
+
+
+def read_environ(pid):
+    """Parse /proc/PID/environ (NUL-separated KEY=VAL) into a dict. {} on any
+    failure — unreadable without privilege, or the process vanished."""
+    raw = _read_bin("%s/%d/environ" % (PROC, pid))
+    if not raw:
+        return {}
+    text = raw.decode("utf-8", errors="replace")
+    return dict(kv.split("=", 1) for kv in text.split("\0") if "=" in kv)
+
+
+def detect_venv(proc):
+    """The Python virtualenv a process belongs to, or None. Prefers the
+    VIRTUAL_ENV / CONDA_PREFIX env vars (which name the venv dir directly); else
+    derives it from the exe path, returning the venv DIR — the component before
+    '/bin/', e.g. '…/proj/.venv' — so both forms read the same."""
+    env = read_environ(proc.pid)
+    if env.get("VIRTUAL_ENV"):
+        return env["VIRTUAL_ENV"]
+    if env.get("CONDA_PREFIX"):
+        return env["CONDA_PREFIX"]
+    exe = proc.exe or ""
+    for marker in VENV_PATH_MARKERS:
+        idx = exe.find(marker)
+        if idx >= 0:
+            return exe[:idx] + marker.split("/", 1)[0]
+    return None
+
+
 # --- pure core: socket parsing ----------------------------------------------
 
 
@@ -423,6 +531,33 @@ def range_str(values, fmt):
     return "%s–%s" % (fmt(lo), fmt(hi))
 
 
+def count_states(procs):
+    """(running, sleeping, zombie) task counts from a {pid: Proc} snapshot;
+    sleeping folds in D (uninterruptible) and I (idle). Pure."""
+    running = sum(1 for p in procs.values() if p.state == "R")
+    sleeping = sum(1 for p in procs.values() if p.state in ("S", "D", "I"))
+    zombie = sum(1 for p in procs.values() if p.state == "Z")
+    return running, sleeping, zombie
+
+
+def parse_meminfo(content):
+    """Parse /proc/meminfo into BYTES (the file is in kB), keeping the few keys
+    the header needs: free/buff/cache/mem_total/swap_total/swap_free. Missing ->
+    None, except swap_total -> 0 so swap-off is the safe default. Pure."""
+    raw = {}
+    for line in content.splitlines():
+        f = line.split()
+        if len(f) >= 2 and f[0].endswith(":"):
+            try:
+                raw[f[0][:-1]] = int(f[1]) * 1024
+            except ValueError:
+                pass
+    return {"free": raw.get("MemFree"), "buff": raw.get("Buffers"),
+            "cache": raw.get("Cached"), "mem_total": raw.get("MemTotal"),
+            "swap_total": raw.get("SwapTotal", 0),
+            "swap_free": raw.get("SwapFree")}
+
+
 def diff_snapshots(before, after):
     """Given two {pid: Proc} snapshots, return (born, died) Proc lists keyed by
     (pid, starttime) so a reused PID is treated as a death + a birth. born are
@@ -559,6 +694,25 @@ def _read(path):
         return fh.read()
 
 
+def _read_text(path):
+    """Read a /proc file as text, '' on failure — for best-effort reads (environ,
+    maps) where a vanished or unprivileged pid must not abort the pass."""
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def _read_bin(path):
+    """Read a /proc file as bytes, b'' on failure (environ is NUL-separated)."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except OSError:
+        return b""
+
+
 def scan():
     """One cheap pass over /proc. Returns {pid: Proc} with stat/cmdline/uid
     filled; cwd/exe/sockets are deferred to probe()."""
@@ -635,6 +789,22 @@ def read_uptime():
         return 0.0
 
 
+def read_loadavg():
+    """(1m, 5m, 15m) load averages from /proc/loadavg; (None, None, None) on
+    failure."""
+    try:
+        f = _read("/proc/loadavg").split()
+        return float(f[0]), float(f[1]), float(f[2])
+    except (OSError, ValueError, IndexError):
+        return (None, None, None)
+
+
+def cores_count():
+    """Number of online CPUs — for the header line only; CPU figures are already
+    in cores. Falls back to 1."""
+    return os.cpu_count() or 1
+
+
 def _parents_map(*snaps):
     """pid -> comm across one or more {pid: Proc} snapshots (for annotating the
     parent of a born/died process)."""
@@ -699,6 +869,123 @@ def probe(nodes, cache, resolver=resolve_netmaps):
         summary = format_sockets(inodes, netmaps.get(ns, {}))
         node.sockets_str = summary
         cache.put(node.pid, node.starttime, fdcount, summary)
+
+
+# --- pure core: path snapshot ('--path') ------------------------------------
+
+PathHit = namedtuple("PathHit", "kind detail path")
+
+
+def normalize_path_target(path):
+    """Resolve a user-supplied path to an absolute, symlink-free subtree root for
+    prefix matching."""
+    return os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+
+
+def _strip_deleted_marker(path):
+    marker = " (deleted)"
+    if path and path.endswith(marker):
+        return path[:-len(marker)]
+    return path
+
+
+def _path_is_in_subtree(path, root):
+    """True when `path` resolves to `root` or a descendant. Pseudo-paths
+    (socket:/pipe:/anon_inode:/memfd:), '?' and '' are never matches; a kernel
+    ' (deleted)' marker is stripped before resolving."""
+    if not path or path == "?":
+        return False
+    if path.startswith(("socket:", "pipe:", "anon_inode:", "memfd:")):
+        return False
+    clean = _strip_deleted_marker(path)
+    try:
+        real = os.path.realpath(clean)
+    except OSError:
+        real = os.path.abspath(clean)
+    try:
+        return os.path.commonpath([root, real]) == root
+    except ValueError:        # not comparable (e.g. relative vs absolute)
+        return False
+
+
+def _fd_kind(pid, fd):
+    """Label an fd by what it points at: 'fd:N dir', 'fd:N file', or bare 'fd:N'."""
+    try:
+        mode = os.stat("%s/%d/fd/%s" % (PROC, pid, fd)).st_mode
+    except OSError:
+        return "fd:%s" % fd
+    if stat.S_ISDIR(mode):
+        return "fd:%s dir" % fd
+    if stat.S_ISREG(mode):
+        return "fd:%s file" % fd
+    return "fd:%s" % fd
+
+
+def proc_path_hits(proc, root, readlink=os.readlink, listdir=os.listdir,
+                   read_maps=None, fd_kind=None):
+    """Every way `proc` currently touches `root`: its cwd, exe, open fds, and the
+    first MAPS_MAX_PER_PROC mmap'd files under root. Returns a de-duplicated list
+    of PathHit. The os/read callables are injectable for testing."""
+    hits = []
+    seen = set()
+
+    def add(kind, detail, path):
+        key = (kind, detail, path)
+        if key not in seen:
+            hits.append(PathHit(kind, detail, path))
+            seen.add(key)
+
+    for kind, path in (("cwd", proc.cwd), ("exe", proc.exe)):
+        if _path_is_in_subtree(path, root):
+            add(kind, "", path)
+
+    try:
+        fds = sorted(listdir("%s/%d/fd" % (PROC, proc.pid)), key=int)
+    except (OSError, ValueError):
+        fds = []
+    for fd in fds:
+        try:
+            path = readlink("%s/%d/fd/%s" % (PROC, proc.pid, fd))
+        except OSError:
+            continue
+        if _path_is_in_subtree(path, root):
+            add((fd_kind or _fd_kind)(proc.pid, fd), "", path)
+
+    if read_maps is None:
+        read_maps = lambda pid: _read_text("%s/%d/maps" % (PROC, pid))
+    maps_seen = 0
+    for line in read_maps(proc.pid).splitlines():
+        if maps_seen >= MAPS_MAX_PER_PROC:
+            break
+        fields = line.split(None, 5)
+        if len(fields) < 6:
+            continue
+        path = fields[5]
+        if path.startswith("/") and _path_is_in_subtree(path, root):
+            add("mmap", "", path)
+            maps_seen += 1
+    return hits
+
+
+def collect_path_hits(procs, root):
+    """{pid: [PathHit]} for every process currently touching `root`. Fills each
+    proc's cwd/exe (cheap single readlinks) as a side effect."""
+    hits = {}
+    for p in procs.values():
+        p.cwd, p.exe = read_links(p.pid)
+        phits = proc_path_hits(p, root)
+        if phits:
+            hits[p.pid] = phits
+    return hits
+
+
+def _format_path_hits(hits):
+    """Join PathHits into one detail bit: 'kind:compressed/path  kind:…'."""
+    bits = []
+    for hit in hits:
+        label = hit.kind + (":" + hit.detail if hit.detail else "")
+        bits.append("%s:%s" % (label, compress_path(hit.path)))
+    return "  ".join(bits)
 
 
 # --- render -----------------------------------------------------------------
@@ -792,12 +1079,15 @@ def _compose_dim(bits, color):
     return "\x1b[2m  \x1b[0m".join(segs)
 
 
-def _detail(node, color, sysinfo=None):
+def _detail(node, color, sysinfo=None, venv=None, path_hits=None):
     bits = []   # (text, tint level)
-    if node.cwd and node.cwd not in ("?", ""):
-        bits.append(("cwd:" + compress_path(node.cwd), 0))
-    if node.exe and node.exe not in ("?", ""):
-        bits.append(("exe:" + compress_path(node.exe), 0))
+    if not path_hits:        # in --path mode the hits already carry cwd/exe/fd
+        if node.cwd and node.cwd not in ("?", ""):
+            bits.append(("cwd:" + compress_path(node.cwd), 0))
+        if node.exe and node.exe not in ("?", ""):
+            bits.append(("exe:" + compress_path(node.exe), 0))
+    if venv:
+        bits.append(("venv:" + compress_path(venv), 0))
     if node.sockets_str:
         bits.append((node.sockets_str, 0))
     if sysinfo is not None:
@@ -812,6 +1102,8 @@ def _detail(node, color, sysinfo=None):
             lifetime_secs(node.starttime, sysinfo.uptime, sysinfo.clk_tck)), 0))
     if node.num_threads > 1:
         bits.append(("%d threads" % node.num_threads, 0))
+    if path_hits:
+        bits.append((_format_path_hits(path_hits), 0))
     if not bits:
         return None
     return _compose_dim(bits, color)
@@ -871,13 +1163,22 @@ def _group_detail(members, color, sysinfo):
 
 
 def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
-           dedup_min=None, never_merge=frozenset()):
+           dedup_min=None, never_merge=frozenset(), categories=None,
+           venv_map=None):
     """Render kept Procs as an ascii tree. With sysinfo, detail lines carry
     cpu/rss/elapsed. With dedup_min, near-identical sibling subtrees merge into
-    one ×N entry that recurses over the union of members' children."""
+    one ×N entry that recurses over the union of members' children. With
+    categories ({pid: Category}), each head gains a '[badge]' prefix; with
+    venv_map ({pid: venv}), python procs gain a 'venv:' detail bit. A group's
+    badge is taken from its first member (members share comm/exe)."""
     if color is None:
         color = False
     lines = []
+
+    def badge(pid):
+        if categories and pid in categories:
+            return "[%s] " % categories[pid].badge
+        return ""
 
     def walk_items(items, prefix):
         for i, item in enumerate(items):
@@ -886,8 +1187,9 @@ def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
                 "└─ " if is_last else "├─ ")
             child_prefix = prefix + ("   " if is_last else "│  ")
             if isinstance(item, Group):
-                head = "%s%s×%d %s" % (prefix, connector, len(item.members),
-                                       _group_label(item.members, width))
+                head = "%s%s%s×%d %s" % (
+                    prefix, connector, badge(item.members[0].pid),
+                    len(item.members), _group_label(item.members, width))
                 lines.append(head)
                 detail = _group_detail(item.members, color, sysinfo)
                 if detail is not None:
@@ -895,10 +1197,12 @@ def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
                 kids = [c for m in item.members
                         for c in _visible_children(m, suppressed)]
             else:
-                head = "%s%s%d %s" % (prefix, connector, item.pid,
-                                      compress_cmdline(item.cmdline, width))
+                head = "%s%s%s%d %s" % (
+                    prefix, connector, badge(item.pid), item.pid,
+                    compress_cmdline(item.cmdline, width))
                 lines.append(head)
-                detail = _detail(item, color, sysinfo)
+                venv = venv_map.get(item.pid) if venv_map else None
+                detail = _detail(item, color, sysinfo, venv=venv)
                 if detail is not None:
                     lines.append(child_prefix + detail)
                 kids = _visible_children(item, suppressed)
@@ -910,12 +1214,25 @@ def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
     return lines
 
 
+def render_path(proc, color, sysinfo, category, venv, hits, width=CMD_WIDTH):
+    """One flat line for a process touching the --path target: '[badge] pid
+    cmdline' followed by its detail bits (cpu/rss/up/venv) and the path hits."""
+    head = "%s%d %s" % ("[%s] " % category.badge if category else "",
+                        proc.pid, compress_cmdline(proc.cmdline, width))
+    detail = _detail(proc, color, sysinfo, venv=venv, path_hits=hits)
+    if detail:
+        head += "  " + detail
+    return head
+
+
 def glossary(color):
     """A short legend printed at the head of the output explaining the
     annotations (notably what '+N est' means). Returns a list of lines."""
     lines = [
         "psf — interesting process subtrees only; the dim line under each "
         "process annotates it.",
+        "  badges:  [usr] user-session  [bld] build-daemon  [cmp] compile-worker"
+        "  [inf] infrastructure  [sys] system-service  [mis] misc",
         "  sockets: LISTEN :PORT = listening   "
         "+N est = N established TCP connections   unix:PATH = named socket",
         "  stats:   cpu X% (Y avg) = recent / lifetime-average CPU   "
@@ -926,6 +1243,35 @@ def glossary(color):
     if color:
         lines = ["\x1b[2m%s\x1b[0m" % ln for ln in lines]
     return lines
+
+
+def psf_header(procs):
+    """Two header lines: a system summary (cores / load / mem / swap) and a task
+    breakdown (proc count + running/sleeping/zombie). Reads loadavg and meminfo
+    live; `procs` supplies the counts. Returns a list of two strings."""
+    load = read_loadavg()
+    n_run, n_sleep, n_zombie = count_states(procs)
+    mem = parse_meminfo(_read_text("/proc/meminfo"))
+    parts = ["psf — %d cores" % cores_count()]
+    if load[0] is not None:
+        parts.append("load %.2f/%.2f/%.2f" % load)
+    mem_total = mem.get("mem_total")
+    if mem_total is not None:
+        used = mem_total - (mem.get("free") or 0) - (mem.get("buff") or 0) \
+            - (mem.get("cache") or 0)
+        parts.append("Mem %s/%s" % (fmt_bytes(used), fmt_bytes(mem_total)))
+    swap_total = mem.get("swap_total", 0)
+    if swap_total:
+        sw_used = swap_total - (mem.get("swap_free") or 0)
+        parts.append("Swap %s/%s" % (fmt_bytes(sw_used), fmt_bytes(swap_total)))
+    task = ["%d procs" % len(procs)]
+    if n_run:
+        task.append("%d run" % n_run)
+    if n_sleep:
+        task.append("%d sleep" % n_sleep)
+    if n_zombie:
+        task.append("%d zombie" % n_zombie)
+    return ["  ".join(parts), "(%s)" % ", ".join(task)]
 
 
 # --- CLI --------------------------------------------------------------------
@@ -961,6 +1307,33 @@ def collect_printed(roots, suppressed):
     return out
 
 
+def _run_path(args):
+    """--path mode: flat list of every process touching the target subtree,
+    highest-priority category first. Bypasses the interesting-subtree tree,
+    collapse, dedup, lifecycle and the socket cache — it answers one question,
+    'what is touching this path', directly."""
+    procs = scan()
+    sysinfo = SysInfo(clk_tck=CLK_TCK, page_size=PAGE_SIZE, uptime=read_uptime())
+    root = normalize_path_target(args.path)
+    hits = collect_path_hits(procs, root)        # fills cwd/exe; {pid: [PathHit]}
+    color = sys.stdout.isatty() and not args.no_color
+    venv_map = {pid: detect_venv(procs[pid]) for pid in hits
+                if procs[pid].comm.startswith("python")}
+    categories = {pid: classify(procs[pid],
+                                venv_resolver=lambda q: venv_map.get(q.pid))
+                  for pid in hits}
+
+    out = []
+    if not args.no_header:
+        out += psf_header(procs) + [""]
+    out.append("touching %s — %d procs" % (compress_path(root), len(hits)))
+    out.append("")
+    for pid in sorted(hits, key=lambda x: (-categories[x].priority, x)):
+        out.append(render_path(procs[pid], color, sysinfo, categories[pid],
+                               venv_map.get(pid), hits[pid], width=args.width))
+    print("\n".join(out))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Focused process snapshot.")
     ap.add_argument("-w", "--width", type=int, default=CMD_WIDTH,
@@ -983,7 +1356,16 @@ def main(argv=None):
                          % DEDUP_MIN)
     ap.add_argument("--no-lifecycle", action="store_true",
                     help="suppress the born/died section")
+    ap.add_argument("--no-header", action="store_true",
+                    help="suppress the system summary header")
+    ap.add_argument("--path", metavar="PATH",
+                    help="instead of the tree, list every process whose "
+                         "cwd/exe/open-fd/mmap touches PATH or its subtree")
     args = ap.parse_args(argv)
+
+    if args.path:
+        _run_path(args)
+        return
 
     s_a = scan()
     t_a = time.monotonic()
@@ -1018,11 +1400,22 @@ def main(argv=None):
     sysinfo = SysInfo(clk_tck=CLK_TCK, page_size=PAGE_SIZE, uptime=read_uptime())
     dedup_min = None if args.no_dedup else args.dedup_min
 
+    # Label the printed nodes: a venv for python procs, then a category badge for
+    # each (the venv promotes an interactive python from compile-worker to
+    # user-session — see classify()).
+    venv_map = {n.pid: detect_venv(n) for n in printed
+                if n.comm.startswith("python")}
+    categories = {n.pid: classify(n, venv_resolver=lambda q: venv_map.get(q.pid))
+                  for n in printed}
+
     out = []
+    if not args.no_header:
+        out += psf_header(s_a) + [""]
     if not args.no_glossary:
         out += glossary(color) + [""]
     out += render(visible_roots, suppressed, width=args.width, color=color,
-                  sysinfo=sysinfo, dedup_min=dedup_min, never_merge=NEVER_MERGE)
+                  sysinfo=sysinfo, dedup_min=dedup_min, never_merge=NEVER_MERGE,
+                  categories=categories, venv_map=venv_map)
     if s_b is not None and not args.no_lifecycle:
         section = format_lifecycle(born, died, _parents_map(s_a, s_b),
                                    sysinfo, dt, color=color)
