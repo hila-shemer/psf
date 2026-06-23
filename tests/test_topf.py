@@ -1210,3 +1210,21 @@ def test_header_line_includes_task_breakdown():
     assert "3 run" in h
     assert "90 sleep" in h
     assert "2 zombie" in h
+
+
+# --- live-loop select timeout (frozen must block, never busy-spin) ----------
+
+def test_select_timeout_frozen_blocks_forever():
+    # Frozen = wait for a key, don't resample. A finite timeout here is the
+    # busy-spin bug: deadline never advances, so a 0.0 timeout would loop hot.
+    assert topf._select_timeout(True, deadline=5.0, now=99.0) is None
+
+
+def test_select_timeout_unfrozen_future_deadline_is_remaining():
+    assert topf._select_timeout(False, deadline=10.0, now=7.5) == 2.5
+
+
+def test_select_timeout_unfrozen_past_deadline_polls_zero():
+    # Deadline already passed -> 0.0 so the loop resamples immediately,
+    # but never negative (select would reject that).
+    assert topf._select_timeout(False, deadline=3.0, now=9.0) == 0.0

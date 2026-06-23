@@ -2240,6 +2240,20 @@ def _read_key(fd):
             "5~": "pgup", "6~": "pgdn", "1~": "home", "4~": "end"}.get(seq, "esc")
 
 
+def _select_timeout(frozen, deadline, now):
+    """How long the live loop should wait for a keypress before resampling.
+
+    Frozen means "don't resample, just wait for a key", so block forever (None)
+    instead of polling. Returning a finite timeout here is the "f freezes my
+    CPU" bug: while frozen the `deadline` never advances, so a 0.0 timeout makes
+    select() return instantly every iteration and the loop spins a core flat.
+    Unfrozen, wait out whatever is left of the sample interval -- clamped at 0,
+    never negative (select rejects a negative timeout)."""
+    if frozen:
+        return None
+    return max(0.0, deadline - now)
+
+
 def run_live(args):
     """Full-screen live loop with a pinned header, a scrolling/cursored process
     tree, and pinned vmstat + disk panes. Keys: q/Ctrl-C quit, f freeze, w sort
@@ -2355,7 +2369,7 @@ def run_live(args):
         repaint()
         deadline = time.monotonic() + args.sample_interval
         while True:
-            remaining = max(0.0, deadline - time.monotonic())
+            remaining = _select_timeout(ui.frozen, deadline, time.monotonic())
             r, _w, _e = _select.select([fd], [], [], remaining)
             if r:
                 key = _read_key(fd)
