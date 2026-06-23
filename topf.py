@@ -2378,6 +2378,11 @@ def run_live(args):
                     break
                 elif key == "f":
                     ui.frozen = not ui.frozen
+                    if not ui.frozen:
+                        # Unfreeze -> fresh frame now, don't wait out the
+                        # interval that was in flight when we froze.
+                        sample_and_build()
+                        deadline = time.monotonic() + args.sample_interval
                 elif key == "w":
                     ui.sort_idx = (ui.sort_idx + 1) % len(windows)
                 elif key == "v":
