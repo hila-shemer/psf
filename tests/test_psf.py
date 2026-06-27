@@ -1279,6 +1279,73 @@ class TestEscapeFlags(unittest.TestCase):
         self.assertNotIn("+5 descendants", text)
 
 
+class TestColorMap(unittest.TestCase):
+    def _base(self, i):
+        h = psf.COLOR_FAMILIES[i]
+        return tuple(int(h[j:j + 2], 16) for j in (1, 3, 5))
+
+    def test_oklab_round_trips_exactly(self):
+        for h in psf.COLOR_FAMILIES:
+            self.assertEqual(psf._oklab_to_rgb(*psf._hex_to_oklab(h)),
+                             tuple(int(h[j:j + 2], 16) for j in (1, 3, 5)))
+
+    def test_depth0_is_the_base_hue(self):
+        for i in range(len(psf.COLOR_FAMILIES)):
+            self.assertEqual(psf.family_rgb(i, 0), self._base(i))
+
+    def test_deeper_dir_lightens(self):
+        for i in range(len(psf.COLOR_FAMILIES)):
+            self.assertGreaterEqual(sum(psf.family_rgb(i, 1)),
+                                    sum(psf.family_rgb(i, 0)))
+
+    def test_anchor_auto_detects_shared_prefix(self):
+        comps = [psf._canon_components(c) for c in
+                 ("/home/h/proj/mbm", "/home/h/proj/psf", "/home/h/proj/iteb")]
+        self.assertEqual(psf.detect_anchor(comps), ("home", "h", "proj"))
+
+    def test_anchor_never_consumes_last_component(self):
+        comps = [psf._canon_components("/home/h/proj/psf")] * 3
+        self.assertEqual(psf.detect_anchor(comps), ("home", "h", "proj"))
+
+    def test_anchor_robust_to_one_outlier(self):
+        comps = [psf._canon_components(c) for c in
+                 ("/home/h/proj/a", "/home/h/proj/b", "/home/h/proj/c", "/usr/x")]
+        self.assertEqual(psf.detect_anchor(comps), ("home", "h", "proj"))
+
+    def test_anchor_override(self):
+        self.assertEqual(psf.detect_anchor([], override="/srv/work"),
+                         ("srv", "work"))
+
+    def test_distinct_families_get_distinct_colors(self):
+        cm = psf.build_colormap([("/home/h/proj/mbm", 1), ("/home/h/proj/psf", 1)])
+        self.assertNotEqual(cm.sgr(("dir", "/home/h/proj/mbm")),
+                            cm.sgr(("dir", "/home/h/proj/psf")))
+
+    def test_same_dir_keys_to_same_color(self):
+        cm = psf.build_colormap([("/home/h/proj/mbm", 1), ("/home/h/proj/x", 1)])
+        self.assertEqual(cm.sgr(("dir", "/home/h/proj/mbm")),
+                         cm.sgr(("cmd", "/home/h/proj/mbm")))
+
+    def test_outside_anchor_is_uncolored(self):
+        cm = psf.build_colormap([("/home/h/proj/a", 1), ("/home/h/proj/b", 1)])
+        self.assertIsNone(cm.sgr(("dir", "/usr/lib/x")))
+        self.assertIsNone(cm.sgr(("dir", "?")))
+
+    def test_subdir_shares_family_but_different_shade(self):
+        cm = psf.build_colormap([("/home/h/proj/mbm", 1), ("/home/h/proj/p", 1)])
+        base = cm.sgr(("dir", "/home/h/proj/mbm"))
+        sub = cm.sgr(("dir", "/home/h/proj/mbm/src/net"))
+        self.assertIsNotNone(base)
+        self.assertNotEqual(base, sub)
+
+    def test_overflow_family_uncolored(self):
+        # five families, only four hues -> the least-weighted is uncolored
+        paths = [("/p/a", 5), ("/p/b", 4), ("/p/c", 3), ("/p/d", 2), ("/p/e", 1)]
+        cm = psf.build_colormap(paths)
+        self.assertIsNone(cm.sgr(("dir", "/p/e")))
+        self.assertIsNotNone(cm.sgr(("dir", "/p/a")))
+
+
 # --- view layer: build_view / emit_lines (model->view->render seam) ---------
 
 
