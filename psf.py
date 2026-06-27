@@ -1609,11 +1609,26 @@ def main(argv=None):
                     default=SAMPLE_INTERVAL,
                     help="seconds slept to measure current CPU (default %.2g; "
                          "0 disables the current-CPU sample)" % SAMPLE_INTERVAL)
-    ap.add_argument("--no-dedup", action="store_true",
-                    help="do not merge near-identical sibling subtrees")
+    ap.add_argument("-g", "--group",
+                    choices=("session", "consolidated", "dir"),
+                    default="session",
+                    help="grouping axis: session (default) roots each session at "
+                         "its leader; consolidated folds alike sessions; dir "
+                         "buckets by directory")
+    ap.add_argument("--pool-global", action="store_true",
+                    help="with --group consolidated, one flat ×N-by-kind list "
+                         "across every session")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="do not merge near-identical siblings (list each)")
+    ap.add_argument("--expand-all", action="store_true",
+                    help="expand everything: no merging and no subtree collapse")
+    ap.add_argument("--color-anchor", metavar="PATH",
+                    help="strip PATH as the color anchor instead of auto-detecting "
+                         "the shared prefix")
+    # Back-compat aliases, folded into --verbose/the dedup knob in one place.
+    ap.add_argument("--no-dedup", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--dedup-min", type=int, default=DEDUP_MIN,
-                    help="min identical siblings to merge (default %d)"
-                         % DEDUP_MIN)
+                    help=argparse.SUPPRESS)
     ap.add_argument("--no-lifecycle", action="store_true",
                     help="suppress the born/died section")
     ap.add_argument("--no-header", action="store_true",
@@ -1622,6 +1637,11 @@ def main(argv=None):
                     help="instead of the tree, list every process whose "
                          "cwd/exe/open-fd/mmap touches PATH or its subtree")
     args = ap.parse_args(argv)
+    if args.group == "dir" and args.path:
+        ap.error("--group dir is meaningless under --path (the path already "
+                 "scopes a directory)")
+    if args.pool_global and args.group != "consolidated":
+        ap.error("--pool-global requires --group consolidated")
 
     if args.path:
         _run_path(args)
@@ -1661,7 +1681,8 @@ def main(argv=None):
 
     color = sys.stdout.isatty() and not args.no_color
     sysinfo = SysInfo(clk_tck=CLK_TCK, page_size=PAGE_SIZE, uptime=read_uptime())
-    dedup_min = None if args.no_dedup else args.dedup_min
+    merge_off = args.no_dedup or args.verbose or args.expand_all
+    dedup_min = None if merge_off else args.dedup_min
 
     # Label the printed nodes: a venv for python procs, then a category badge for
     # each (the venv promotes an interactive python from compile-worker to
@@ -1679,7 +1700,8 @@ def main(argv=None):
     nodes = build_view(visible_roots, suppressed, width=args.width,
                        sysinfo=sysinfo, dedup_min=dedup_min,
                        never_merge=NEVER_MERGE, categories=categories,
-                       venv_map=venv_map, axis="session",
+                       venv_map=venv_map, axis=args.group,
+                       pool_global=args.pool_global, expand_all=args.expand_all,
                        key_fn=lambda p: merge_key(p, categories))
     out += emit_lines(nodes, color=color, colormap=None)
     if s_b is not None and not args.no_lifecycle:
