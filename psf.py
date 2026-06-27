@@ -1306,6 +1306,154 @@ def _group_detail(members, sysinfo):
     return bits
 
 
+# --- identity color: cartographic, protanomaly-safe ------------------------
+
+# Four scatter-validated family hues (see ~/.claude/memory/color-vision.md). Gray
+# is deliberately NOT a family: it reads as the terminal default fg, so an
+# uncolored span already looks gray and means 'no family'. Order is the palette
+# index 0..3.
+COLOR_FAMILIES = ("#F2E34C", "#E69F00", "#2E9E6B", "#1565C0")  # yellow amber green blue
+COLOR_DEPTH_STEP = 0.11        # OKLab L* added per directory level past the family
+COLOR_L_CEILING = 0.93         # cap on lightening - above the lightest base (yellow
+                               # L~0.90) so a base hue is never clamped, below white
+COLOR_MAX_DEPTH = 2            # directory levels that still get a distinct shade
+
+
+def _cbrt(x):
+    return (x if x >= 0 else 0.0) ** (1.0 / 3.0)
+
+
+def _srgb_to_linear(c):
+    c = c / 255.0
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _linear_to_srgb(c):
+    c = 0.0 if c < 0 else (1.0 if c > 1 else c)
+    v = c * 12.92 if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
+    return int(round(v * 255))
+
+
+def _hex_to_oklab(h):
+    """sRGB hex '#rrggbb' -> OKLab (L, a, b) (Ottosson 2020)."""
+    r, g, b = (_srgb_to_linear(int(h[i:i + 2], 16)) for i in (1, 3, 5))
+    l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
+    m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
+    s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
+    l_, m_, s_ = _cbrt(l), _cbrt(m), _cbrt(s)
+    return (0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+            1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+            0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_)
+
+
+def _oklab_to_rgb(L, a, b):
+    """OKLab -> sRGB (r, g, b) ints, clamped to gamut."""
+    l_ = L + 0.3963377774 * a + 0.2158037573 * b
+    m_ = L - 0.1055613458 * a - 0.0638541728 * b
+    s_ = L - 0.0894841775 * a - 1.2914855480 * b
+    l, m, s = l_ ** 3, m_ ** 3, s_ ** 3
+    return (_linear_to_srgb(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
+            _linear_to_srgb(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+            _linear_to_srgb(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s))
+
+
+def family_rgb(family_index, depth):
+    """Truecolor (r, g, b) for a family at directory `depth`: the base hue
+    lightened toward (never to) white in OKLab, so the steps look perceptually
+    even and deep paths still read as the same family."""
+    L, a, b = _hex_to_oklab(COLOR_FAMILIES[family_index])
+    L = min(COLOR_L_CEILING, L + COLOR_DEPTH_STEP * min(depth, COLOR_MAX_DEPTH))
+    return _oklab_to_rgb(L, a, b)
+
+
+def _canon_components(path):
+    """Absolute path -> tuple of components for color keying, ' (deleted)'
+    stripped. Pseudo/unknown paths -> () (never colored)."""
+    if (not path or path == "?"
+            or path.startswith(("socket:", "pipe:", "anon_inode:", "memfd:"))):
+        return ()
+    return tuple(c for c in _strip_deleted_marker(path).split("/") if c)
+
+
+def detect_anchor(component_lists, override=None):
+    """The shared prefix to strip before coloring. With override, that path's
+    components. Otherwise the deepest component-prefix shared by >= half of the
+    valid paths AND by >= 2, never consuming a path's last component (so a family
+    component always remains). < 2 valid paths -> () (nothing anchored)."""
+    if override is not None:
+        return tuple(c for c in override.split("/") if c)
+    valid = [c for c in component_lists if c]
+    if len(valid) < 2:
+        return ()
+    need = max(2, (len(valid) + 1) // 2)
+    best = ()
+    for d in range(1, max(len(c) for c in valid)):
+        cnt = Counter(c[:d] for c in valid if len(c) > d)
+        if cnt:
+            pref, k = cnt.most_common(1)[0]
+            if k >= need:
+                best = pref
+    return best
+
+
+class ColorMap:
+    """Resolves a ('dir'|'cmd', raw_path) key to a truecolor SGR opener. The
+    family is the first path component past the anchor; the four most-weighted
+    families get the palette, the rest (and anything outside the anchor) stay
+    default fg. Depth past the family lightens the hue."""
+
+    def __init__(self, anchor, families):
+        self.anchor = anchor            # tuple of components
+        self.families = families        # {component: family_index 0..3}
+
+    def family_of(self, path):
+        comps = _canon_components(path)
+        a = len(self.anchor)
+        if len(comps) <= a or comps[:a] != self.anchor:
+            return None, 0
+        fam = comps[a]
+        if fam not in self.families:
+            return None, 0
+        return self.families[fam], len(comps) - a - 1
+
+    def sgr(self, key):
+        if not key:
+            return None
+        fam, depth = self.family_of(key[1])
+        if fam is None:
+            return None
+        return "\x1b[38;2;%d;%d;%dm" % family_rgb(fam, depth)
+
+
+def build_colormap(paths_with_weight, anchor_override=None):
+    """paths_with_weight: iterable of (raw_path, weight). Detect the anchor, then
+    hand the four most-weighted families (weight = visual mass) the palette."""
+    comps = [(_canon_components(p), w) for p, w in paths_with_weight]
+    anchor = detect_anchor([c for c, _ in comps], anchor_override)
+    a = len(anchor)
+    weight = Counter()
+    for c, w in comps:
+        if len(c) > a and c[:a] == anchor:
+            weight[c[a]] += w
+    top = sorted(weight.items(), key=lambda kv: (-kv[1], kv[0]))[:len(COLOR_FAMILIES)]
+    return ColorMap(anchor, {f: i for i, (f, _) in enumerate(top)})
+
+
+def _truecolor():
+    """24-bit terminal? The scatter-validated hues need true color; on a 16/256
+    terminal identity color is disabled (heat-tint still applies)."""
+    return os.environ.get("COLORTERM", "") in ("truecolor", "24bit")
+
+
+def make_colormap(procs, color, anchor_override=None):
+    """Build the identity ColorMap from the shown procs' cwds, or None when color
+    is off or the terminal isn't truecolor."""
+    if not (color and _truecolor()):
+        return None
+    return build_colormap([(p.cwd, 1) for p in procs if p.cwd],
+                          anchor_override=anchor_override)
+
+
 @dataclass
 class ViewNode:
     """One display-tree node: a single Proc or a merged Group, children already
@@ -1365,6 +1513,7 @@ def build_view(roots, suppressed, width=CMD_WIDTH, sysinfo=None,
             badge=badge(item.pid),
             head_pre="%d " % item.pid,
             head_label=compress_cmdline(item.cmdline, width),
+            head_key=("dir", item.cwd),     # the command takes its project's hue
             detail_bits=_detail(item, sysinfo, venv=venv),
             collapse_note=(item.collapse_note
                            if (not expand_all and item.collapsed
@@ -1432,6 +1581,7 @@ def build_view(roots, suppressed, width=CMD_WIDTH, sysinfo=None,
                 kind="proc", payload=p, badge=badge(p.pid),
                 head_pre="%d " % p.pid,
                 head_label=compress_cmdline(p.cmdline, width),
+                head_key=("dir", p.cwd),
                 detail_bits=_detail(p, sysinfo, venv=venv, path_hits=ph),
                 sort_key=(-prio, p.pid))
         return sorted((flat_node(p) for p in roots), key=lambda n: n.sort_key)
@@ -1600,7 +1750,10 @@ def _run_path(args):
     nodes = build_view([procs[pid] for pid in hits], suppressed=set(),
                        width=args.width, sysinfo=sysinfo, categories=categories,
                        venv_map=venv_map, axis="flat", path_hits=hits)
-    out += emit_lines(nodes, color=color, colormap=None)
+    anchor = normalize_path_target(args.color_anchor) if args.color_anchor else None
+    colormap = make_colormap([procs[pid] for pid in hits], color,
+                             anchor_override=anchor)
+    out += emit_lines(nodes, color=color, colormap=colormap)
     print("\n".join(out))
 
 
@@ -1702,18 +1855,26 @@ def main(argv=None):
     categories = {n.pid: classify(n, venv_resolver=lambda q: venv_map.get(q.pid))
                   for n in printed}
 
+    anchor = normalize_path_target(args.color_anchor) if args.color_anchor else None
+    colormap = make_colormap(printed, color, anchor_override=anchor)
+
     out = []
     if not args.no_header:
         out += psf_header(s_a) + [""]
     if not args.no_glossary:
         out += glossary(color) + [""]
+    if colormap and colormap.anchor:        # the active anchor is data, always shown
+        note = ("color: directories & commands are hued by project under /%s "
+                "(dim = no project / outside anchor; warm = cpu/rss heat)"
+                % "/".join(colormap.anchor))
+        out += [("\x1b[2m%s\x1b[0m" % note) if color else note, ""]
     nodes = build_view(visible_roots, suppressed, width=args.width,
                        sysinfo=sysinfo, dedup_min=dedup_min,
                        never_merge=NEVER_MERGE, categories=categories,
                        venv_map=venv_map, axis=args.group,
                        pool_global=args.pool_global, expand_all=args.expand_all,
                        key_fn=lambda p: merge_key(p, categories))
-    out += emit_lines(nodes, color=color, colormap=None)
+    out += emit_lines(nodes, color=color, colormap=colormap)
     if s_b is not None and not args.no_lifecycle:
         section = format_lifecycle(born, died, _parents_map(s_a, s_b),
                                    sysinfo, dt, color=color)
