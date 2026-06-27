@@ -1346,6 +1346,70 @@ class TestColorMap(unittest.TestCase):
         self.assertIsNotNone(cm.sgr(("dir", "/p/a")))
 
 
+# Machado et al. (2009) protanomaly, severity ~0.5 (anomalous trichromat, not
+# dichromat - simulating full protanopia would over-reject a palette fine for
+# this user). Applied to linear RGB, then Lab + CIE76 distance. Pure Python.
+_PROTAN_05 = ((0.458064, 0.679578, -0.137642),
+              (0.092785, 0.846313, 0.060902),
+              (-0.007494, -0.016807, 1.024301))
+
+
+def _lin(c):
+    c /= 255.0
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _protan(rgb):
+    r, g, b = (_lin(x) for x in rgb)
+    return tuple(max(0.0, min(1.0, sum(m[i] * v for i, v in enumerate((r, g, b)))))
+                 for m in _PROTAN_05)
+
+
+def _lab(linrgb):
+    r, g, b = linrgb
+    X, Y, Z = (0.4124 * r + 0.3576 * g + 0.1805 * b,
+               0.2126 * r + 0.7152 * g + 0.0722 * b,
+               0.0193 * r + 0.1192 * g + 0.9505 * b)
+    f = lambda t: t ** (1 / 3) if t > 0.008856 else 7.787 * t + 16 / 116
+    fx, fy, fz = f(X / 0.95047), f(Y / 1.0), f(Z / 1.08883)
+    return (116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz))
+
+
+def _de76(a, b):
+    return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
+
+
+class TestPaletteCVDGuard(unittest.TestCase):
+    # Floors locked just below the measured palette minimum: this catches a
+    # FUTURE edit that makes any pair worse than today's scatter-validated set,
+    # without failing on the palette Hila actually validated by eye.
+    def _labs(self):
+        return {(i, d): _lab(_protan(psf.family_rgb(i, d)))
+                for i in range(len(psf.COLOR_FAMILIES)) for d in (0, 1, 2)}
+
+    def test_families_stay_apart_under_protanomaly(self):
+        labs = self._labs()
+        for (i, _), la in labs.items():
+            for (j, _), lb in labs.items():
+                if i < j:
+                    self.assertGreaterEqual(
+                        _de76(la, lb), 10.0,
+                        "families %d/%d collide under protanomaly" % (i, j))
+
+    def test_no_family_collapses_into_default_fg(self):
+        fg = _lab(_protan((180, 180, 180)))      # assumed terminal default gray
+        for k, la in self._labs().items():
+            self.assertGreaterEqual(_de76(la, fg), 20.0,
+                                    "family %r reads as default fg" % (k,))
+
+    def test_depth_shades_distinct_but_related(self):
+        labs = self._labs()
+        for i in range(len(psf.COLOR_FAMILIES)):
+            step = _de76(labs[(i, 0)], labs[(i, 1)])
+            self.assertGreater(step, 2.5)         # distinct from its base
+            self.assertLess(step, 40.0)           # still clearly the same family
+
+
 # --- view layer: build_view / emit_lines (model->view->render seam) ---------
 
 
