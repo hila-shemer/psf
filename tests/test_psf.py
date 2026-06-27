@@ -1003,5 +1003,75 @@ class TestCliSmoke(unittest.TestCase):
         self.assertIn("touching", r.stdout)
 
 
+# --- view layer: build_view / emit_lines (model->view->render seam) ---------
+
+
+class TestViewLayer(unittest.TestCase):
+    def _tree(self):
+        procs = {
+            1: _p(1, 0, comm="sshd", cmdline="sshd"),
+            2: _p(2, 1, comm="bash", cmdline="-bash"),
+            3: _p(3, 1, comm="vim", cmdline="vim foo"),
+        }
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        return procs
+
+    def test_emit_lines_connectors_golden(self):
+        # Locks the connector skeleton: root special case (no connector), ├─ for
+        # a non-last sibling, └─ for the last, and the indent under each.
+        procs = self._tree()
+        lines = psf.render([procs[1]], suppressed=set(), width=50, color=False,
+                           dedup_min=None, never_merge=frozenset())
+        self.assertEqual(lines, [
+            "1 sshd",
+            "   ├─ 2 -bash",
+            "   └─ 3 vim foo",
+        ])
+
+    def test_no_ansi_when_color_false(self):
+        procs = self._tree()
+        lines = psf.render([procs[1]], suppressed=set(), width=50, color=False)
+        self.assertNotIn("\x1b", "\n".join(lines))
+
+    def test_head_line_stays_plain_even_in_color(self):
+        # The head line carries no ANSI today (identity hue is wired in step 10);
+        # without a colormap, emit_lines must not color it.
+        procs = self._tree()
+        nodes = psf.build_view([procs[1]], suppressed=set(), width=50)
+        lines = psf.emit_lines(nodes, color=True, colormap=None)
+        head = [ln for ln in lines if "sshd" in ln][0]
+        self.assertNotIn("\x1b", head)
+
+    def test_build_view_shape(self):
+        procs = self._tree()
+        nodes = psf.build_view([procs[1]], suppressed=set(), width=50,
+                               dedup_min=None)
+        self.assertEqual(len(nodes), 1)
+        root = nodes[0]
+        self.assertEqual(root.kind, "proc")
+        self.assertEqual(root.head_pre, "1 ")
+        self.assertEqual(root.head_label, "sshd")
+        self.assertNotIn("\x1b", root.head_label)
+        self.assertEqual([c.head_label for c in root.children],
+                         ["-bash", "vim foo"])
+
+    def test_build_view_merges_identical_siblings(self):
+        procs = {1: _p(1, 0, comm="sshd", cmdline="sshd")}
+        for pid in (10, 11, 12):
+            procs[pid] = _p(pid, 1, comm="cc1", cmdline="cc1",
+                            exe="/usr/lib/cc1")
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        nodes = psf.build_view([procs[1]], suppressed=set(), width=50,
+                               dedup_min=3, never_merge=frozenset())
+        group = nodes[0].children[0]
+        self.assertEqual(group.kind, "group")
+        self.assertEqual(len(group.payload.members), 3)
+        self.assertEqual(group.head_pre, "×3 ")
+
+
 if __name__ == "__main__":
     unittest.main()

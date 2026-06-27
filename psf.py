@@ -1068,26 +1068,43 @@ def _cpu_bit(node, sysinfo):
     return ("cpu %s avg" % avg, level)
 
 
-def _compose_dim(bits, color):
-    """Join (text, level) bits into one detail line. Without color, plain text.
-    With color, each bit is wrapped in its tint level's SGR code (TINT_SGR);
-    level 0 is dim, so all-baseline lines look exactly as before while heavy
-    cpu/rss bits gain a graduated warm tint."""
+def _compose_dim(bits, color, colormap=None):
+    """Join Bits into one detail line. A Bit is (text, tint_level[, color_key]);
+    by the model invariant a bit carries at most one of {tint_level>0,
+    color_key}. Without color, plain text. With color, a bit whose color_key
+    `colormap` resolves gets that identity hue; otherwise it gets its tint
+    level's warm SGR (TINT_SGR), level 0 being the dim baseline - so a
+    colormap-less call is byte-identical to the old heat-only line."""
+    norm = [(b[0], b[1], b[2] if len(b) > 2 else None) for b in bits]
     if not color:
-        return "  ".join(t for t, _ in bits)
-    segs = ["\x1b[%sm%s\x1b[0m" % (TINT_SGR[lvl], t) for t, lvl in bits]
+        return "  ".join(t for t, _, _ in norm)
+    segs = []
+    for text, lvl, key in norm:
+        sgr = colormap.sgr(key) if (colormap is not None
+                                    and key is not None) else None
+        if sgr:
+            segs.append("%s%s\x1b[0m" % (sgr, text))
+        else:
+            segs.append("\x1b[%sm%s\x1b[0m" % (TINT_SGR[lvl], text))
     return "\x1b[2m  \x1b[0m".join(segs)
 
 
-def _detail(node, color, sysinfo=None, venv=None, path_hits=None):
-    bits = []   # (text, tint level)
+def _detail(node, sysinfo=None, venv=None, path_hits=None):
+    """The dim detail Bits for one Proc: cwd/exe (unless --path already carries
+    them), venv, sockets, cpu/rss/up, thread count, path hits last. Returns
+    list[Bit] (possibly empty); composing/coloring is the renderer's job. cwd
+    and exe carry a ('dir'/'cmd', raw_path) color_key so the renderer can hue
+    them; the raw path - not the compressed display string - is the key."""
+    bits = []
     if not path_hits:        # in --path mode the hits already carry cwd/exe/fd
         if node.cwd and node.cwd not in ("?", ""):
-            bits.append(("cwd:" + compress_path(node.cwd), 0))
+            bits.append(("cwd:" + compress_path(node.cwd), 0,
+                         ("dir", node.cwd)))
         if node.exe and node.exe not in ("?", ""):
-            bits.append(("exe:" + compress_path(node.exe), 0))
+            bits.append(("exe:" + compress_path(node.exe), 0,
+                         ("cmd", node.exe)))
     if venv:
-        bits.append(("venv:" + compress_path(venv), 0))
+        bits.append(("venv:" + compress_path(venv), 0, ("dir", venv)))
     if node.sockets_str:
         bits.append((node.sockets_str, 0))
     if sysinfo is not None:
@@ -1104,9 +1121,7 @@ def _detail(node, color, sysinfo=None, venv=None, path_hits=None):
         bits.append(("%d threads" % node.num_threads, 0))
     if path_hits:
         bits.append((_format_path_hits(path_hits), 0))
-    if not bits:
-        return None
-    return _compose_dim(bits, color)
+    return bits
 
 
 def _visible_children(node, suppressed):
@@ -1117,9 +1132,10 @@ def _group_label(members, width):
     return brace_summary([m.cmdline for m in members])[:width]
 
 
-def _group_detail(members, color, sysinfo):
-    """Aggregated detail line for a merged group: shared/braced cwd & exe,
-    member pids, and cpu/rss/up ranges (when sysinfo is given)."""
+def _group_detail(members, sysinfo):
+    """Aggregated detail Bits for a merged group: shared/braced cwd & exe,
+    member pids, and cpu/rss/up ranges (when sysinfo is given). Returns
+    list[Bit]; composing/coloring is the renderer's job."""
     bits = []   # (text, tint level)
     for attr, prefix in (("cwd", "cwd:"), ("exe", "exe:")):
         vals = [getattr(m, attr) for m in members
@@ -1159,59 +1175,122 @@ def _group_detail(members, color, sysinfo):
     threads = max(m.num_threads for m in members)
     if threads > 1:
         bits.append(("%d threads" % threads, 0))
-    return _compose_dim(bits, color)
+    return bits
 
 
-def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
-           dedup_min=None, never_merge=frozenset(), categories=None,
-           venv_map=None):
-    """Render kept Procs as an ascii tree. With sysinfo, detail lines carry
-    cpu/rss/elapsed. With dedup_min, near-identical sibling subtrees merge into
-    one ×N entry that recurses over the union of members' children. With
-    categories ({pid: Category}), each head gains a '[badge]' prefix; with
-    venv_map ({pid: venv}), python procs gain a 'venv:' detail bit. A group's
-    badge is taken from its first member (members share comm/exe)."""
-    if color is None:
-        color = False
-    lines = []
+@dataclass
+class ViewNode:
+    """One display-tree node: a single Proc or a merged Group, children already
+    grouped. The view layer produces these (pure - no /proc IO, no ANSI); the
+    renderer turns them into lines. head_label is the colorable span (cmdline or
+    group brace) the renderer prefixes with connector/badge/head_pre."""
+    kind: str                       # "proc" | "group"
+    payload: object                 # Proc | Group
+    badge: str = ""                 # "[xxx] " or ""
+    head_pre: str = ""              # "<pid> " (proc) or "×N " (group) - never colored
+    head_label: str = ""            # cmdline or group brace - gets identity hue
+    head_key: object = None         # ColorKey for head_label (wired in step 10)
+    detail_bits: list = field(default_factory=list)
+    extra_bits: list = field(default_factory=list)   # path-hit bits (step 8)
+    collapse_note: object = None    # proc-only
+    children: list = field(default_factory=list)
+    sort_key: tuple = ()
+
+
+def build_view(roots, suppressed, width=CMD_WIDTH, sysinfo=None,
+               dedup_min=None, never_merge=frozenset(), categories=None,
+               venv_map=None, axis="tree"):
+    """Turn kept Procs into a display tree (list[ViewNode]). Pure: no /proc IO,
+    no ANSI. Merging for the chosen axis is fully resolved here - each node's
+    children are its already-grouped visible children. axis="tree" is the
+    per-parent grouping the public render() exposes; the session/consolidated/dir
+    axes hang off this in later steps."""
 
     def badge(pid):
         if categories and pid in categories:
             return "[%s] " % categories[pid].badge
         return ""
 
-    def walk_items(items, prefix):
-        for i, item in enumerate(items):
+    def make_nodes(items):
+        nodes = []
+        for item in items:
+            if isinstance(item, Group):
+                node = ViewNode(
+                    kind="group", payload=item,
+                    badge=badge(item.members[0].pid),
+                    head_pre="×%d " % len(item.members),
+                    head_label=_group_label(item.members, width),
+                    detail_bits=_group_detail(item.members, sysinfo))
+                kids = [c for m in item.members
+                        for c in _visible_children(m, suppressed)]
+            else:
+                venv = venv_map.get(item.pid) if venv_map else None
+                node = ViewNode(
+                    kind="proc", payload=item,
+                    badge=badge(item.pid),
+                    head_pre="%d " % item.pid,
+                    head_label=compress_cmdline(item.cmdline, width),
+                    detail_bits=_detail(item, sysinfo, venv=venv),
+                    collapse_note=(item.collapse_note
+                                   if item.collapsed and item.collapse_note
+                                   else None))
+                kids = _visible_children(item, suppressed)
+            node.children = make_nodes(
+                group_siblings(kids, dedup_min, never_merge))
+            nodes.append(node)
+        return nodes
+
+    return make_nodes(group_siblings(list(roots), dedup_min, never_merge))
+
+
+def emit_lines(nodes, color=False, colormap=None):
+    """Walk a display tree into ascii-tree lines - the only place connectors and
+    ANSI are produced. With a colormap, head_label and key-bearing detail bits
+    get their identity hue; without one this is the old heat-only tree, byte for
+    byte."""
+    lines = []
+
+    def hue(text, key):
+        if color and colormap is not None and key is not None:
+            sgr = colormap.sgr(key)
+            if sgr:
+                return "%s%s\x1b[0m" % (sgr, text)
+        return text
+
+    def walk(items, prefix):
+        for i, node in enumerate(items):
             is_last = i == len(items) - 1
             connector = "" if prefix == "" and is_last else (
                 "└─ " if is_last else "├─ ")
             child_prefix = prefix + ("   " if is_last else "│  ")
-            if isinstance(item, Group):
-                head = "%s%s%s×%d %s" % (
-                    prefix, connector, badge(item.members[0].pid),
-                    len(item.members), _group_label(item.members, width))
-                lines.append(head)
-                detail = _group_detail(item.members, color, sysinfo)
-                if detail is not None:
-                    lines.append(child_prefix + detail)
-                kids = [c for m in item.members
-                        for c in _visible_children(m, suppressed)]
-            else:
-                head = "%s%s%s%d %s" % (
-                    prefix, connector, badge(item.pid), item.pid,
-                    compress_cmdline(item.cmdline, width))
-                lines.append(head)
-                venv = venv_map.get(item.pid) if venv_map else None
-                detail = _detail(item, color, sysinfo, venv=venv)
-                if detail is not None:
-                    lines.append(child_prefix + detail)
-                kids = _visible_children(item, suppressed)
-            walk_items(group_siblings(kids, dedup_min, never_merge), child_prefix)
-            if isinstance(item, Proc) and item.collapsed and item.collapse_note:
-                lines.append(child_prefix + item.collapse_note)
+            lines.append("%s%s%s%s%s" % (
+                prefix, connector, node.badge, node.head_pre,
+                hue(node.head_label, node.head_key)))
+            bits = node.detail_bits + node.extra_bits
+            if bits:
+                lines.append(child_prefix + _compose_dim(bits, color, colormap))
+            walk(node.children, child_prefix)
+            if node.collapse_note:
+                lines.append(child_prefix + node.collapse_note)
 
-    walk_items(group_siblings(list(roots), dedup_min, never_merge), "")
+    walk(nodes, "")
     return lines
+
+
+def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
+           dedup_min=None, never_merge=frozenset(), categories=None,
+           venv_map=None):
+    """Render kept Procs as an ascii tree (the tree axis, no identity color).
+    Thin wrapper over build_view+emit_lines, kept for direct callers/tests.
+    categories ({pid: Category}) add a '[badge]' prefix; venv_map ({pid: venv})
+    adds a 'venv:' bit; with dedup_min, near-identical siblings merge into one
+    ×N entry recursing over the union of members' children."""
+    if color is None:
+        color = False
+    nodes = build_view(roots, suppressed, width=width, sysinfo=sysinfo,
+                       dedup_min=dedup_min, never_merge=never_merge,
+                       categories=categories, venv_map=venv_map, axis="tree")
+    return emit_lines(nodes, color=color, colormap=None)
 
 
 def render_path(proc, color, sysinfo, category, venv, hits, width=CMD_WIDTH):
@@ -1219,9 +1298,9 @@ def render_path(proc, color, sysinfo, category, venv, hits, width=CMD_WIDTH):
     cmdline' followed by its detail bits (cpu/rss/up/venv) and the path hits."""
     head = "%s%d %s" % ("[%s] " % category.badge if category else "",
                         proc.pid, compress_cmdline(proc.cmdline, width))
-    detail = _detail(proc, color, sysinfo, venv=venv, path_hits=hits)
-    if detail:
-        head += "  " + detail
+    bits = _detail(proc, sysinfo, venv=venv, path_hits=hits)
+    if bits:
+        head += "  " + _compose_dim(bits, color)
     return head
 
 
