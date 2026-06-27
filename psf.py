@@ -75,6 +75,18 @@ DEFAULT_MATCHERS = [
     ("claude", "cmdline", re.compile(r"\bclaude\b")),
 ]
 
+# Session leaders for the `session`/`consolidated` axes - the proc that owns an
+# interactive session. The session axis roots each session at the shallowest
+# leader (or, lacking one, the shallowest interesting proc) on a path and drops
+# the plumbing above it. Patterns over comm/cmdline, like DEFAULT_MATCHERS.
+SESSION_LEADERS = [
+    ("comm", re.compile(r"^sshd$")),
+    ("cmdline", re.compile(r"^sshd: ")),
+    ("comm", re.compile(r"^tmux")),
+    ("comm", re.compile(r"^login$")),
+    ("comm", re.compile(r"claude")),
+]
+
 # Process classification: a rule-based category (+ short badge) assigned to
 # every printed process, orthogonal to the "interesting subtree" selection above.
 # First matching rule wins; a python compile-worker inside a venv is promoted to
@@ -305,6 +317,56 @@ def merge_key(proc, categories=None):
     cat = (categories[proc.pid].name
            if categories and proc.pid in categories else None)
     return (cat, proc.comm, proc.exe)
+
+
+def is_session_leader(proc):
+    """True when a proc heads an interactive session (ssh/tmux/login/claude),
+    matched over comm/cmdline like the interest matchers."""
+    for target, rx in SESSION_LEADERS:
+        if rx.search(proc.comm if target == "comm" else proc.cmdline):
+            return True
+    return False
+
+
+def find_session_roots(roots):
+    """Cut the kept forest into sessions top-down: descending each path, the
+    first proc that is a session leader or interesting becomes a session root -
+    the plumbing above it is dropped and its whole subtree (nested leaders
+    included as sub-nodes) is that session. Descends THROUGH suppressed plumbing:
+    collapse may suppress the bash that parents a claude, but the claude is still
+    the session the axis exists to surface. Returns the session-root Procs sorted
+    by pid for stable output."""
+    out = []
+
+    def descend(node):
+        if not node.kept:
+            return
+        if is_session_leader(node) or node.interesting:
+            out.append(node)            # session root - its subtree is the session
+            return
+        for c in node.children:
+            descend(c)
+
+    for r in roots:
+        descend(r)
+    return sorted(out, key=lambda p: p.pid)
+
+
+def collect_session_printed(roots, suppressed):
+    """The procs a session-axis view shows: each session root plus its visible
+    (kept, non-suppressed) descendants. This is the set to decorate/probe/sample,
+    since collect_printed stops at suppressed plumbing and would skip a session
+    whose parent shell was collapsed away."""
+    out = []
+
+    def walk(node):
+        out.append(node)
+        for c in _visible_children(node, suppressed):
+            walk(c)
+
+    for r in find_session_roots(roots):
+        walk(r)
+    return out
 
 
 # --- pure core: collapse ----------------------------------------------------
@@ -1263,6 +1325,11 @@ def build_view(roots, suppressed, width=CMD_WIDTH, sysinfo=None,
             nodes.append(node)
         return nodes
 
+    if axis == "session":
+        # Each session is its own top-level node (no folding - that's the
+        # `consolidated` axis); children still merge within the session. Roots are
+        # found through suppressed plumbing; their subtrees still honour it.
+        return make_nodes(find_session_roots(roots))
     return make_nodes(
         group_siblings(list(roots), dedup_min, never_merge, key_fn))
 
@@ -1476,7 +1543,10 @@ def main(argv=None):
     select(s_a, DEFAULT_MATCHERS)
     suppressed = collapse(s_a, threshold=args.threshold)
     visible_roots = [r for r in roots if r.kept]
-    printed = [n for n in collect_printed(visible_roots, suppressed) if n.kept]
+    # The session view re-roots past suppressed plumbing, so the set to
+    # probe/classify/sample is the session-printed set, not collect_printed's
+    # (which stops at suppressed and would skip a claude whose shell collapsed).
+    printed = collect_session_printed(visible_roots, suppressed)
 
     born, died, s_b, dt = [], [], None, 0.0
     if args.sample_interval > 0:
@@ -1516,9 +1586,12 @@ def main(argv=None):
         out += psf_header(s_a) + [""]
     if not args.no_glossary:
         out += glossary(color) + [""]
-    out += render(visible_roots, suppressed, width=args.width, color=color,
-                  sysinfo=sysinfo, dedup_min=dedup_min, never_merge=NEVER_MERGE,
-                  categories=categories, venv_map=venv_map)
+    nodes = build_view(visible_roots, suppressed, width=args.width,
+                       sysinfo=sysinfo, dedup_min=dedup_min,
+                       never_merge=NEVER_MERGE, categories=categories,
+                       venv_map=venv_map, axis="session",
+                       key_fn=lambda p: merge_key(p, categories))
+    out += emit_lines(nodes, color=color, colormap=None)
     if s_b is not None and not args.no_lifecycle:
         section = format_lifecycle(born, died, _parents_map(s_a, s_b),
                                    sysinfo, dt, color=color)
