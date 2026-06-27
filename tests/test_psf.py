@@ -674,6 +674,44 @@ class TestGroupSiblings(unittest.TestCase):
         self.assertEqual(firsts, sorted(firsts))
 
 
+class TestMergeKey(unittest.TestCase):
+    def _kids(self, comm, exe):
+        out = []
+        for pid in (10, 11, 12):
+            p = _p(pid, 1, comm=comm, cmdline=comm)
+            p.exe = exe
+            out.append(p)
+        return out
+
+    def _group(self, kids, cats):
+        key_fn = lambda p: psf.merge_key(p, cats)
+        items = psf.group_siblings(kids, dedup_min=3,
+                                   never_merge=frozenset(), key_fn=key_fn)
+        return [it for it in items if isinstance(it, psf.Group)]
+
+    def test_unknown_exe_never_merges(self):
+        for exe in ("?", "", "/usr/bin/python3 (deleted)"):
+            kids = self._kids("python3", exe)
+            self.assertEqual(self._group(kids, None), [],
+                             "exe=%r should not merge" % exe)
+
+    def test_same_category_comm_exe_merges(self):
+        kids = self._kids("cc1", "/usr/lib/cc1")
+        cats = {pid: psf.CAT_BY_NAME["compile-worker"] for pid in (10, 11, 12)}
+        groups = self._group(kids, cats)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0].members), 3)
+
+    def test_category_split_blocks_merge(self):
+        # same comm+exe python, split category (a venv promotion vs bare worker):
+        # the three no longer share a key, so nothing reaches dedup_min.
+        kids = self._kids("python3", "/usr/bin/python3")
+        cats = {10: psf.CAT_BY_NAME["user-session"],
+                11: psf.CAT_BY_NAME["compile-worker"],
+                12: psf.CAT_BY_NAME["compile-worker"]}
+        self.assertEqual(self._group(kids, cats), [])
+
+
 # --- group rendering --------------------------------------------------------
 
 

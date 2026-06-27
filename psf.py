@@ -256,18 +256,21 @@ def select(procs, matchers):
             anc = procs.get(anc.ppid)
 
 
-def group_siblings(procs, dedup_min, never_merge):
-    """Partition a node's visible sibling Procs by (comm, exe) into a render
-    list. A partition with >= dedup_min members whose comm is not in
-    never_merge becomes a Group; everything else stays an individual Proc.
-    dedup_min falsy (None/0) disables grouping. Items are ordered by their
-    smallest pid so output is stable."""
+def group_siblings(procs, dedup_min, never_merge, key_fn=None):
+    """Partition a node's visible sibling Procs into a render list. Procs sharing
+    a key - default (comm, exe), or pass key_fn for the category-gated merge key -
+    with >= dedup_min members, none of whose comm is in never_merge, become a
+    Group; everything else stays an individual Proc. dedup_min falsy (None/0)
+    disables grouping. Items are ordered by their smallest pid so output is
+    stable."""
     if not dedup_min:
         return list(procs)
+    if key_fn is None:
+        key_fn = lambda p: (p.comm, p.exe)
     buckets = {}
     order = []
     for p in procs:
-        key = (p.comm, p.exe)
+        key = key_fn(p)
         if key not in buckets:
             buckets[key] = []
             order.append(key)
@@ -275,13 +278,33 @@ def group_siblings(procs, dedup_min, never_merge):
     items = []
     for key in order:
         members = buckets[key]
-        if len(members) >= dedup_min and key[0] not in never_merge:
+        if (len(members) >= dedup_min
+                and not any(m.comm in never_merge for m in members)):
             items.append(Group(members=members))
         else:
             items.extend(members)
     items.sort(key=lambda it: min(m.pid for m in it.members)
                if isinstance(it, Group) else it.pid)
     return items
+
+
+def _exe_unknown(exe):
+    """True when a proc's exe is missing or unstable - unreadable link ('?'),
+    empty, or a kernel ' (deleted)' marker. Such procs must not merge."""
+    return (not exe) or exe == "?" or exe.endswith(" (deleted)")
+
+
+def merge_key(proc, categories=None):
+    """Sibling-merge key for the grouping axes: procs collapse into one ×N only
+    when category, comm and exe all match. Category gates merging so a venv
+    python (promoted to user-session) never merges with a bare compile-worker
+    python - same comm, different role. An unknown/unstable exe yields a per-pid
+    unique key, so distinct unknown-exe daemons don't fold into one bogus group."""
+    if _exe_unknown(proc.exe):
+        return ("\x00unknown", proc.pid)
+    cat = (categories[proc.pid].name
+           if categories and proc.pid in categories else None)
+    return (cat, proc.comm, proc.exe)
 
 
 # --- pure core: collapse ----------------------------------------------------
@@ -1199,7 +1222,7 @@ class ViewNode:
 
 def build_view(roots, suppressed, width=CMD_WIDTH, sysinfo=None,
                dedup_min=None, never_merge=frozenset(), categories=None,
-               venv_map=None, axis="tree"):
+               venv_map=None, axis="tree", key_fn=None):
     """Turn kept Procs into a display tree (list[ViewNode]). Pure: no /proc IO,
     no ANSI. Merging for the chosen axis is fully resolved here - each node's
     children are its already-grouped visible children. axis="tree" is the
@@ -1236,11 +1259,12 @@ def build_view(roots, suppressed, width=CMD_WIDTH, sysinfo=None,
                                    else None))
                 kids = _visible_children(item, suppressed)
             node.children = make_nodes(
-                group_siblings(kids, dedup_min, never_merge))
+                group_siblings(kids, dedup_min, never_merge, key_fn))
             nodes.append(node)
         return nodes
 
-    return make_nodes(group_siblings(list(roots), dedup_min, never_merge))
+    return make_nodes(
+        group_siblings(list(roots), dedup_min, never_merge, key_fn))
 
 
 def emit_lines(nodes, color=False, colormap=None):
