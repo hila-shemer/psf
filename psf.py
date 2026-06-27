@@ -1336,7 +1336,7 @@ def _dir_bucket(cwd):
 def build_view(roots, suppressed, width=CMD_WIDTH, sysinfo=None,
                dedup_min=None, never_merge=frozenset(), categories=None,
                venv_map=None, axis="tree", key_fn=None, pool_global=False,
-               expand_all=False):
+               expand_all=False, path_hits=None):
     """Turn kept Procs into a display tree (list[ViewNode]). Pure: no /proc IO,
     no ANSI. Merging for the chosen axis is fully resolved here. axis="tree" is
     the per-parent grouping render() exposes; "session" roots each session at its
@@ -1420,6 +1420,22 @@ def build_view(roots, suppressed, width=CMD_WIDTH, sysinfo=None,
                 children=[node_of(it) for it in items]))
         return nodes
 
+    if axis == "flat":
+        # --path: one priority-ordered line per toucher (roots = the hit procs),
+        # its path hits carried as the trailing detail bits. No tree, no merging.
+        def flat_node(p):
+            venv = venv_map.get(p.pid) if venv_map else None
+            ph = path_hits.get(p.pid) if path_hits else None
+            prio = (categories[p.pid].priority
+                    if categories and p.pid in categories else 0)
+            return ViewNode(
+                kind="proc", payload=p, badge=badge(p.pid),
+                head_pre="%d " % p.pid,
+                head_label=compress_cmdline(p.cmdline, width),
+                detail_bits=_detail(p, sysinfo, venv=venv, path_hits=ph),
+                sort_key=(-prio, p.pid))
+        return sorted((flat_node(p) for p in roots), key=lambda n: n.sort_key)
+
     return make_nodes(
         group_siblings(list(roots), dedup_min, never_merge, key_fn))
 
@@ -1441,9 +1457,13 @@ def emit_lines(nodes, color=False, colormap=None):
     def walk(items, prefix):
         for i, node in enumerate(items):
             is_last = i == len(items) - 1
-            connector = "" if prefix == "" and is_last else (
-                "└─ " if is_last else "├─ ")
-            child_prefix = prefix + ("   " if is_last else "│  ")
+            if prefix == "":
+                # Top-level nodes are independent roots (sessions, dir buckets,
+                # touchers) - render each bare, no dangling connector.
+                connector, child_prefix = "", "   "
+            else:
+                connector = "└─ " if is_last else "├─ "
+                child_prefix = prefix + ("   " if is_last else "│  ")
             lines.append("%s%s%s%s%s" % (
                 prefix, connector, node.badge, node.head_pre,
                 hue(node.head_label, node.head_key)))
@@ -1472,17 +1492,6 @@ def render(roots, suppressed, width=CMD_WIDTH, color=None, sysinfo=None,
                        dedup_min=dedup_min, never_merge=never_merge,
                        categories=categories, venv_map=venv_map, axis="tree")
     return emit_lines(nodes, color=color, colormap=None)
-
-
-def render_path(proc, color, sysinfo, category, venv, hits, width=CMD_WIDTH):
-    """One flat line for a process touching the --path target: '[badge] pid
-    cmdline' followed by its detail bits (cpu/rss/up/venv) and the path hits."""
-    head = "%s%d %s" % ("[%s] " % category.badge if category else "",
-                        proc.pid, compress_cmdline(proc.cmdline, width))
-    bits = _detail(proc, sysinfo, venv=venv, path_hits=hits)
-    if bits:
-        head += "  " + _compose_dim(bits, color)
-    return head
 
 
 def glossary(color):
@@ -1588,9 +1597,10 @@ def _run_path(args):
         out += psf_header(procs) + [""]
     out.append("touching %s — %d procs" % (compress_path(root), len(hits)))
     out.append("")
-    for pid in sorted(hits, key=lambda x: (-categories[x].priority, x)):
-        out.append(render_path(procs[pid], color, sysinfo, categories[pid],
-                               venv_map.get(pid), hits[pid], width=args.width))
+    nodes = build_view([procs[pid] for pid in hits], suppressed=set(),
+                       width=args.width, sysinfo=sysinfo, categories=categories,
+                       venv_map=venv_map, axis="flat", path_hits=hits)
+    out += emit_lines(nodes, color=color, colormap=None)
     print("\n".join(out))
 
 
