@@ -993,27 +993,46 @@ class TestRenderBadgesVenv(unittest.TestCase):
 
 
 class TestRenderPath(unittest.TestCase):
-    def test_renders_flat_toucher_line(self):
+    # --path now flows through the shared view+emitter (axis="flat"): one
+    # priority-ordered toucher per node, hits as the detail bits.
+    def _flat(self, proc, cat, hits, venv=None):
         sysinfo = psf.SysInfo(clk_tck=100, page_size=4096, uptime=1100.0)
+        nodes = psf.build_view(
+            [proc], suppressed=set(), width=60, sysinfo=sysinfo,
+            categories={proc.pid: cat},
+            venv_map=({proc.pid: venv} if venv else None),
+            axis="flat", path_hits={proc.pid: hits})
+        return "\n".join(psf.emit_lines(nodes, color=False))
+
+    def test_renders_flat_toucher_line(self):
         proc = _p(4321, 1, comm="chrome", cmdline="chrome --type=renderer",
                   starttime=1000)
         hits = [psf.PathHit("mmap", "", "/usr/lib/libc.so.6")]
-        line = psf.render_path(proc, False, sysinfo,
-                               psf.CAT_BY_NAME["misc"], None, hits, width=60)
-        self.assertIn("[mis] 4321 chrome", line)
-        self.assertIn("mmap:", line)
+        text = self._flat(proc, psf.CAT_BY_NAME["misc"], hits)
+        self.assertIn("[mis] 4321 chrome", text)
+        self.assertIn("mmap:", text)
 
     def test_cwd_hit_not_also_shown_as_generic_bit(self):
         # When the cwd IS the path hit, it appears once (as the hit), not twice.
-        sysinfo = psf.SysInfo(clk_tck=100, page_size=4096, uptime=1100.0)
         proc = _p(7, 1, comm="bash", cmdline="bash", starttime=1000)
         proc.cwd = "/srv/work"
         proc.exe = "/usr/bin/bash"
         hits = [psf.PathHit("cwd", "", "/srv/work")]
-        line = psf.render_path(proc, False, sysinfo,
-                               psf.CAT_BY_NAME["infrastructure"],
-                               None, hits, width=60)
-        self.assertEqual(line.count("cwd:"), 1)
+        text = self._flat(proc, psf.CAT_BY_NAME["infrastructure"], hits)
+        self.assertEqual(text.count("cwd:"), 1)
+
+    def test_touchers_sorted_by_category_priority(self):
+        sysinfo = psf.SysInfo(clk_tck=100, page_size=4096, uptime=1100.0)
+        lo = _p(10, 1, comm="x", cmdline="x", starttime=1)
+        hi = _p(20, 1, comm="claude", cmdline="claude", starttime=1)
+        hits = {10: [psf.PathHit("cwd", "", "/p")],
+                20: [psf.PathHit("cwd", "", "/p")]}
+        cats = {10: psf.CAT_BY_NAME["misc"],
+                20: psf.CAT_BY_NAME["user-session"]}
+        nodes = psf.build_view([lo, hi], suppressed=set(), width=60,
+                               sysinfo=sysinfo, categories=cats, axis="flat",
+                               path_hits=hits)
+        self.assertEqual([n.payload.pid for n in nodes], [20, 10])  # usr before mis
 
 
 class TestCliSmoke(unittest.TestCase):
