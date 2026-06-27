@@ -1113,6 +1113,129 @@ class TestSessionAxis(unittest.TestCase):
         self.assertEqual(nodes[0].children[0].payload.comm, "cc1")
 
 
+class TestConsolidatedAxis(unittest.TestCase):
+    def _sessions(self, n, child_exe="/bin/bash"):
+        procs = {1: _p(1, 0, comm="systemd", cmdline="init")}
+        pid = 10
+        for i in range(n):
+            leader = _p(pid, 1, comm="sshd", cmdline="sshd: u@pts/%d" % i)
+            leader.exe = "/usr/sbin/sshd"
+            leader.interesting = True
+            procs[pid] = leader
+            ce = child_exe[i] if isinstance(child_exe, list) else child_exe
+            c = _p(pid + 100, pid, comm="bash", cmdline="-bash")
+            c.exe = ce
+            procs[pid + 100] = c
+            pid += 1
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        return procs
+
+    def _view(self, procs, **kw):
+        kw.setdefault("dedup_min", 3)
+        kw.setdefault("never_merge", frozenset())
+        kw.setdefault("key_fn", lambda p: psf.merge_key(p, None))
+        return psf.build_view([procs[1]], suppressed=set(), width=80,
+                              axis="consolidated", **kw)
+
+    def test_identical_sessions_fold(self):
+        nodes = self._view(self._sessions(3))
+        groups = [n for n in nodes if n.kind == "group"]
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0].payload.members), 3)
+
+    def test_different_child_blocks_fold(self):
+        procs = self._sessions(3, child_exe=["/bin/bash", "/bin/bash", "/bin/zsh"])
+        nodes = self._view(procs, dedup_min=2)
+        groups = [n for n in nodes if n.kind == "group"]
+        singles = [n for n in nodes if n.kind == "proc"]
+        self.assertEqual(len(groups[0].payload.members), 2)   # the bash pair
+        self.assertEqual(len(singles), 1)                     # zsh stays apart
+
+    def test_never_merge_leaders_do_not_fold(self):
+        procs = {1: _p(1, 0, comm="systemd", cmdline="init")}
+        for pid in (10, 11, 12):
+            c = _p(pid, 1, comm="claude", cmdline="claude")
+            c.exe = "/x"
+            c.interesting = True
+            procs[pid] = c
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        nodes = self._view(procs, never_merge=frozenset({"claude"}))
+        self.assertEqual(len(nodes), 3)
+        self.assertTrue(all(n.kind == "proc" for n in nodes))
+
+    def test_pool_global_flattens_by_kind(self):
+        nodes = self._view(self._sessions(3), pool_global=True)
+        self.assertTrue(all(not n.children for n in nodes))   # flat
+        bash = [n for n in nodes if n.kind == "group"
+                and n.payload.members[0].comm == "bash"]
+        self.assertEqual(len(bash), 1)
+        self.assertEqual(len(bash[0].payload.members), 3)     # pooled ×3
+
+
+class TestDirAxis(unittest.TestCase):
+    def _procs(self):
+        procs = {1: _p(1, 0, comm="systemd", cmdline="init")}
+        for pid, cwd in ((10, "/a"), (11, "/a"), (12, "/b"), (13, "?")):
+            p = _p(pid, 1, comm="cc1", cmdline="cc1")
+            p.exe = "/x"
+            p.cwd = cwd
+            p.interesting = True
+            procs[pid] = p
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        return procs
+
+    def _view(self, procs):
+        return psf.build_view([procs[1]], suppressed=set(), width=80,
+                              axis="dir", dedup_min=2, never_merge=frozenset(),
+                              key_fn=lambda p: psf.merge_key(p, None))
+
+    def test_buckets_by_directory(self):
+        labels = [n.head_label for n in self._view(self._procs())]
+        self.assertEqual(sorted(labels), ["/a", "/b", "unknown"])
+
+    def test_unknown_bucket_is_single_and_uncolored(self):
+        unknown = [n for n in self._view(self._procs())
+                   if n.head_label == "unknown"]
+        self.assertEqual(len(unknown), 1)
+        self.assertIsNone(unknown[0].head_key)        # no identity hue for unknown
+
+
+class TestEscapeFlags(unittest.TestCase):
+    def _collapsed(self):
+        procs = {
+            1: _p(1, 0, comm="bazel", cmdline="bazel"),
+            2: _p(2, 1, comm="cc1", cmdline="cc1"),
+        }
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        procs[1].interesting = True
+        procs[1].collapsed = True
+        procs[1].collapse_note = "… (+5 descendants: cc1×5)"
+        return procs
+
+    def test_default_hides_suppressed_and_shows_note(self):
+        procs = self._collapsed()
+        text = "\n".join(psf.emit_lines(
+            psf.build_view([procs[1]], suppressed={2}, width=80, axis="tree")))
+        self.assertNotIn("2 cc1", text)
+        self.assertIn("+5 descendants", text)
+
+    def test_expand_all_shows_suppressed_and_drops_note(self):
+        procs = self._collapsed()
+        text = "\n".join(psf.emit_lines(
+            psf.build_view([procs[1]], suppressed={2}, width=80, axis="tree",
+                           expand_all=True)))
+        self.assertIn("cc1", text)
+        self.assertNotIn("+5 descendants", text)
+
+
 # --- view layer: build_view / emit_lines (model->view->render seam) ---------
 
 

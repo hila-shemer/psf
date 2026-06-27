@@ -352,11 +352,8 @@ def find_session_roots(roots):
     return sorted(out, key=lambda p: p.pid)
 
 
-def collect_session_printed(roots, suppressed):
-    """The procs a session-axis view shows: each session root plus its visible
-    (kept, non-suppressed) descendants. This is the set to decorate/probe/sample,
-    since collect_printed stops at suppressed plumbing and would skip a session
-    whose parent shell was collapsed away."""
+def _session_procs(root, suppressed):
+    """A session root plus its visible (kept, non-suppressed) descendants."""
     out = []
 
     def walk(node):
@@ -364,9 +361,55 @@ def collect_session_printed(roots, suppressed):
         for c in _visible_children(node, suppressed):
             walk(c)
 
-    for r in find_session_roots(roots):
-        walk(r)
+    walk(root)
     return out
+
+
+def collect_session_printed(roots, suppressed):
+    """The procs a session-axis view shows. This is the set to decorate/probe/
+    sample, since collect_printed stops at suppressed plumbing and would skip a
+    session whose parent shell was collapsed away."""
+    return [p for r in find_session_roots(roots)
+            for p in _session_procs(r, suppressed)]
+
+
+def session_signature(leader, categories, suppressed):
+    """What makes two sessions 'the same' for the consolidated axis: the leader's
+    category/comm/uid plus the sorted multiset of its visible children's merge
+    keys. Folding on comm alone would fold an idle shell into a heavy build and
+    mislead through the pooled child counts."""
+    cat = (categories[leader.pid].name
+           if categories and leader.pid in categories else None)
+    child_keys = tuple(sorted(merge_key(c, categories)
+                              for c in _visible_children(leader, suppressed)))
+    return (cat, leader.comm, leader.uid, child_keys)
+
+
+def consolidate_sessions(sroots, categories, suppressed, dedup_min, never_merge):
+    """Fold signature-equal session roots into one ×N (their children pool and
+    sum downstream); the rest stay individual. Like group_siblings, but keyed on
+    the session signature."""
+    if not dedup_min:
+        return list(sroots)
+    buckets = {}
+    order = []
+    for r in sroots:
+        sig = session_signature(r, categories, suppressed)
+        if sig not in buckets:
+            buckets[sig] = []
+            order.append(sig)
+        buckets[sig].append(r)
+    items = []
+    for sig in order:
+        members = buckets[sig]
+        if (len(members) >= dedup_min
+                and not any(m.comm in never_merge for m in members)):
+            items.append(Group(members=members))
+        else:
+            items.extend(members)
+    items.sort(key=lambda it: min(m.pid for m in it.members)
+               if isinstance(it, Group) else it.pid)
+    return items
 
 
 # --- pure core: collapse ----------------------------------------------------
@@ -1282,43 +1325,59 @@ class ViewNode:
     sort_key: tuple = ()
 
 
+def _dir_bucket(cwd):
+    """The directory a proc is filed under in the dir axis: its canonical cwd,
+    or one shared 'unknown' bucket for '?'/'' so they never mix with real dirs."""
+    if not cwd or cwd in ("?", ""):
+        return "unknown"
+    return _strip_deleted_marker(cwd)
+
+
 def build_view(roots, suppressed, width=CMD_WIDTH, sysinfo=None,
                dedup_min=None, never_merge=frozenset(), categories=None,
-               venv_map=None, axis="tree", key_fn=None):
+               venv_map=None, axis="tree", key_fn=None, pool_global=False,
+               expand_all=False):
     """Turn kept Procs into a display tree (list[ViewNode]). Pure: no /proc IO,
-    no ANSI. Merging for the chosen axis is fully resolved here - each node's
-    children are its already-grouped visible children. axis="tree" is the
-    per-parent grouping the public render() exposes; the session/consolidated/dir
-    axes hang off this in later steps."""
+    no ANSI. Merging for the chosen axis is fully resolved here. axis="tree" is
+    the per-parent grouping render() exposes; "session" roots each session at its
+    leader; "consolidated" folds signature-equal sessions (pool_global flattens
+    to a global ×N-by-kind list); "dir" buckets by directory. expand_all drops
+    the collapse/suppressed set; merging is off when dedup_min is falsy."""
+    if expand_all:
+        suppressed = frozenset()
 
     def badge(pid):
         if categories and pid in categories:
             return "[%s] " % categories[pid].badge
         return ""
 
+    def node_of(item):
+        if isinstance(item, Group):
+            return ViewNode(
+                kind="group", payload=item,
+                badge=badge(item.members[0].pid),
+                head_pre="×%d " % len(item.members),
+                head_label=_group_label(item.members, width),
+                detail_bits=_group_detail(item.members, sysinfo))
+        venv = venv_map.get(item.pid) if venv_map else None
+        return ViewNode(
+            kind="proc", payload=item,
+            badge=badge(item.pid),
+            head_pre="%d " % item.pid,
+            head_label=compress_cmdline(item.cmdline, width),
+            detail_bits=_detail(item, sysinfo, venv=venv),
+            collapse_note=(item.collapse_note
+                           if (not expand_all and item.collapsed
+                               and item.collapse_note) else None))
+
     def make_nodes(items):
         nodes = []
         for item in items:
+            node = node_of(item)
             if isinstance(item, Group):
-                node = ViewNode(
-                    kind="group", payload=item,
-                    badge=badge(item.members[0].pid),
-                    head_pre="×%d " % len(item.members),
-                    head_label=_group_label(item.members, width),
-                    detail_bits=_group_detail(item.members, sysinfo))
                 kids = [c for m in item.members
                         for c in _visible_children(m, suppressed)]
             else:
-                venv = venv_map.get(item.pid) if venv_map else None
-                node = ViewNode(
-                    kind="proc", payload=item,
-                    badge=badge(item.pid),
-                    head_pre="%d " % item.pid,
-                    head_label=compress_cmdline(item.cmdline, width),
-                    detail_bits=_detail(item, sysinfo, venv=venv),
-                    collapse_note=(item.collapse_note
-                                   if item.collapsed and item.collapse_note
-                                   else None))
                 kids = _visible_children(item, suppressed)
             node.children = make_nodes(
                 group_siblings(kids, dedup_min, never_merge, key_fn))
@@ -1326,10 +1385,41 @@ def build_view(roots, suppressed, width=CMD_WIDTH, sysinfo=None,
         return nodes
 
     if axis == "session":
-        # Each session is its own top-level node (no folding - that's the
-        # `consolidated` axis); children still merge within the session. Roots are
-        # found through suppressed plumbing; their subtrees still honour it.
+        # Each session is its own node; children merge within it. Roots are found
+        # through suppressed plumbing, but their subtrees still honour it.
         return make_nodes(find_session_roots(roots))
+
+    if axis == "consolidated":
+        sroots = find_session_roots(roots)
+        if pool_global:
+            # One flat ×N-by-kind list across every session - a globally-pooled
+            # entry has no single session header to nest under.
+            procs = [p for r in sroots for p in _session_procs(r, suppressed)]
+            return [node_of(it) for it in
+                    group_siblings(procs, dedup_min, never_merge, key_fn)]
+        return make_nodes(consolidate_sessions(
+            sroots, categories, suppressed, dedup_min, never_merge))
+
+    if axis == "dir":
+        procs = [p for r in find_session_roots(roots)
+                 for p in _session_procs(r, suppressed)]
+        buckets = {}
+        order = []
+        for p in procs:
+            d = _dir_bucket(p.cwd)
+            if d not in buckets:
+                buckets[d] = []
+                order.append(d)
+            buckets[d].append(p)
+        nodes = []
+        for d in sorted(order):
+            items = group_siblings(buckets[d], dedup_min, never_merge, key_fn)
+            nodes.append(ViewNode(
+                kind="dir", payload=None, head_label=compress_path(d),
+                head_key=(("dir", d) if d != "unknown" else None),
+                children=[node_of(it) for it in items]))
+        return nodes
+
     return make_nodes(
         group_siblings(list(roots), dedup_min, never_merge, key_fn))
 
