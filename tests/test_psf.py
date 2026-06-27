@@ -1041,6 +1041,78 @@ class TestCliSmoke(unittest.TestCase):
         self.assertIn("touching", r.stdout)
 
 
+# --- session axis -----------------------------------------------------------
+
+
+class TestSessionAxis(unittest.TestCase):
+    def _chain(self):
+        # systemd (plumbing) -> sshd (leader) -> bash -> tmux (leader) -> claude
+        procs = {
+            1: _p(1, 0, comm="systemd", cmdline="/sbin/init"),
+            2: _p(2, 1, comm="sshd", cmdline="sshd: shemer@pts/0"),
+            3: _p(3, 2, comm="bash", cmdline="-bash"),
+            4: _p(4, 3, comm="tmux", cmdline="tmux: server"),
+            5: _p(5, 4, comm="claude", cmdline="claude"),
+        }
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+            p.exe = "/x"
+        for pid in (2, 4, 5):                  # sshd / tmux / claude interesting
+            procs[pid].interesting = True
+        return procs
+
+    def _comms(self, node):
+        out = [node.payload.comm if node.kind == "proc" else "group"]
+        for c in node.children:
+            out += self._comms(c)
+        return out
+
+    def test_session_root_is_leader_not_systemd(self):
+        procs = self._chain()
+        nodes = psf.build_view([procs[1]], suppressed=set(), width=80,
+                               axis="session")
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].payload.comm, "sshd")     # plumbing dropped
+
+    def test_nested_leader_renders_as_subnode(self):
+        procs = self._chain()
+        nodes = psf.build_view([procs[1]], suppressed=set(), width=80,
+                               axis="session")
+        self.assertEqual(self._comms(nodes[0]),
+                         ["sshd", "bash", "tmux", "claude"])
+
+    def test_standalone_leader_is_own_session(self):
+        procs = {
+            1: _p(1, 0, comm="systemd", cmdline="init"),
+            2: _p(2, 1, comm="claude", cmdline="claude"),
+        }
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        procs[2].interesting = True
+        nodes = psf.build_view([procs[1]], suppressed=set(), width=80,
+                               axis="session")
+        self.assertEqual([n.payload.comm for n in nodes], ["claude"])
+
+    def test_orphan_interesting_proc_is_its_own_session(self):
+        # no leader anywhere: the shallowest interesting proc roots the session
+        procs = {
+            1: _p(1, 0, comm="systemd", cmdline="init"),
+            2: _p(2, 1, comm="bazel", cmdline="bazel"),
+            3: _p(3, 2, comm="cc1", cmdline="cc1"),
+        }
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        procs[2].interesting = True
+        procs[3].interesting = True
+        nodes = psf.build_view([procs[1]], suppressed=set(), width=80,
+                               axis="session")
+        self.assertEqual([n.payload.comm for n in nodes], ["bazel"])
+        self.assertEqual(nodes[0].children[0].payload.comm, "cc1")
+
+
 # --- view layer: build_view / emit_lines (model->view->render seam) ---------
 
 
