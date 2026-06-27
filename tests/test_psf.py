@@ -1035,6 +1035,30 @@ class TestCliSmoke(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn("psf —", r.stdout)
 
+    def test_group_axes_all_exit_clean(self):
+        for axis in ("session", "consolidated", "dir"):
+            r = self._run("--no-glossary", "--no-header", "--group", axis)
+            self.assertEqual(r.returncode, 0, "%s: %s" % (axis, r.stderr))
+
+    def test_verbose_and_expand_all_exit_clean(self):
+        for flag in ("--verbose", "--expand-all"):
+            r = self._run("--no-glossary", "--no-header", flag)
+            self.assertEqual(r.returncode, 0, "%s: %s" % (flag, r.stderr))
+
+    def test_pool_global_needs_consolidated(self):
+        r = self._run("--pool-global")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("consolidated", r.stderr)
+
+    def test_dir_axis_rejected_under_path(self):
+        r = self._run("--group", "dir", "--path", "/usr")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("meaningless", r.stderr)
+
+    def test_no_dedup_still_accepted(self):
+        r = self._run("--no-glossary", "--no-header", "--no-dedup")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_path_mode_lists_touchers(self):
         r = self._run("--path", "/usr")
         self.assertEqual(r.returncode, 0, r.stderr)
