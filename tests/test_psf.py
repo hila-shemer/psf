@@ -346,7 +346,7 @@ class TestRender(unittest.TestCase):
         psf.build_tree(procs)
         for p in procs.values():
             p.kept = True
-        procs[3].cwd = "/home/shemer/proj"
+        procs[3].cwd = psf.HOME + "/proj"
         procs[3].exe = "/usr/bin/node"
         procs[3].sockets_str = "+2 est"
         procs[3].num_threads = 11
@@ -711,7 +711,7 @@ class TestGroupRender(unittest.TestCase):
     def test_group_detail_shows_path_and_ranges(self):
         procs = self._tree()
         for i, pid in enumerate((10, 11, 12)):
-            procs[pid].cwd = "/home/shemer/proj%d" % i
+            procs[pid].cwd = psf.HOME + ("/proj%d" % i)
             procs[pid].rss_pages = 1000 + i * 1000      # differing rss
             procs[pid].starttime = 1000
         sysinfo = psf.SysInfo(clk_tck=100, page_size=4096, uptime=1100.0)
