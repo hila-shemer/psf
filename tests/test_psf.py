@@ -1438,6 +1438,90 @@ class TestPaletteCVDGuard(unittest.TestCase):
             self.assertLess(step, 40.0)           # still clearly the same family
 
 
+class TestColorEmission(unittest.TestCase):
+    # The production colour path - emit_lines with a real ColorMap - that the
+    # render()-based tests (colormap=None) can't reach.
+    def _two_projects(self, exe_b="/x"):
+        procs = {1: _p(1, 0, comm="systemd", cmdline="init")}
+        for pid, cwd, exe in ((2, "/home/h/proj/mbm", "/x"),
+                              (3, "/home/h/proj/psf", exe_b)):
+            p = _p(pid, 1, comm="claude", cmdline="claude")
+            p.exe = exe
+            p.cwd = cwd
+            p.interesting = True
+            procs[pid] = p
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        return procs
+
+    def _emit(self, procs, color=True):
+        cm = psf.build_colormap([("/home/h/proj/mbm", 1), ("/home/h/proj/psf", 1)])
+        nodes = psf.build_view([procs[1]], suppressed=set(), width=60,
+                               axis="session")
+        return "\n".join(psf.emit_lines(nodes, color=color, colormap=cm)), cm
+
+    def test_command_and_cwd_share_project_hue(self):
+        text, cm = self._emit(self._two_projects())
+        mbm = cm.sgr(("dir", "/home/h/proj/mbm"))
+        self.assertIsNotNone(mbm)
+        self.assertTrue(any("claude" in ln and mbm in ln
+                            for ln in text.splitlines()))   # command head hued
+        self.assertIn(mbm + "cwd:", text)                   # cwd bit same hue
+
+    def test_distinct_projects_emit_distinct_hues(self):
+        text, cm = self._emit(self._two_projects())
+        self.assertIn(cm.sgr(("dir", "/home/h/proj/mbm")), text)
+        self.assertIn(cm.sgr(("dir", "/home/h/proj/psf")), text)
+        self.assertNotEqual(cm.sgr(("dir", "/home/h/proj/mbm")),
+                            cm.sgr(("dir", "/home/h/proj/psf")))
+
+    def test_outside_anchor_bit_stays_heat_dim(self):
+        text, _ = self._emit(self._two_projects(exe_b="/usr/bin/claude"))
+        self.assertIn("\x1b[2mexe:/usr", text)              # dim baseline, not 38;2
+
+    def test_color_false_emits_no_escapes_even_with_colormap(self):
+        text, _ = self._emit(self._two_projects(), color=False)
+        self.assertNotIn("\x1b", text)
+
+    def test_truecolor_gate(self):
+        procs = [type("P", (), {"cwd": "/h/proj/a"})(),
+                 type("P", (), {"cwd": "/h/proj/b"})()]
+        old = os.environ.get("COLORTERM")
+        try:
+            os.environ["COLORTERM"] = "truecolor"
+            self.assertIsNotNone(psf.make_colormap(procs, True))
+            self.assertIsNone(psf.make_colormap(procs, False))   # colour off
+            os.environ["COLORTERM"] = "xterm-256color"
+            self.assertIsNone(psf.make_colormap(procs, True))    # not truecolor
+        finally:
+            if old is None:
+                os.environ.pop("COLORTERM", None)
+            else:
+                os.environ["COLORTERM"] = old
+
+
+class TestForestConnectors(unittest.TestCase):
+    def test_top_level_nodes_render_bare_children_get_connectors(self):
+        procs = {1: _p(1, 0, comm="systemd", cmdline="init")}
+        a = _p(2, 1, comm="claude", cmdline="claude")
+        a.interesting = True
+        b = _p(3, 2, comm="cc1", cmdline="cc1")       # a child of claude
+        b.exe = "/x"
+        c = _p(4, 1, comm="tmux", cmdline="tmux")
+        c.interesting = True
+        procs[2], procs[3], procs[4] = a, b, c
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        lines = psf.emit_lines(psf.build_view([procs[1]], suppressed=set(),
+                                              axis="session"))
+        tops = [ln for ln in lines if ln and ln[0] not in " │├└"]
+        self.assertEqual([ln.split()[1] for ln in tops], ["claude", "tmux"])
+        self.assertTrue(any(ln.lstrip().startswith(("├─", "└─")) and "cc1" in ln
+                            for ln in lines))     # nested child still gets a connector
+
+
 # --- view layer: build_view / emit_lines (model->view->render seam) ---------
 
 
