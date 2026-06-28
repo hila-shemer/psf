@@ -1210,6 +1210,22 @@ class TestConsolidatedAxis(unittest.TestCase):
         self.assertEqual(len(nodes), 3)
         self.assertTrue(all(n.kind == "proc" for n in nodes))
 
+    def test_mixed_exe_children_do_not_crash_signature(self):
+        # one known-exe and one unknown-exe child: session_signature sorts their
+        # merge-keys, which must be totally orderable (str vs None used to crash).
+        procs = {1: _p(1, 0, comm="systemd", cmdline="init"),
+                 2: _p(2, 1, comm="sshd", cmdline="sshd: u@pts/0")}
+        procs[2].exe = "/usr/sbin/sshd"
+        procs[2].interesting = True
+        c1 = _p(3, 2, comm="bash"); c1.exe = "/bin/bash"
+        c2 = _p(4, 2, comm="python3"); c2.exe = "?"
+        procs[3], procs[4] = c1, c2
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        nodes = self._view(procs, dedup_min=2)        # must not raise
+        self.assertEqual(len(nodes), 1)
+
     def test_pool_global_flattens_by_kind(self):
         nodes = self._view(self._sessions(3), pool_global=True)
         self.assertTrue(all(not n.children for n in nodes))   # flat
@@ -1315,6 +1331,18 @@ class TestColorMap(unittest.TestCase):
     def test_anchor_override(self):
         self.assertEqual(psf.detect_anchor([], override="/srv/work"),
                          ("srv", "work"))
+
+    def test_anchor_stops_at_common_parent_on_even_split(self):
+        # 2 dirs under proj/a, 2 under proj/b: strict majority must stop at proj,
+        # not descend into whichever branch insertion order surfaced first.
+        for paths in (("/h/proj/a/x", "/h/proj/a/y", "/h/proj/b/x", "/h/proj/b/y"),
+                      ("/h/proj/b/x", "/h/proj/b/y", "/h/proj/a/x", "/h/proj/a/y")):
+            comps = [psf._canon_components(c) for c in paths]
+            self.assertEqual(psf.detect_anchor(comps), ("h", "proj"))
+
+    def test_single_path_colors_nothing(self):
+        cm = psf.build_colormap([("/home/h/proj/only", 1)])
+        self.assertIsNone(cm.sgr(("dir", "/home/h/proj/only")))
 
     def test_distinct_families_get_distinct_colors(self):
         cm = psf.build_colormap([("/home/h/proj/mbm", 1), ("/home/h/proj/psf", 1)])

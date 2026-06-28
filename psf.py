@@ -315,7 +315,7 @@ def merge_key(proc, categories=None):
     if _exe_unknown(proc.exe):
         return ("\x00unknown", proc.pid)
     cat = (categories[proc.pid].name
-           if categories and proc.pid in categories else None)
+           if categories and proc.pid in categories else "")
     return (cat, proc.comm, proc.exe)
 
 
@@ -323,7 +323,7 @@ def is_session_leader(proc):
     """True when a proc heads an interactive session (ssh/tmux/login/claude),
     matched over comm/cmdline like the interest matchers."""
     for target, rx in SESSION_LEADERS:
-        if rx.search(proc.comm if target == "comm" else proc.cmdline):
+        if rx.search(proc.comm if target == "comm" else (proc.cmdline or "")):
             return True
     return False
 
@@ -1385,7 +1385,10 @@ def detect_anchor(component_lists, override=None):
     valid = [c for c in component_lists if c]
     if len(valid) < 2:
         return ()
-    need = max(2, (len(valid) + 1) // 2)
+    need = max(2, len(valid) // 2 + 1)   # strict majority - a 50/50 split must
+    #                                      stop at the common parent, not descend
+    #                                      into whichever branch insertion-order
+    #                                      happened to surface first
     best = ()
     for d in range(1, max(len(c) for c in valid)):
         cnt = Counter(c[:d] for c in valid if len(c) > d)
@@ -1429,6 +1432,8 @@ def build_colormap(paths_with_weight, anchor_override=None):
     """paths_with_weight: iterable of (raw_path, weight). Detect the anchor, then
     hand the four most-weighted families (weight = visual mass) the palette."""
     comps = [(_canon_components(p), w) for p, w in paths_with_weight]
+    if anchor_override is None and sum(1 for c, _ in comps if c) < 2:
+        return ColorMap((), {})         # < 2 real paths -> nothing to compare, nothing colored
     anchor = detect_anchor([c for c, _ in comps], anchor_override)
     a = len(anchor)
     weight = Counter()
@@ -1819,7 +1824,8 @@ def main(argv=None):
     # The session view re-roots past suppressed plumbing, so the set to
     # probe/classify/sample is the session-printed set, not collect_printed's
     # (which stops at suppressed and would skip a claude whose shell collapsed).
-    printed = collect_session_printed(visible_roots, suppressed)
+    printed = collect_session_printed(
+        visible_roots, frozenset() if args.expand_all else suppressed)
 
     born, died, s_b, dt = [], [], None, 0.0
     if args.sample_interval > 0:
