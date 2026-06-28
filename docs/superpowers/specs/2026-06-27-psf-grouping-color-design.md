@@ -261,6 +261,19 @@ is actually shown.
 - Heat-tint is itself a warm/red ramp, which a reduced-red viewer reads more as
   "dimmer" than "hotter". Swapping it for a blue→yellow→white luminance ramp is a
   separate change.
-- `CLAUDE.md` is stale: it claims psf imports topf and lists session/glue/cluster
-  functions that don't exist. psf is self-contained; the new layer stays
-  psf-local and topf is untouched. Fix the doc as a follow-up.
+- **`--color {auto,heat,identity,none}` / `--no-identity-color` not implemented.**
+  Only `--no-color` (kills both channels) and `--color-anchor` ship. There's no
+  way to keep heat while turning identity off (or vice-versa). Deferred.
+- **256-color fallback not implemented.** Identity hue is truecolor-or-nothing,
+  gated on `COLORTERM ∈ {truecolor,24bit}`; on a 16/256 terminal identity is off
+  and only heat-tint shows. The spec's "guard-validated 4-entry 256-color
+  fallback" is deferred.
+- **Watch stickiness is moot** — psf is snapshot-only, there is no `--watch`. The
+  sticky-anchor/hysteresis design applies only if `--watch` is ever added; do the
+  deterministic-anchor work (done) first.
+- **Yellow depth resolution is shallow** — `#F2E34C` (OKLab L≈0.90) saturates near
+  the lightening ceiling, so a yellow project's dirs at depth ≥1 share a shade.
+  Acceptable (sibling shades are meant to look related); revisit with a per-family
+  ceiling if it matters.
+- ~~`CLAUDE.md` stale~~ — **done**: rewritten to reflect the self-contained,
+  model→view→render psf with the real axis/colour function names.
