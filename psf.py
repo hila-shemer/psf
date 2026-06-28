@@ -1383,9 +1383,9 @@ def detect_anchor(component_lists, override=None):
 
 class ColorMap:
     """Resolves a ('dir'|'cmd', raw_path) key to a truecolor SGR opener. The
-    family is the first path component past the anchor; the four most-weighted
-    families get the palette, the rest (and anything outside the anchor) stay
-    default fg. Depth past the family lightens the hue."""
+    family is the first path component past the anchor; every family gets a hue
+    (the four cycle by weight rank), anything outside the anchor stays default fg.
+    Depth past the family lightens the hue."""
 
     def __init__(self, anchor, families):
         self.anchor = anchor            # tuple of components
@@ -1412,7 +1412,7 @@ class ColorMap:
 
 def build_colormap(paths_with_weight, anchor_override=None):
     """paths_with_weight: iterable of (raw_path, weight). Detect the anchor, then
-    hand the four most-weighted families (weight = visual mass) the palette."""
+    give every family a hue, cycling the four by weight rank (visual mass)."""
     comps = [(_canon_components(p), w) for p, w in paths_with_weight]
     if anchor_override is None and sum(1 for c, _ in comps if c) < 2:
         return ColorMap((), {})         # < 2 real paths -> nothing to compare, nothing colored
@@ -1422,8 +1422,12 @@ def build_colormap(paths_with_weight, anchor_override=None):
     for c, w in comps:
         if len(c) > a and c[:a] == anchor:
             weight[c[a]] += w
-    top = sorted(weight.items(), key=lambda kv: (-kv[1], kv[0]))[:len(COLOR_FAMILIES)]
-    return ColorMap(anchor, {f: i for i, (f, _) in enumerate(top)})
+    # Round-robin: every family under the anchor gets a hue, cycling the four by
+    # weight rank, so the most projects possible are coloured. Collisions land on
+    # the least-frequent pairs and the printed dir text still disambiguates.
+    ranked = sorted(weight.items(), key=lambda kv: (-kv[1], kv[0]))
+    return ColorMap(anchor, {f: i % len(COLOR_FAMILIES)
+                             for i, (f, _) in enumerate(ranked)})
 
 
 def _truecolor():

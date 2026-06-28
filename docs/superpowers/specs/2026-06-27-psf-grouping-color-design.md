@@ -142,13 +142,15 @@ strings would give the same real dir different colours and split HOME vs non-HOM
 
 **Family hue.** First component past the anchor. Four scatter-validated
 saturated families only: yellow `#F2E34C`, amber `#E69F00`, green `#2E9E6B`,
-blue `#1565C0`. Assigned to the most-frequent distinct components per frame
-(frequency = node count = visual mass; deterministic sort `(-count, name)`).
+blue `#1565C0`. **Round-robin assignment**: every family under the anchor gets a
+hue, cycling the four by weight rank (weight = node count = visual mass;
+deterministic sort `(-count, name)`). With more projects than hues the
+least-frequent pairs collide and the printed dir text disambiguates - chosen over
+"top-4 only, rest gray" so the most projects possible are coloured.
 
 **Gray is the no-family sentinel**, not a fifth family - gray ≈ terminal default
-fg, so a gray family would be indistinguishable from "uncoloured" and carry no
-information. Overflow (beyond 4), outside-anchor, and unreadable paths all render
-as terminal default fg.
+fg, so a gray family would be indistinguishable from "uncoloured". Outside-anchor
+and unreadable paths render as terminal default fg.
 
 **Depth shade.** Lighten *within* a family so siblings read as related, in OKLab
 L* (perceptually even), bounded by a **ceiling** (~L* ∈ [0.55, 0.80] on dark bg) -

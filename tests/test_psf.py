@@ -1366,12 +1366,13 @@ class TestColorMap(unittest.TestCase):
         self.assertIsNotNone(base)
         self.assertNotEqual(base, sub)
 
-    def test_overflow_family_uncolored(self):
-        # five families, only four hues -> the least-weighted is uncolored
+    def test_round_robin_colors_all_families_cycling_hues(self):
+        # five families, four hues -> all coloured; the 5th reuses the 1st's hue
         paths = [("/p/a", 5), ("/p/b", 4), ("/p/c", 3), ("/p/d", 2), ("/p/e", 1)]
         cm = psf.build_colormap(paths)
-        self.assertIsNone(cm.sgr(("dir", "/p/e")))
-        self.assertIsNotNone(cm.sgr(("dir", "/p/a")))
+        self.assertIsNotNone(cm.sgr(("dir", "/p/e")))
+        self.assertEqual(cm.sgr(("dir", "/p/e")), cm.sgr(("dir", "/p/a")))   # cycle
+        self.assertNotEqual(cm.sgr(("dir", "/p/a")), cm.sgr(("dir", "/p/b")))
 
 
 # Machado et al. (2009) protanomaly, severity ~0.5 (anomalous trichromat, not
