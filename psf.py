@@ -367,7 +367,7 @@ def _session_procs(root, suppressed):
 
 def collect_session_printed(roots, suppressed):
     """The procs a session-axis view shows. This is the set to decorate/probe/
-    sample, since collect_printed stops at suppressed plumbing and would skip a
+    sample - a plain kept-tree walk stops at suppressed plumbing and would skip a
     session whose parent shell was collapsed away."""
     return [p for r in find_session_roots(roots)
             for p in _session_procs(r, suppressed)]
@@ -387,29 +387,11 @@ def session_signature(leader, categories, suppressed):
 
 def consolidate_sessions(sroots, categories, suppressed, dedup_min, never_merge):
     """Fold signature-equal session roots into one ×N (their children pool and
-    sum downstream); the rest stay individual. Like group_siblings, but keyed on
-    the session signature."""
-    if not dedup_min:
-        return list(sroots)
-    buckets = {}
-    order = []
-    for r in sroots:
-        sig = session_signature(r, categories, suppressed)
-        if sig not in buckets:
-            buckets[sig] = []
-            order.append(sig)
-        buckets[sig].append(r)
-    items = []
-    for sig in order:
-        members = buckets[sig]
-        if (len(members) >= dedup_min
-                and not any(m.comm in never_merge for m in members)):
-            items.append(Group(members=members))
-        else:
-            items.extend(members)
-    items.sort(key=lambda it: min(m.pid for m in it.members)
-               if isinstance(it, Group) else it.pid)
-    return items
+    sum downstream); the rest stay individual. Just group_siblings keyed on the
+    session signature instead of the per-proc merge key."""
+    return group_siblings(
+        sroots, dedup_min, never_merge,
+        key_fn=lambda r: session_signature(r, categories, suppressed))
 
 
 # --- pure core: collapse ----------------------------------------------------
@@ -1459,6 +1441,23 @@ def make_colormap(procs, color, anchor_override=None):
                           anchor_override=anchor_override)
 
 
+def colormap_for(args, procs, color):
+    """The ColorMap for a run, honouring --color-anchor. Shared by main/--path."""
+    override = normalize_path_target(args.color_anchor) if args.color_anchor else None
+    return make_colormap(procs, color, anchor_override=override)
+
+
+def anchor_note(colormap, color):
+    """The one-line legend naming the active colour anchor - data, shown whenever
+    identity colour is on (both the tree and --path). Empty without an anchor."""
+    if not (colormap and colormap.anchor):
+        return []
+    note = ("color: directories & commands are hued by project under /%s "
+            "(dim = no project / outside anchor; warm = cpu/rss heat)"
+            % "/".join(colormap.anchor))
+    return [("\x1b[2m%s\x1b[0m" % note) if color else note, ""]
+
+
 @dataclass
 class ViewNode:
     """One display-tree node: a single Proc or a merged Group, children already
@@ -1470,9 +1469,8 @@ class ViewNode:
     badge: str = ""                 # "[xxx] " or ""
     head_pre: str = ""              # "<pid> " (proc) or "×N " (group) - never colored
     head_label: str = ""            # cmdline or group brace - gets identity hue
-    head_key: object = None         # ColorKey for head_label (wired in step 10)
+    head_key: object = None         # ('dir'|'cmd', raw_path) hue key for head_label
     detail_bits: list = field(default_factory=list)
-    extra_bits: list = field(default_factory=list)   # path-hit bits (step 8)
     collapse_note: object = None    # proc-only
     children: list = field(default_factory=list)
     sort_key: tuple = ()
@@ -1506,11 +1504,15 @@ def build_view(roots, suppressed, width=CMD_WIDTH, sysinfo=None,
 
     def node_of(item):
         if isinstance(item, Group):
+            cwds = {m.cwd for m in item.members}
             return ViewNode(
                 kind="group", payload=item,
                 badge=badge(item.members[0].pid),
                 head_pre="×%d " % len(item.members),
                 head_label=_group_label(item.members, width),
+                # a uniform-cwd group takes that project's hue; a mixed-cwd one
+                # stays uncoloured rather than picking a member's hue at random.
+                head_key=(("dir", item.members[0].cwd) if len(cwds) == 1 else None),
                 detail_bits=_group_detail(item.members, sysinfo))
         venv = venv_map.get(item.pid) if venv_map else None
         return ViewNode(
@@ -1622,9 +1624,9 @@ def emit_lines(nodes, color=False, colormap=None):
             lines.append("%s%s%s%s%s" % (
                 prefix, connector, node.badge, node.head_pre,
                 hue(node.head_label, node.head_key)))
-            bits = node.detail_bits + node.extra_bits
-            if bits:
-                lines.append(child_prefix + _compose_dim(bits, color, colormap))
+            if node.detail_bits:
+                lines.append(child_prefix
+                             + _compose_dim(node.detail_bits, color, colormap))
             walk(node.children, child_prefix)
             if node.collapse_note:
                 lines.append(child_prefix + node.collapse_note)
@@ -1716,26 +1718,11 @@ def cache_path():
     return os.path.join(base, "psf", "cache.json")
 
 
-def collect_printed(roots, suppressed):
-    """The nodes render() will actually print -> the only ones to deep-probe."""
-    out = []
-
-    def walk(node):
-        if not node.kept or node.pid in suppressed:
-            return
-        out.append(node)
-        for c in node.children:
-            walk(c)
-    for r in roots:
-        walk(r)
-    return out
-
-
 def _run_path(args):
-    """--path mode: flat list of every process touching the target subtree,
-    highest-priority category first. Bypasses the interesting-subtree tree,
-    collapse, dedup, lifecycle and the socket cache — it answers one question,
-    'what is touching this path', directly."""
+    """--path mode: every process touching the target subtree, one per node,
+    highest-priority category first, with its path hits as the detail line.
+    Bypasses the interesting-subtree tree, collapse, dedup, lifecycle and the
+    socket cache - it answers one question, 'what is touching this path'."""
     procs = scan()
     sysinfo = SysInfo(clk_tck=CLK_TCK, page_size=PAGE_SIZE, uptime=read_uptime())
     root = normalize_path_target(args.path)
@@ -1747,17 +1734,17 @@ def _run_path(args):
                                 venv_resolver=lambda q: venv_map.get(q.pid))
                   for pid in hits}
 
+    hitprocs = [procs[pid] for pid in hits]
+    colormap = colormap_for(args, hitprocs, color)
     out = []
     if not args.no_header:
         out += psf_header(procs) + [""]
     out.append("touching %s — %d procs" % (compress_path(root), len(hits)))
     out.append("")
-    nodes = build_view([procs[pid] for pid in hits], suppressed=set(),
-                       width=args.width, sysinfo=sysinfo, categories=categories,
+    out += anchor_note(colormap, color)
+    nodes = build_view(hitprocs, suppressed=set(), width=args.width,
+                       sysinfo=sysinfo, categories=categories,
                        venv_map=venv_map, axis="flat", path_hits=hits)
-    anchor = normalize_path_target(args.color_anchor) if args.color_anchor else None
-    colormap = make_colormap([procs[pid] for pid in hits], color,
-                             anchor_override=anchor)
     out += emit_lines(nodes, color=color, colormap=colormap)
     print("\n".join(out))
 
@@ -1861,19 +1848,14 @@ def main(argv=None):
     categories = {n.pid: classify(n, venv_resolver=lambda q: venv_map.get(q.pid))
                   for n in printed}
 
-    anchor = normalize_path_target(args.color_anchor) if args.color_anchor else None
-    colormap = make_colormap(printed, color, anchor_override=anchor)
+    colormap = colormap_for(args, printed, color)
 
     out = []
     if not args.no_header:
         out += psf_header(s_a) + [""]
     if not args.no_glossary:
         out += glossary(color) + [""]
-    if colormap and colormap.anchor:        # the active anchor is data, always shown
-        note = ("color: directories & commands are hued by project under /%s "
-                "(dim = no project / outside anchor; warm = cpu/rss heat)"
-                % "/".join(colormap.anchor))
-        out += [("\x1b[2m%s\x1b[0m" % note) if color else note, ""]
+    out += anchor_note(colormap, color)
     nodes = build_view(visible_roots, suppressed, width=args.width,
                        sysinfo=sysinfo, dedup_min=dedup_min,
                        never_merge=NEVER_MERGE, categories=categories,
