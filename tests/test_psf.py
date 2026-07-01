@@ -1078,6 +1078,27 @@ class TestCliSmoke(unittest.TestCase):
         r = self._run("--no-glossary", "--no-header", "--no-dedup")
         self.assertEqual(r.returncode, 0, r.stderr)
 
+    def test_positional_path_shorthand(self):
+        for target in ("/usr", "."):
+            r = self._run(target)
+            self.assertEqual(r.returncode, 0, "%s: %s" % (target, r.stderr))
+            self.assertIn("touching", r.stdout)
+
+    def test_positional_axis_keyword(self):
+        for axis in ("session", "consolidated", "dir"):
+            r = self._run(axis, "--no-glossary", "--no-header")
+            self.assertEqual(r.returncode, 0, "%s: %s" % (axis, r.stderr))
+            self.assertNotIn("touching", r.stdout)
+
+    def test_tree_keyword_is_session_and_exits_clean(self):
+        r = self._run("tree", "--no-glossary", "--no-header")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("touching", r.stdout)     # a view, not a --path listing
+
+    def test_positional_path_conflicts_with_flag(self):
+        r = self._run("/usr", "--path", "/tmp")
+        self.assertNotEqual(r.returncode, 0)
+
     def test_path_mode_lists_touchers(self):
         r = self._run("--path", "/usr")
         self.assertEqual(r.returncode, 0, r.stderr)

@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 
 CMD_WIDTH = 50            # chars of cmdline shown per process
 COLLAPSE_THRESHOLD = 20   # kept-descendant count above which a subtree collapses
+TREE_THRESHOLD = 80       # relaxed threshold for `psf tree` - bigger, less-collapsed
 CACHE_TTL = 30            # seconds before a cached socket entry is re-probed
 REPR_COMMS = 4            # distinct comms named in a collapse summary
 SAMPLE_INTERVAL = 0.2     # seconds slept to measure current CPU (0 disables)
@@ -1795,7 +1796,28 @@ def main(argv=None):
     ap.add_argument("--path", metavar="PATH",
                     help="instead of the tree, list every process whose "
                          "cwd/exe/open-fd/mmap touches PATH or its subtree")
+    ap.add_argument("target", nargs="?", metavar="TARGET",
+                    help="shorthand: a path (psf ., psf ~/proj) lists what "
+                         "touches it; or a mode - tree (bigger, less-collapsed "
+                         "session), session, consolidated, dir")
     args = ap.parse_args(argv)
+
+    # A positional TARGET is convenience sugar: 'tree' is the session view with
+    # collapse relaxed, an axis name picks the mode, anything else is a --path
+    # target (so `psf .` and `psf ~/proj` just work). A bare word that names an
+    # axis wins over a like-named directory - use --path for that dir.
+    if args.target is not None:
+        if args.target == "tree":
+            args.group = "session"
+            if args.threshold == COLLAPSE_THRESHOLD:
+                args.threshold = TREE_THRESHOLD
+        elif args.target in ("session", "consolidated", "dir"):
+            args.group = args.target
+        elif args.path is None:
+            args.path = args.target
+        else:
+            ap.error("pass a path as the positional OR --path, not both")
+
     if args.group == "dir" and args.path:
         ap.error("--group dir is meaningless under --path (the path already "
                  "scopes a directory)")

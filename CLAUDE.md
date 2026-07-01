@@ -14,6 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Run topf once (piped):** `topf --once` or `python topf.py --once`
 - **Run topf live (interactive TUI):** `topf` or `python topf.py`
 - **Run psf (snapshot):** `psf` or `python psf.py` (default `--group session`)
+- **positional shorthand:** `psf .` / `psf ~/proj` = `--path` that dir; `psf tree` = session view, collapse relaxed (`TREE_THRESHOLD`); `psf dir`/`psf consolidated`/`psf session` pick the axis. A bare axis word wins over a like-named dir — use `--path` for that dir.
 - **Run psf, other axes:** `psf --group consolidated` (fold alike sessions; `--pool-global` to flatten), `psf --group dir` (by directory)
 - **Run psf path query:** `psf --path ~/proj` (every process touching a subtree)
 - **Install editable:** `pip install -e .`
