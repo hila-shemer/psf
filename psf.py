@@ -142,6 +142,20 @@ VENV_PATH_MARKERS = (".venv/bin/", "env/bin/", "venv/bin/")
 # --path: max /proc/PID/maps lines scanned per process when matching a subtree.
 MAPS_MAX_PER_PROC = 3
 
+# Idle MCP-helper hiding. Every claude session spawns the same context7-mcp
+# helper chain (npm exec -> sh -c -> node); it is almost always idle yet triples
+# a claude's line count, and collapse() won't fold it (the subtree is too small).
+# A *unit* is the shallowest cmdline match (HELPER_MARKERS) plus its whole kept
+# subtree - the node leaf's cmdline is truncated and does NOT literally contain
+# "context7", so per-proc matching would miss it. A unit is only hidden when its
+# nearest visible ancestor is a claude (classified user-session). A node is "hot"
+# (kept visible) if ANY threshold below is strictly exceeded; CPU is in cores
+# (1.0 == one full core), matching CPU_TINT_ANCHORS. See plan_helper_hiding().
+HELPER_MARKERS = (re.compile(r"context7-mcp"),)   # cmdline; shallowest match roots a unit
+HELPER_CUR_CPU = 0.02       # recent-sample CPU fraction above which a helper is busy
+HELPER_AVG_CPU = 0.05       # lifetime-average CPU fraction above which it is busy
+HELPER_RSS = 200 * 1024**2  # resident bytes above which it is busy
+
 # ---------------------------------------------------------------------------
 
 
@@ -353,13 +367,14 @@ def find_session_roots(roots):
     return sorted(out, key=lambda p: p.pid)
 
 
-def _session_procs(root, suppressed):
-    """A session root plus its visible (kept, non-suppressed) descendants."""
+def _session_procs(root, suppressed, transparent=frozenset()):
+    """A session root plus its visible (kept, non-suppressed) descendants.
+    `transparent` helper members are passed through, not counted."""
     out = []
 
     def walk(node):
         out.append(node)
-        for c in _visible_children(node, suppressed):
+        for c in _visible_children(node, suppressed, transparent):
             walk(c)
 
     walk(root)
@@ -374,25 +389,28 @@ def collect_session_printed(roots, suppressed):
             for p in _session_procs(r, suppressed)]
 
 
-def session_signature(leader, categories, suppressed):
+def session_signature(leader, categories, suppressed, transparent=frozenset()):
     """What makes two sessions 'the same' for the consolidated axis: the leader's
     category/comm/uid plus the sorted multiset of its visible children's merge
     keys. Folding on comm alone would fold an idle shell into a heavy build and
     mislead through the pooled child counts."""
     cat = (categories[leader.pid].name
            if categories and leader.pid in categories else None)
-    child_keys = tuple(sorted(merge_key(c, categories)
-                              for c in _visible_children(leader, suppressed)))
+    child_keys = tuple(sorted(
+        merge_key(c, categories)
+        for c in _visible_children(leader, suppressed, transparent)))
     return (cat, leader.comm, leader.uid, child_keys)
 
 
-def consolidate_sessions(sroots, categories, suppressed, dedup_min, never_merge):
+def consolidate_sessions(sroots, categories, suppressed, dedup_min, never_merge,
+                         transparent=frozenset()):
     """Fold signature-equal session roots into one ×N (their children pool and
     sum downstream); the rest stay individual. Just group_siblings keyed on the
     session signature instead of the per-proc merge key."""
     return group_siblings(
         sroots, dedup_min, never_merge,
-        key_fn=lambda r: session_signature(r, categories, suppressed))
+        key_fn=lambda r: session_signature(r, categories, suppressed,
+                                           transparent))
 
 
 # --- pure core: collapse ----------------------------------------------------
@@ -423,6 +441,90 @@ def collapse(procs, threshold=COLLAPSE_THRESHOLD):
             top += ", …"
         p.collapse_note = "… (+%d descendants: %s)" % (len(hide), top)
     return suppressed
+
+
+def _helper_marker(proc):
+    """The HELPER_MARKERS pattern text a proc's cmdline matches, else None.
+    The pattern doubles as the helper name shown in the trailing note."""
+    for rx in HELPER_MARKERS:
+        if rx.search(proc.cmdline or ""):
+            return rx.pattern
+    return None
+
+
+def _helper_hot(proc, sysinfo):
+    """True when a helper proc is doing enough to stay visible: current CPU,
+    lifetime-average CPU, or RSS strictly over its threshold. A None current
+    sample (sampling off) counts as 0, so only avg/rss can trip it."""
+    if proc.rss_pages * sysinfo.page_size > HELPER_RSS:
+        return True
+    cur = proc.cpu_current if proc.cpu_current is not None else 0.0
+    if cur > HELPER_CUR_CPU:
+        return True
+    life = lifetime_secs(proc.starttime, sysinfo.uptime, sysinfo.clk_tck)
+    avg = cpu_fraction(proc.utime + proc.stime, life, sysinfo.clk_tck)
+    return avg is not None and avg > HELPER_AVG_CPU
+
+
+def plan_helper_hiding(roots, categories, sysinfo):
+    """Post-sampling planner: walk the kept forest and decide which idle helper
+    procs to hide. Runs AFTER sampling so current-CPU is known (helpers stay in
+    the sampled/probed set). Returns (transparent, lifted, notes):
+
+    - transparent: set[pid] of cold members - skipped in the render walk but
+      *passed through* (their visible descendants surface in their place), so a
+      lifted hot node under a hidden parent still renders.
+    - lifted: set[pid] of hot members that surface through a transparent parent;
+      the renderer marks them with '↑ '.
+    - notes: {anchor_pid: [note, …]} trailing dim note(s), keyed by the claude.
+
+    A unit is the shallowest cmdline match (its whole kept subtree); it is only
+    eligible when its nearest visible ancestor is classified user-session. An
+    all-cold unit goes wholly transparent (nothing surfaces); a partial one puts
+    cold members in transparent and hot members in lifted."""
+    transparent, lifted, notes = set(), set(), {}
+
+    def unit_members(root):
+        out, stack = [], [root]
+        while stack:
+            n = stack.pop()
+            if not n.kept:
+                continue
+            out.append(n)
+            stack.extend(n.children)
+        return out
+
+    def descend(node, anchor):
+        if not node.kept:
+            return
+        name = _helper_marker(node)
+        eligible = (name is not None and anchor is not None and categories
+                    and anchor.pid in categories
+                    and categories[anchor.pid].name == "user-session")
+        if eligible:
+            members = unit_members(node)
+            hot, cold = [], []          # partition once: predicate is expensive
+            for m in members:
+                (hot if _helper_hot(m, sysinfo) else cold).append(m)
+            if not cold:
+                # Every member is hot - nothing idle to hide. Leave the unit
+                # rendered normally (no transparent, no lift marker, no note);
+                # a "0 idle hidden" note with spurious '↑ ' markers would lie.
+                return
+            transparent.update(m.pid for m in cold)
+            if hot:
+                lifted.update(m.pid for m in hot)
+                note = "… (%s helper: %d idle hidden)" % (name, len(cold))
+            else:
+                note = "… (%s helper hidden)" % name
+            notes.setdefault(anchor.pid, []).append(note)
+            return                      # whole unit handled - don't recurse in
+        for c in node.children:
+            descend(c, node)
+
+    for r in roots:
+        descend(r, None)
+    return transparent, lifted, notes
 
 
 # --- pure core: classification + venv ---------------------------------------
@@ -1235,8 +1337,22 @@ def _detail(node, sysinfo=None, venv=None, path_hits=None):
     return bits
 
 
-def _visible_children(node, suppressed):
-    return [c for c in node.children if c.kept and c.pid not in suppressed]
+def _visible_children(node, suppressed, transparent=frozenset()):
+    """A node's kept, non-suppressed children. A `transparent` child (a cold
+    helper) is skipped but *passed through*: its own visible children take its
+    place, so a lifted hot node under it still reaches the view rather than
+    being cut off. `transparent` empty -> byte-for-byte the old behaviour."""
+    out = []
+    for c in node.children:
+        if not c.kept:
+            continue
+        if c.pid in transparent:
+            out.extend(_visible_children(c, suppressed, transparent))
+            continue
+        if c.pid in suppressed:
+            continue
+        out.append(c)
+    return out
 
 
 def _group_label(members, width):
@@ -1477,6 +1593,7 @@ class ViewNode:
     head_key: object = None         # ('dir'|'cmd', raw_path) hue key for head_label
     detail_bits: list = field(default_factory=list)
     collapse_note: object = None    # proc-only
+    helper_note: object = None      # list[str] idle-helper note(s), on the anchor
     children: list = field(default_factory=list)
     sort_key: tuple = ()
 
@@ -1492,15 +1609,28 @@ def _dir_bucket(cwd):
 def build_view(roots, suppressed, width=CMD_WIDTH, sysinfo=None,
                dedup_min=None, never_merge=frozenset(), categories=None,
                venv_map=None, axis="tree", key_fn=None, pool_global=False,
-               expand_all=False, path_hits=None):
+               expand_all=False, path_hits=None,
+               transparent=frozenset(), lifted=frozenset(), notes=None):
     """Turn kept Procs into a display tree (list[ViewNode]). Pure: no /proc IO,
     no ANSI. Merging for the chosen axis is fully resolved here. axis="tree" is
     the per-parent grouping render() exposes; "session" roots each session at its
     leader; "consolidated" folds signature-equal sessions (pool_global flattens
     to a global ×N-by-kind list); "dir" buckets by directory. expand_all drops
-    the collapse/suppressed set; merging is off when dedup_min is falsy."""
+    the collapse/suppressed set. transparent/lifted/notes come from
+    plan_helper_hiding: transparent members pass through the visible-children
+    walk, lifted members get a '↑ ' marker, notes attach a trailing line to their
+    anchor. merging is off when dedup_min is falsy."""
     if expand_all:
         suppressed = frozenset()
+        transparent = frozenset()
+        lifted = frozenset()
+        notes = None
+    elif lifted:
+        # Lifting overrides collapse-suppression: a hot helper that collapse()
+        # also folded into `suppressed` must still surface (otherwise the
+        # _visible_children suppressed-filter would drop it and the hot node
+        # would vanish rather than lift).
+        suppressed = set(suppressed) - lifted
 
     def badge(pid):
         if categories and pid in categories:
@@ -1523,13 +1653,15 @@ def build_view(roots, suppressed, width=CMD_WIDTH, sysinfo=None,
         return ViewNode(
             kind="proc", payload=item,
             badge=badge(item.pid),
-            head_pre="%d " % item.pid,
+            # a lifted hot helper surfacing through a hidden parent gets '↑ '.
+            head_pre=("↑ " if item.pid in lifted else "") + "%d " % item.pid,
             head_label=compress_cmdline(item.cmdline, width),
             head_key=("dir", item.cwd),     # the command takes its project's hue
             detail_bits=_detail(item, sysinfo, venv=venv),
             collapse_note=(item.collapse_note
                            if (not expand_all and item.collapsed
-                               and item.collapse_note) else None))
+                               and item.collapse_note) else None),
+            helper_note=(notes.get(item.pid) if notes else None))
 
     def make_nodes(items):
         nodes = []
@@ -1537,9 +1669,9 @@ def build_view(roots, suppressed, width=CMD_WIDTH, sysinfo=None,
             node = node_of(item)
             if isinstance(item, Group):
                 kids = [c for m in item.members
-                        for c in _visible_children(m, suppressed)]
+                        for c in _visible_children(m, suppressed, transparent)]
             else:
-                kids = _visible_children(item, suppressed)
+                kids = _visible_children(item, suppressed, transparent)
             node.children = make_nodes(
                 group_siblings(kids, dedup_min, never_merge, key_fn))
             nodes.append(node)
@@ -1555,15 +1687,17 @@ def build_view(roots, suppressed, width=CMD_WIDTH, sysinfo=None,
         if pool_global:
             # One flat ×N-by-kind list across every session - a globally-pooled
             # entry has no single session header to nest under.
-            procs = [p for r in sroots for p in _session_procs(r, suppressed)]
+            procs = [p for r in sroots
+                     for p in _session_procs(r, suppressed, transparent)]
             return [node_of(it) for it in
                     group_siblings(procs, dedup_min, never_merge, key_fn)]
         return make_nodes(consolidate_sessions(
-            sroots, categories, suppressed, dedup_min, never_merge))
+            sroots, categories, suppressed, dedup_min, never_merge,
+            transparent))
 
     if axis == "dir":
         procs = [p for r in find_session_roots(roots)
-                 for p in _session_procs(r, suppressed)]
+                 for p in _session_procs(r, suppressed, transparent)]
         buckets = {}
         order = []
         for p in procs:
@@ -1635,6 +1769,9 @@ def emit_lines(nodes, color=False, colormap=None):
             walk(node.children, child_prefix)
             if node.collapse_note:
                 lines.append(child_prefix + node.collapse_note)
+            for note in (node.helper_note or []):
+                lines.append(child_prefix
+                             + (("\x1b[2m%s\x1b[0m" % note) if color else note))
 
     walk(nodes, "")
     return lines
@@ -1876,6 +2013,13 @@ def main(argv=None):
 
     colormap = colormap_for(args, printed, color)
 
+    # Idle helper hiding runs AFTER sampling/classification: current CPU is set
+    # and every helper carries a category, so the nearest-visible-ancestor guard
+    # and the hot/cold split are decidable. build_view zeroes these under
+    # --expand-all, so the full chains reappear there.
+    transparent, lifted, notes = plan_helper_hiding(
+        visible_roots, categories, sysinfo)
+
     out = []
     if not args.no_header:
         out += psf_header(s_a) + [""]
@@ -1887,7 +2031,8 @@ def main(argv=None):
                        never_merge=NEVER_MERGE, categories=categories,
                        venv_map=venv_map, axis=args.group,
                        pool_global=args.pool_global, expand_all=args.expand_all,
-                       key_fn=lambda p: merge_key(p, categories))
+                       key_fn=lambda p: merge_key(p, categories),
+                       transparent=transparent, lifted=lifted, notes=notes)
     out += emit_lines(nodes, color=color, colormap=colormap)
     if s_b is not None and not args.no_lifecycle:
         section = format_lifecycle(born, died, _parents_map(s_a, s_b),
