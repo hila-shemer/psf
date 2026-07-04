@@ -1523,6 +1523,228 @@ class TestColorEmission(unittest.TestCase):
                 os.environ["COLORTERM"] = old
 
 
+class TestHelperHiding(unittest.TestCase):
+    # The idle context7-mcp helper chain a claude spawns: claude (usr) -> npm
+    # (mis) -> sh (mis) -> node (cmp). The node leaf's cmdline is truncated and
+    # does NOT contain "context7", so the unit anchors on the shallowest match
+    # (npm) and takes the whole kept subtree.
+    SYS = None
+
+    def setUp(self):
+        # page_size 1 -> rss_pages read as bytes; clk_tck 100.
+        self.SYS = psf.SysInfo(clk_tck=100, page_size=1, uptime=1100.0)
+
+    def _chain(self):
+        procs = {
+            1: _p(1, 0, comm="systemd", cmdline="init"),
+            2: _p(2, 1, comm="claude", cmdline="claude"),
+            3: _p(3, 2, comm="npm", cmdline="npm exec @upstash/context7-mcp"),
+            4: _p(4, 3, comm="sh", cmdline="sh -c context7-mcp"),
+            5: _p(5, 4, comm="node",
+                  cmdline="node /home/h/.npm/_npx/abc123/node_mo"),
+        }
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        procs[2].interesting = True
+        return procs
+
+    def _cats(self, procs):
+        return {pid: psf.classify(procs[pid]) for pid in procs}
+
+    def _plan(self, procs):
+        return psf.plan_helper_hiding([procs[1]], self._cats(procs), self.SYS)
+
+    # --- planner ---
+
+    def test_all_cold_hides_whole_unit(self):
+        procs = self._chain()
+        transparent, lifted, notes = self._plan(procs)
+        self.assertEqual(transparent, {3, 4, 5})
+        self.assertEqual(lifted, set())
+        self.assertIn(2, notes)                       # keyed by the claude
+        self.assertIn("context7-mcp helper hidden", notes[2][0])
+
+    def test_hot_node_lifts_and_counts_idle(self):
+        procs = self._chain()
+        procs[5].rss_pages = 300 * 1024**2            # >200MB -> hot
+        transparent, lifted, notes = self._plan(procs)
+        self.assertEqual(transparent, {3, 4})         # npm + sh idle
+        self.assertEqual(lifted, {5})
+        self.assertIn("context7-mcp helper: 2 idle hidden", notes[2][0])
+
+    def test_hot_by_current_cpu(self):
+        procs = self._chain()
+        procs[5].cpu_current = 0.05                    # >0.02 -> hot
+        transparent, lifted, _ = self._plan(procs)
+        self.assertEqual(lifted, {5})
+        self.assertEqual(transparent, {3, 4})
+
+    def test_hot_by_average_cpu(self):
+        procs = self._chain()
+        procs[5].starttime = 0                          # life == uptime 1100s
+        procs[5].utime = 5600                           # 5600/110000 = 5.1% avg
+        transparent, lifted, _ = self._plan(procs)
+        self.assertEqual(lifted, {5})
+
+    def test_boundary_rss_strict(self):
+        procs = self._chain()
+        procs[5].rss_pages = 200 * 1024**2              # exactly -> NOT hot
+        _, lifted, _ = self._plan(procs)
+        self.assertEqual(lifted, set())
+        procs[5].rss_pages = 200 * 1024**2 + 1          # one over -> hot
+        _, lifted, _ = self._plan(procs)
+        self.assertEqual(lifted, {5})
+
+    def test_boundary_current_cpu_strict(self):
+        procs = self._chain()
+        procs[5].cpu_current = 0.02                      # exactly -> NOT hot
+        _, lifted, _ = self._plan(procs)
+        self.assertEqual(lifted, set())
+
+    def test_boundary_average_cpu_strict(self):
+        procs = self._chain()
+        procs[5].starttime = 0
+        procs[5].utime = 5500                            # 5500/110000 = 5% exactly
+        _, lifted, _ = self._plan(procs)
+        self.assertEqual(lifted, set())
+
+    def test_cpu_current_none_treated_as_zero(self):
+        procs = self._chain()                            # all cpu_current None
+        transparent, lifted, _ = self._plan(procs)
+        self.assertEqual(lifted, set())                  # None never trips cur
+        self.assertEqual(transparent, {3, 4, 5})
+
+    def test_guard_non_user_session_parent_not_eligible(self):
+        # A context7-mcp launched under a plain bash (infrastructure), not a
+        # claude, stays fully visible: empty plan.
+        procs = {
+            1: _p(1, 0, comm="systemd", cmdline="init"),
+            2: _p(2, 1, comm="bash", cmdline="bash"),
+            3: _p(3, 2, comm="npm", cmdline="npm exec @upstash/context7-mcp"),
+        }
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        procs[2].interesting = True
+        transparent, lifted, notes = psf.plan_helper_hiding(
+            [procs[1]], self._cats(procs), self.SYS)
+        self.assertEqual((transparent, lifted, notes), (set(), set(), {}))
+
+    # --- _visible_children pass-through ---
+
+    def test_visible_children_passes_through_transparent(self):
+        procs = self._chain()
+        # npm (pid 3) transparent -> claude's children surface sh (npm's child)
+        kids = psf._visible_children(procs[2], suppressed=frozenset(),
+                                     transparent={3})
+        self.assertEqual([k.pid for k in kids], [4])
+
+    def test_visible_children_default_unchanged(self):
+        procs = self._chain()
+        kids = psf._visible_children(procs[2], suppressed=frozenset())
+        self.assertEqual([k.pid for k in kids], [3])   # npm, byte-for-byte old
+
+    # --- build_view + emit_lines ---
+
+    def test_session_view_hides_cold_unit_with_note(self):
+        procs = self._chain()
+        cats = self._cats(procs)
+        transparent, lifted, notes = self._plan(procs)
+        nodes = psf.build_view([procs[1]], suppressed=set(), width=80,
+                               axis="session", categories=cats,
+                               transparent=transparent, lifted=lifted,
+                               notes=notes)
+        claude = nodes[0]
+        self.assertEqual(claude.payload.comm, "claude")
+        self.assertEqual(claude.children, [])          # npm/sh/node all hidden
+        text = "\n".join(psf.emit_lines(nodes))
+        self.assertIn("context7-mcp helper hidden", text)
+        self.assertNotIn("npm", text)
+        self.assertNotIn("node /home", text)
+
+    def test_session_view_lifts_hot_node_with_marker(self):
+        procs = self._chain()
+        procs[5].rss_pages = 300 * 1024**2
+        cats = self._cats(procs)
+        transparent, lifted, notes = self._plan(procs)
+        nodes = psf.build_view([procs[1]], suppressed=set(), width=80,
+                               axis="session", categories=cats,
+                               transparent=transparent, lifted=lifted,
+                               notes=notes)
+        claude = nodes[0]
+        self.assertEqual(len(claude.children), 1)
+        child = claude.children[0]
+        self.assertEqual(child.payload.comm, "node")
+        self.assertTrue(child.head_pre.startswith("↑ "))   # lifted marker
+        text = "\n".join(psf.emit_lines(nodes))
+        self.assertIn("2 idle hidden", text)
+        self.assertNotIn("npm exec", text)             # npm/sh still hidden
+        self.assertNotIn("sh -c context7", text)
+
+    def test_expand_all_reveals_full_chain(self):
+        procs = self._chain()
+        cats = self._cats(procs)
+        transparent, lifted, notes = self._plan(procs)
+        nodes = psf.build_view([procs[1]], suppressed=set(), width=80,
+                               axis="session", categories=cats,
+                               transparent=transparent, lifted=lifted,
+                               notes=notes, expand_all=True)
+        text = "\n".join(psf.emit_lines(nodes))
+        self.assertIn("npm", text)                     # chain reappears
+        self.assertIn("sh -c context7-mcp", text)
+        self.assertNotIn("helper hidden", text)        # and no note
+
+    def test_all_hot_unit_renders_normally_no_note(self):
+        # Every member over threshold -> nothing idle. The unit renders in full
+        # with no lift markers and no "0 idle hidden" note (which would lie).
+        procs = self._chain()
+        for pid in (3, 4, 5):
+            procs[pid].rss_pages = 300 * 1024**2       # all hot
+        transparent, lifted, notes = self._plan(procs)
+        self.assertEqual((transparent, lifted, notes), (set(), set(), {}))
+        nodes = psf.build_view([procs[1]], suppressed=set(), width=80,
+                               axis="session", categories=self._cats(procs),
+                               transparent=transparent, lifted=lifted,
+                               notes=notes)
+        text = "\n".join(psf.emit_lines(nodes))
+        self.assertIn("npm exec", text)                # full chain visible
+        self.assertIn("node /home", text)
+        self.assertNotIn("↑ ", text)                   # no spurious lift marker
+        self.assertNotIn("idle hidden", text)          # no misleading note
+
+    def test_lifted_node_overrides_collapse_suppression(self):
+        # Regression: a hot helper that collapse() also folded into `suppressed`
+        # must still surface (lift wins over suppression) rather than vanish.
+        procs = self._chain()
+        procs[5].rss_pages = 300 * 1024**2             # node is hot
+        transparent, lifted, notes = self._plan(procs)
+        # Simulate collapse having suppressed the whole helper chain.
+        nodes = psf.build_view([procs[1]], suppressed={3, 4, 5}, width=80,
+                               axis="session", categories=self._cats(procs),
+                               transparent=transparent, lifted=lifted,
+                               notes=notes)
+        claude = nodes[0]
+        self.assertEqual(len(claude.children), 1)      # not zero: node survives
+        child = claude.children[0]
+        self.assertEqual(child.payload.comm, "node")
+        self.assertTrue(child.head_pre.startswith("↑ "))
+        text = "\n".join(psf.emit_lines(nodes))
+        self.assertIn("2 idle hidden", text)
+
+    def test_helper_note_dim_wrapped_when_color(self):
+        # color=True wraps the trailing helper note in the dim SGR (\x1b[2m…\x1b[0m)
+        # as one contiguous run - guards the beyond-spec dim rendering.
+        procs = self._chain()
+        transparent, lifted, notes = self._plan(procs)
+        nodes = psf.build_view([procs[1]], suppressed=set(), width=80,
+                               axis="session", categories=self._cats(procs),
+                               transparent=transparent, lifted=lifted,
+                               notes=notes)
+        text = "\n".join(psf.emit_lines(nodes, color=True))
+        self.assertIn("\x1b[2m… (context7-mcp helper hidden)\x1b[0m", text)
+
+
 class TestForestConnectors(unittest.TestCase):
     def test_top_level_nodes_render_bare_children_get_connectors(self):
         procs = {1: _p(1, 0, comm="systemd", cmdline="init")}
