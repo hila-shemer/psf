@@ -1836,5 +1836,165 @@ class TestViewLayer(unittest.TestCase):
         self.assertEqual(group.head_pre, "×3 ")
 
 
+class TestContainerAnnotation(unittest.TestCase):
+    V2 = ("0::/system.slice/docker-"
+          "49480dce3a5120a597778ac4260e74a137e7ba162348f6d3567d042ebb554f6a"
+          ".scope\n")
+    V1 = ("11:cpu,cpuacct:/docker/"
+          "49480dce3a5120a597778ac4260e74a137e7ba162348f6d3567d042ebb554f6a\n")
+    K8S = ("0::/kubepods/burstable/podabc/"
+           "49480dce3a5120a597778ac4260e74a137e7ba162348f6d3567d042ebb554f6a\n")
+    HOST = "0::/user.slice/user-1000.slice/session-3.scope\n"
+
+    def test_cgroup_v2_scope_id(self):
+        cid = psf.read_cgroup_container(7, read=lambda p: self.V2)
+        self.assertEqual(cid, "49480dce3a51")     # short (12-char) id
+
+    def test_cgroup_v1_and_k8s_ids(self):
+        self.assertEqual(psf.read_cgroup_container(7, read=lambda p: self.V1),
+                         "49480dce3a51")
+        self.assertEqual(psf.read_cgroup_container(7, read=lambda p: self.K8S),
+                         "49480dce3a51")
+
+    def test_host_cgroup_is_none(self):
+        self.assertIsNone(psf.read_cgroup_container(7, read=lambda p: self.HOST))
+        self.assertIsNone(psf.read_cgroup_container(7, read=lambda p: ""))
+
+    def test_docker_ps_parse(self):
+        out = ("49480dce3a51 loop-model-claude-run-953864d14744\n"
+               "abc123def456 other-container\n")
+        self.assertEqual(psf._parse_docker_ps(out), {
+            "49480dce3a51": "loop-model-claude-run-953864d14744",
+            "abc123def456": "other-container"})
+
+    def test_docker_ps_parse_garbage_is_empty(self):
+        self.assertEqual(psf._parse_docker_ps(""), {})
+        self.assertEqual(psf._parse_docker_ps("\n\n"), {})
+
+    def test_docker_names_missing_binary_is_empty(self):
+        def boom():
+            raise FileNotFoundError("no docker")
+        self.assertEqual(psf.docker_container_names(runner=boom), {})
+
+    def test_docker_names_timeout_is_empty(self):
+        import subprocess
+
+        def boom():
+            raise subprocess.TimeoutExpired(cmd="docker", timeout=1.0)
+        self.assertEqual(psf.docker_container_names(runner=boom), {})
+
+    def test_docker_names_nonzero_exit_is_empty(self):
+        class R:
+            returncode = 1
+            stdout = "garbage"
+        self.assertEqual(psf.docker_container_names(runner=lambda: R()), {})
+
+    def test_docker_names_ok(self):
+        class R:
+            returncode = 0
+            stdout = "49480dce3a51 loop-model-claude-run-953864d14744\n"
+        self.assertEqual(psf.docker_container_names(runner=lambda: R()),
+                         {"49480dce3a51": "loop-model-claude-run-953864d14744"})
+
+    def test_label_friendly_name_strips_hash_and_compresses(self):
+        names = {"49480dce3a51":
+                 "loop-model-prepare_profiler-claude-loop-run-953864d14744"}
+        label = psf.container_label("49480dce3a51", names)
+        self.assertNotIn("953864d14744", label)     # trailing run-hash gone
+        self.assertTrue(label.startswith("loop-model-"))
+        self.assertIn("…", label)                   # long -> head…tail elided
+
+    def test_label_short_name_kept_verbatim(self):
+        names = {"49480dce3a51": "web"}
+        self.assertEqual(psf.container_label("49480dce3a51", names), "web")
+
+    def test_label_falls_back_to_id(self):
+        self.assertEqual(psf.container_label("49480dce3a51", {}), "49480dce3a51")
+
+    def _tree(self):
+        # host-bash -> claude(container A) -> node(container A); a second
+        # claude(container B) also under host-bash.
+        procs = {
+            1: _p(1, 0, comm="bash", cmdline="bash"),
+            10: _p(10, 1, comm="claude", cmdline="claude"),
+            11: _p(11, 10, comm="node", cmdline="node"),
+            20: _p(20, 1, comm="claude", cmdline="claude"),
+        }
+        psf.build_tree(procs)
+        for p in procs.values():
+            p.kept = True
+        return procs
+
+    def test_boundary_annotates_topmost_only(self):
+        procs = self._tree()
+        printed = list(procs.values())
+        cid = {10: "aaaaaaaaaaaa", 11: "aaaaaaaaaaaa", 20: "bbbbbbbbbbbb"}
+        names = {"aaaaaaaaaaaa": "alpha", "bbbbbbbbbbbb": "beta"}
+        ann = psf.container_annotations(printed, cid, names)
+        self.assertEqual(ann, {10: "alpha", 20: "beta"})  # node(11) inherits, no bit
+
+    def test_boundary_when_parent_not_printed(self):
+        procs = self._tree()
+        printed = [procs[10], procs[11]]         # host-bash(1) not printed
+        cid = {10: "aaaaaaaaaaaa", 11: "aaaaaaaaaaaa"}
+        ann = psf.container_annotations(printed, cid, {})
+        self.assertEqual(ann, {10: "aaaaaaaaaaaa"})       # id fallback, boundary=10
+
+    def test_detail_includes_container_bit_only_when_mapped(self):
+        p = _p(10, 1, comm="claude", cmdline="claude", rss_pages=0)
+        p.kept = True
+        info = psf.SysInfo(clk_tck=100, page_size=4096, uptime=1100.0)
+        with_bit = psf._detail(p, info, containers={10: "alpha"})
+        self.assertEqual(with_bit[0][0], "container:alpha")   # leading bit
+        without = psf._detail(p, info)
+        self.assertFalse(any(str(b[0]).startswith("container:") for b in without))
+
+    def test_build_view_threads_container_bit(self):
+        procs = self._tree()
+        info = psf.SysInfo(clk_tck=100, page_size=4096, uptime=1100.0)
+        nodes = psf.build_view([procs[1]], suppressed=set(), width=50,
+                               sysinfo=info, containers={10: "alpha"})
+        claude = nodes[0].children[0]
+        self.assertEqual(claude.payload.pid, 10)
+        self.assertTrue(any(str(b[0]) == "container:alpha"
+                            for b in claude.detail_bits))
+
+    def test_docker_cache_persists_and_reuses_within_ttl(self):
+        class R:
+            returncode = 0
+            stdout = "49480dce3a51 web\n"
+        with tempfile.TemporaryDirectory() as d:
+            calls = []
+            runner = lambda: (calls.append(1), R())[1]
+            m1 = psf.docker_names_cached(d, now=1000.0, runner=runner)
+            self.assertEqual(m1, {"49480dce3a51": "web"})
+            # second call inside CACHE_TTL reuses the file, no re-shell
+            m2 = psf.docker_names_cached(d, now=1000.0 + psf.CACHE_TTL - 1,
+                                         runner=runner)
+            self.assertEqual(m2, {"49480dce3a51": "web"})
+            self.assertEqual(len(calls), 1)
+            # past the TTL it probes again
+            psf.docker_names_cached(d, now=1000.0 + psf.CACHE_TTL + 1,
+                                    runner=runner)
+            self.assertEqual(len(calls), 2)
+
+    def test_docker_cache_no_cache_skips_file(self):
+        class R:
+            returncode = 0
+            stdout = "49480dce3a51 web\n"
+        with tempfile.TemporaryDirectory() as d:
+            psf.docker_names_cached(d, now=1000.0, no_cache=True,
+                                    runner=lambda: R())
+            self.assertFalse(os.path.exists(os.path.join(d, "docker.json")))
+
+    def test_docker_cache_empty_map_not_persisted(self):
+        def boom():
+            raise FileNotFoundError("no docker")
+        with tempfile.TemporaryDirectory() as d:
+            m = psf.docker_names_cached(d, now=1000.0, runner=boom)
+            self.assertEqual(m, {})
+            self.assertFalse(os.path.exists(os.path.join(d, "docker.json")))
+
+
 if __name__ == "__main__":
     unittest.main()

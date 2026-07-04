@@ -21,6 +21,7 @@ import math
 import os
 import re
 import stat
+import subprocess
 import sys
 import time
 from collections import Counter, namedtuple
@@ -141,6 +142,17 @@ VENV_PATH_MARKERS = (".venv/bin/", "env/bin/", "venv/bin/")
 
 # --path: max /proc/PID/maps lines scanned per process when matching a subtree.
 MAPS_MAX_PER_PROC = 3
+
+# Container annotation. A containerized proc's cgroup carries the 64-hex id in a
+# docker-<id>.scope / /docker/<id> / k8s path; the short id is its first 12 chars
+# (the free, universal signal). The friendly compose name lives only in docker's
+# metadata, so it's a best-effort `docker ps` shell-out (DOCKER_PS_TIMEOUT, cached
+# under CACHE_TTL) that degrades to the bare id. A long name is compressed like a
+# path: a trailing run-hash is stripped, then head…tail-elided to fit the width.
+CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}")
+CONTAINER_HASH_RE = re.compile(r"[-_][0-9a-f]{8,}$")   # trailing compose run-hash
+CONTAINER_NAME_WIDTH = 40      # friendly-name chars before head…tail elision
+DOCKER_PS_TIMEOUT = 1.0        # seconds before the `docker ps` probe is abandoned
 
 # Idle MCP-helper hiding. Every claude session spawns the same context7-mcp
 # helper chain (npm exec -> sh -c -> node); it is almost always idle yet triples
@@ -987,6 +999,123 @@ def netns_of(pid):
         return ""
 
 
+def read_cgroup_container(pid, read=None):
+    """Short (12-char) container id from /proc/PID/cgroup, or None if the proc
+    isn't in a container. Matches the 64-hex id docker/containerd/k8s embed in
+    the cgroup path (docker-<id>.scope, /docker/<id>, /kubepods/.../<id>); a host
+    proc's cgroup has no 64-hex run, so the docker-compose launcher on the host
+    never false-positives. `read` is injectable for testing."""
+    if read is None:
+        read = lambda p: _read_text("%s/%d/cgroup" % (PROC, p))
+    m = CONTAINER_ID_RE.search(read(pid) or "")
+    return m.group(0)[:12] if m else None
+
+
+def _parse_docker_ps(output):
+    """{short_id: name} from `docker ps --format '{{.ID}} {{.Names}}'` output.
+    Pure, so it's tested without a live docker."""
+    out = {}
+    for line in output.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            out[parts[0]] = parts[1].strip()
+    return out
+
+
+def docker_container_names(runner=None):
+    """Best-effort {short_id: friendly_name} via one `docker ps`. Returns {} when
+    docker is missing, errors, or times out - the id-from-cgroup path still works,
+    this only enriches it. `runner` (the subprocess call) is injectable."""
+    if runner is None:
+        runner = lambda: subprocess.run(
+            ["docker", "ps", "--format", "{{.ID}} {{.Names}}"],
+            capture_output=True, text=True, timeout=DOCKER_PS_TIMEOUT)
+    try:
+        res = runner()
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return {}
+    if getattr(res, "returncode", 1) != 0:
+        return {}
+    return _parse_docker_ps(res.stdout or "")
+
+
+def docker_names_cached(cache_dir, now, no_cache=False, runner=None):
+    """docker_container_names() memoized to <cache_dir>/docker.json under a
+    CACHE_TTL window, so back-to-back snapshots don't re-shell. A cache miss (or
+    --no-cache) probes live; only a non-empty map is persisted (the common
+    no-docker failure is instant, so caching {} would just stall a fresh start)."""
+    path = os.path.join(cache_dir, "docker.json")
+    if not no_cache:
+        try:
+            with open(path) as fh:
+                blob = json.load(fh)
+            if now - blob.get("ts", 0) < CACHE_TTL:
+                return blob["map"]
+        except (OSError, ValueError, KeyError):
+            pass
+    names = docker_container_names(runner)
+    if names and not no_cache:
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(path + ".tmp", "w") as fh:
+                json.dump({"ts": now, "map": names}, fh)
+            os.replace(path + ".tmp", path)
+        except OSError:
+            pass          # cache is best-effort; never fail the run over it
+    return names
+
+
+def compress_container_name(name, width=CONTAINER_NAME_WIDTH):
+    """Fit a friendly container name: drop a trailing compose run-hash, then
+    head…tail-elide if still over `width`."""
+    stripped = CONTAINER_HASH_RE.sub("", name) or name
+    if len(stripped) <= width:
+        return stripped
+    k = (width - 1) // 2
+    return stripped[:k] + "…" + stripped[-k:]
+
+
+def container_label(short_id, names):
+    """Display label for a container: the compressed friendly name if docker
+    resolved one, else the bare short id."""
+    name = names.get(short_id)
+    return compress_container_name(name) if name else short_id
+
+
+def container_annotations(printed, cid, names):
+    """{pid: label} for each container-boundary proc - the topmost printed proc
+    in a container. A proc is a boundary when its parent isn't printed or sits in
+    a different container; descendants sharing the id inherit the label silently,
+    so a whole in-container subtree is annotated once. cid: {pid: short_id} for
+    the containerized printed procs."""
+    printed_ids = {p.pid for p in printed}
+    out = {}
+    for p in printed:
+        my = cid.get(p.pid)
+        if my is None:
+            continue
+        parent = cid.get(p.ppid) if p.ppid in printed_ids else None
+        if parent != my:
+            out[p.pid] = container_label(my, names)
+    return out
+
+
+def build_container_map(printed, cache_dir, now, no_cache=False):
+    """{pid: label} for the container-boundary procs among `printed`. Reads each
+    printed proc's cgroup (cheap), and only when something is containerized does
+    the one cached `docker ps` to enrich ids into friendly names. Empty when no
+    printed proc lives in a container."""
+    cid = {}
+    for p in printed:
+        c = read_cgroup_container(p.pid)
+        if c:
+            cid[p.pid] = c
+    if not cid:
+        return {}
+    names = docker_names_cached(cache_dir, now, no_cache)
+    return container_annotations(printed, cid, names)
+
+
 def read_boot_id():
     try:
         return _read("/proc/sys/kernel/random/boot_id").strip()
@@ -1302,13 +1431,17 @@ def _compose_dim(bits, color, colormap=None):
     return "\x1b[2m  \x1b[0m".join(segs)
 
 
-def _detail(node, sysinfo=None, venv=None, path_hits=None):
-    """The dim detail Bits for one Proc: cwd/exe (unless --path already carries
-    them), venv, sockets, cpu/rss/up, thread count, path hits last. Returns
-    list[Bit] (possibly empty); composing/coloring is the renderer's job. cwd
-    and exe carry a ('dir'/'cmd', raw_path) color_key so the renderer can hue
-    them; the raw path - not the compressed display string - is the key."""
+def _detail(node, sysinfo=None, venv=None, path_hits=None, containers=None):
+    """The dim detail Bits for one Proc: an optional leading container tag, then
+    cwd/exe (unless --path already carries them), venv, sockets, cpu/rss/up,
+    thread count, path hits last. Returns list[Bit] (possibly empty);
+    composing/coloring is the renderer's job. cwd and exe carry a
+    ('dir'/'cmd', raw_path) color_key so the renderer can hue them; the raw path -
+    not the compressed display string - is the key. `containers` ({pid: label},
+    only container-boundary pids) defaults None -> no tag -> byte-compat."""
     bits = []
+    if containers and node.pid in containers:
+        bits.append(("container:" + containers[node.pid], 0))
     if not path_hits:        # in --path mode the hits already carry cwd/exe/fd
         if node.cwd and node.cwd not in ("?", ""):
             bits.append(("cwd:" + compress_path(node.cwd), 0,
@@ -1610,7 +1743,8 @@ def build_view(roots, suppressed, width=CMD_WIDTH, sysinfo=None,
                dedup_min=None, never_merge=frozenset(), categories=None,
                venv_map=None, axis="tree", key_fn=None, pool_global=False,
                expand_all=False, path_hits=None,
-               transparent=frozenset(), lifted=frozenset(), notes=None):
+               transparent=frozenset(), lifted=frozenset(), notes=None,
+               containers=None):
     """Turn kept Procs into a display tree (list[ViewNode]). Pure: no /proc IO,
     no ANSI. Merging for the chosen axis is fully resolved here. axis="tree" is
     the per-parent grouping render() exposes; "session" roots each session at its
@@ -1657,7 +1791,7 @@ def build_view(roots, suppressed, width=CMD_WIDTH, sysinfo=None,
             head_pre=("↑ " if item.pid in lifted else "") + "%d " % item.pid,
             head_label=compress_cmdline(item.cmdline, width),
             head_key=("dir", item.cwd),     # the command takes its project's hue
-            detail_bits=_detail(item, sysinfo, venv=venv),
+            detail_bits=_detail(item, sysinfo, venv=venv, containers=containers),
             collapse_note=(item.collapse_note
                            if (not expand_all and item.collapsed
                                and item.collapse_note) else None),
@@ -1728,7 +1862,8 @@ def build_view(roots, suppressed, width=CMD_WIDTH, sysinfo=None,
                 head_pre="%d " % p.pid,
                 head_label=compress_cmdline(p.cmdline, width),
                 head_key=("dir", p.cwd),
-                detail_bits=_detail(p, sysinfo, venv=venv, path_hits=ph),
+                detail_bits=_detail(p, sysinfo, venv=venv, path_hits=ph,
+                                    containers=containers),
                 sort_key=(-prio, p.pid))
         return sorted((flat_node(p) for p in roots), key=lambda n: n.sort_key)
 
@@ -1877,6 +2012,9 @@ def _run_path(args):
                   for pid in hits}
 
     hitprocs = [procs[pid] for pid in hits]
+    containers = build_container_map(
+        hitprocs, os.path.dirname(cache_path()), time.time(),
+        no_cache=args.no_cache)
     colormap = colormap_for(args, hitprocs, color)
     out = []
     if not args.no_header:
@@ -1886,7 +2024,8 @@ def _run_path(args):
     out += anchor_note(colormap, color)
     nodes = build_view(hitprocs, suppressed=set(), width=args.width,
                        sysinfo=sysinfo, categories=categories,
-                       venv_map=venv_map, axis="flat", path_hits=hits)
+                       venv_map=venv_map, axis="flat", path_hits=hits,
+                       containers=containers)
     out += emit_lines(nodes, color=color, colormap=colormap)
     print("\n".join(out))
 
@@ -2020,6 +2159,14 @@ def main(argv=None):
     transparent, lifted, notes = plan_helper_hiding(
         visible_roots, categories, sysinfo)
 
+    # Tag each container's topmost printed proc. Id comes free from the cgroup;
+    # the friendly compose name is a best-effort, cached `docker ps` that
+    # degrades to the id (build_container_map only shells out if something is
+    # actually containerized).
+    containers = build_container_map(
+        printed, os.path.dirname(cache_path()), time.time(),
+        no_cache=args.no_cache)
+
     out = []
     if not args.no_header:
         out += psf_header(s_a) + [""]
@@ -2032,7 +2179,8 @@ def main(argv=None):
                        venv_map=venv_map, axis=args.group,
                        pool_global=args.pool_global, expand_all=args.expand_all,
                        key_fn=lambda p: merge_key(p, categories),
-                       transparent=transparent, lifted=lifted, notes=notes)
+                       transparent=transparent, lifted=lifted, notes=notes,
+                       containers=containers)
     out += emit_lines(nodes, color=color, colormap=colormap)
     if s_b is not None and not args.no_lifecycle:
         section = format_lifecycle(born, died, _parents_map(s_a, s_b),
