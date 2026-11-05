@@ -94,7 +94,7 @@ const RENDER = {
   cmd_width: String, collapse_threshold: String, group_pids: String,
   lifecycle_max: String, dedup_min: String, repr_comms: String, cache_ttl: String,
   cpu_windows: pyTupleFloat, cpu_tint_anchors: pyTupleFloat,
-  vmstat_outlier_anchors: pyTupleFloat,
+  vmstat_pct_anchors: pyTupleFloat,
   refresh_interval: pyFloat, sample_interval: pyFloat,
   rss_tint_anchors: pyTupleInt, tint_sgr: pyTupleStr,
 };
@@ -210,7 +210,7 @@ function formColors() {
   return el("div", {}, [el("h2", {}, "Colors & thresholds"),
     listField("rss_tint_anchors", "RSS tint anchors, bytes", s => parseFloatList(s), a => a.join(", ")),
     listField("cpu_tint_anchors", "CPU tint anchors, cores", parseFloatList, a => a.join(", ")),
-    listField("vmstat_outlier_anchors", "vmstat outlier z-levels", parseFloatList, a => a.join(", ")),
+    listField("vmstat_pct_anchors", "vmstat history cdf thresholds", parseFloatList, a => a.join(", ")),
     listField("tint_sgr", "SGR codes (dim, dim-yellow, yellow, bold-red)", parseStrList, a => a.join(", "))]);
 }
 function formCustom() {
